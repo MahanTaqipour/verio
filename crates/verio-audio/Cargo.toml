@@ -1,0 +1,10 @@
+[package]
+name = "verio-audio"
+version.workspace = true
+edition.workspace = true
+description = "Verio audio I/O: device enumeration, cpal streams, lock-free ring buffers"
+
+[dependencies]
+cpal = { workspace = true }
+ringbuf = { workspace = true }
+tracing = { workspace = true }

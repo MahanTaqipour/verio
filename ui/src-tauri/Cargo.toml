@@ -1,0 +1,27 @@
+[package]
+name = "verio"
+version.workspace = true
+edition.workspace = true
+description = "Verio control-panel app: thin Tauri commands/events bridge onto verio-app"
+
+[lib]
+name = "verio_lib"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+verio-app = { path = "../../crates/verio-app" }
+verio-audio = { path = "../../crates/verio-audio" }
+verio-discovery = { path = "../../crates/verio-discovery" }
+verio-transport = { path = "../../crates/verio-transport" }
+uuid = { version = "1", features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { workspace = true, features = [] }
+tauri-plugin-global-shortcut = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+rfd = { workspace = true }

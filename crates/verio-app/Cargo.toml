@@ -1,0 +1,15 @@
+[package]
+name = "verio-app"
+version.workspace = true
+edition.workspace = true
+description = "Verio application core: room state machine, wires audio + dsp + transport + discovery together"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+tracing = { workspace = true }
+verio-audio = { path = "../verio-audio" }
+verio-dsp = { path = "../verio-dsp" }
+verio-transport = { path = "../verio-transport" }
+verio-discovery = { path = "../verio-discovery" }

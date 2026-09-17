@@ -1,0 +1,62 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Tauri
+/ui/src-tauri/target/
+/ui/src-tauri/gen/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Secrets / local config — NEVER commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+signing/
+settings.json
+
+# Tauri updater signing keys
+*.key.pub
+tauri.key
+tauri.key.pub
+
+# Design / temp working files (not source)
+/design/
+.openclaw/
+.openclaw
+*.tmp
+*.bak
+*_done.flag
+/verio-music-player-panel.zip
+
+# Debug audio dumps; retain shipping sound assets
+*.wav
+!ui/public/**/*.wav

@@ -1,0 +1,17 @@
+[package]
+name = "soak-harness"
+version.workspace = true
+edition.workspace = true
+description = "Headless Phase 2 verification harness: two full room instances connect over loopback and soak"
+
+[[bin]]
+name = "room_soak"
+path = "src/room_soak.rs"
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+verio-app = { path = "../verio-app" }
+verio-discovery = { path = "../verio-discovery" }
+verio-dsp = { path = "../verio-dsp" }
+verio-transport = { path = "../verio-transport" }

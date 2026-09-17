@@ -1,0 +1,16 @@
+[package]
+name = "verio-transport"
+version.workspace = true
+edition.workspace = true
+description = "Verio transport: libdatachannel peer management, full-mesh topology, control datachannel"
+
+[dependencies]
+str0m = { version = "0.23.1", default-features = false, features = ["wincrypto"] }
+verio-discovery = { path = "../verio-discovery" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+igd-next = "0.17.1"
+
+[dev-dependencies]
+verio-dsp = { path = "../verio-dsp" }
