@@ -1,0 +1,15 @@
+[package]
+name = "verio-server"
+version.workspace = true
+edition.workspace = true
+description = "Verio VPS signaling server and fallback UDP relay"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = "0.8"
+futures-util = "0.3"

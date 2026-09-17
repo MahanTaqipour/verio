@@ -1,0 +1,14 @@
+[package]
+name = "verio-discovery"
+version.workspace = true
+edition.workspace = true
+description = "Verio signaling: mDNS LAN discovery (_verio._udp) + manual invite codes behind a Signaling trait"
+
+[dependencies]
+base64 = "0.23.1"
+mdns-sd = "0.14"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = { workspace = true }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }

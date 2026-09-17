@@ -1,0 +1,11 @@
+[package]
+name = "verio-dsp"
+version.workspace = true
+edition.workspace = true
+description = "Verio DSP pipeline: RNNoise denoise + VAD, VAD gate, Opus encode/decode, rechunking, debug WAV I/O"
+
+[dependencies]
+audiopus = { workspace = true }
+symphonia = { workspace = true }
+nnnoiseless = { workspace = true }
+tracing = { workspace = true }

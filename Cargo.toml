@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/verio-audio",
+    "crates/verio-dsp",
+    "crates/verio-transport",
+    "crates/verio-discovery",
+    "crates/verio-app",
+    "crates/soak-harness",
+    "crates/verio-server",
+    "ui/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = "2"
+tauri-build = "2"
+tauri-plugin-global-shortcut = "2"
+cpal = "0.15"
+# rnnoise: the locked stack names "rnnoise", but no such crate exists on crates.io;
+# the RustAudio rnnoise-sys bindings are deprecated "in favour of the nnnoiseless
+# crate". nnnoiseless is a pure-Rust port of Xiph's RNNoise (same model, exposes
+# voice probability) — documented justification per Phase 1 dependency rules.
+nnnoiseless = { version = "0.5", default-features = false }
+audiopus = "0.2"
+# Session 13: music decoding. Pure Rust (no C/C++ toolchain); only the four
+# formats in scope are enabled - AAC/ALAC are deliberately excluded for v1.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "vorbis", "pcm"] }
+ringbuf = "0.5"
+# Session 13: native file picker for the music player. Chosen over
+# tauri-plugin-dialog because only a Rust-side dialog is needed (no JS plugin,
+# no capability wiring) and rfd is pure Rust on Windows via windows-sys.
+rfd = "0.15"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+# Keep default settings for now (build machine: 4C/8T, 8 GB RAM).
