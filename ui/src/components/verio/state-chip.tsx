@@ -1,0 +1,114 @@
+import type { ReactNode } from "react";
+import { cn } from "@/lib/utils";
+
+/**
+ * StateChip — the one way Verio renders a small uppercase status chip.
+ *
+ * It exists because three places needed the same object: the header's connection
+ * status, the dock's transmission-mode badge, and the music panel's playback
+ * state. Written three times they drift; written once, "what does amber mean
+ * here" has a single answer.
+ *
+ * Tone vocabulary is derived from design.md's semantic colours, and each tone is
+ * used for exactly what design.md says it is for:
+ *
+ *   neutral  — no state to signal. Also the default when a caller has nothing
+ *              meaningful to say, so an empty state never borrows a colour it
+ *              has not earned.
+ *   accent   — `--accent`: reserved for primary actions and the speaking
+ *              indicator. A chip using it must be reporting one of those.
+ *   idle     — `--idle`: quiet, connected, at rest.
+ *   warn     — `--warn`: muted / deafened. Intentional states that should still
+ *              be visible.
+ *   danger   — `--danger`: genuinely destructive or failed states only.
+ *
+ * A chip is inert unless `onClick` is supplied. That is deliberate: the previous
+ * header rendered a `<button>` with no handler, which looked interactive and did
+ * nothing. Here, "looks clickable" and "is clickable" cannot come apart.
+ */
+
+export type ChipTone = "neutral" | "accent" | "idle" | "warn" | "danger";
+
+const TONES: Record<ChipTone, string> = {
+  neutral: "border-border bg-surface-2 text-text-dim",
+  accent: "border-accent/25 bg-accent/8 text-accent",
+  idle: "border-idle/30 bg-idle/8 text-idle",
+  warn: "border-warn/25 bg-warn/6 text-warn",
+  danger: "border-danger/35 bg-danger/8 text-danger",
+};
+
+/** The dot colour that matches each tone, for callers that show a leading dot. */
+export const TONE_DOT: Record<ChipTone, string> = {
+  neutral: "bg-text-faint",
+  accent: "bg-accent",
+  idle: "bg-idle",
+  warn: "bg-warn",
+  danger: "bg-danger",
+};
+
+export interface StateChipProps {
+  tone?: ChipTone;
+  /** Rendered before the label — normally a `size-1.5 rounded-full` dot. */
+  leading?: ReactNode;
+  /** Rendered after the label, muted. Used for the transport segment. */
+  trailing?: ReactNode;
+  children: ReactNode;
+  className?: string;
+  /**
+   * Supply this to make the chip a real button. Omit it and the chip is an inert
+   * span that cannot be focused or clicked.
+   */
+  onClick?: () => void;
+  /** Tooltip / accessible description. */
+  title?: string;
+  /** Only meaningful when `onClick` is set. */
+  expanded?: boolean;
+}
+
+export function StateChip({
+  tone = "neutral",
+  leading,
+  trailing,
+  children,
+  className,
+  onClick,
+  title,
+  expanded,
+}: StateChipProps) {
+  const classes = cn(
+    "inline-flex select-none items-center gap-2 whitespace-nowrap rounded-sm border px-2 py-1",
+    "font-mono text-10 uppercase tracking-chip",
+    "transition-colors ease-verio",
+    TONES[tone],
+    onClick && "cursor-pointer hover:border-border-2 hover:bg-surface-3",
+    className,
+  );
+
+  const body = (
+    <>
+      {leading}
+      <span>{children}</span>
+      {trailing}
+    </>
+  );
+
+  if (!onClick) {
+    return (
+      <span title={title} className={classes}>
+        {body}
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-expanded={expanded}
+      className={classes}
+    >
+      {body}
+    </button>
+  );
+}

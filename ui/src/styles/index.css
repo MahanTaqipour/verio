@@ -1,0 +1,379 @@
+/* ==========================================================================
+   Verio — styling foundation
+   ==========================================================================
+
+   Authority: /design.md at the repository root. Every token below is a direct
+   transcription of that document. Where the Stitch design package disagrees
+   with design.md, design.md wins — see REDESIGN-PLAN.md §4.0 for the full list
+   of resolved conflicts (surface tiers, radii, text tiers, type sizes, icons).
+
+   Layer strategy
+   --------------
+   Tailwind v4 declares `@layer theme, base, components, utilities`. Everything
+   this file emits is therefore *layered*.
+
+   The pre-existing `src/App.css` is imported unlayered by `App.tsx`. Unlayered
+   CSS beats any cascade layer regardless of specificity, so during the
+   migration the legacy stylesheet keeps priority and the existing screens
+   render exactly as before. That is deliberate: it makes the migration
+   non-destructive and one-directional.
+
+   The corollary is a hard rule — one styling authority per element:
+     - a migrated component uses Tailwind + these tokens, and its legacy rules
+       are deleted in the same change;
+     - a not-yet-migrated component keeps its legacy classes and is not given
+       Tailwind utilities.
+
+   Mixing the two on one element is how a codebase ends up with two competing
+   design systems. Don't.
+
+   Inert foundation
+   ----------------
+   This file is a foundation, not a redesign. Its job is to be *provably
+   inert*: loading it must not change one pixel of the existing screens. That
+   matters because it keeps every later visual change attributable to the
+   screen being migrated rather than to ambient drift, and because it is the
+   only way to tell an intentional redesign from an accidental regression.
+
+   Two independent checks enforce it, both re-runnable:
+     - `shoot.mjs` captures 26 scenarios × 2 widths × 3 variants and `diff.mjs`
+       pixel-diffs them against the pre-Tailwind baseline;
+     - `probe-all.mjs` enumerates the complete computed style of 50 selectors
+       and `probe-all-diff.mjs` reports every property that changed, grouped by
+       property, so a systematic reset is distinguishable from a one-off bug.
+
+   Both found real regressions that a visual eyeball would have missed. See the
+   base-layer notes below.
+
+   Spacing allow-list
+   ------------------
+   design.md fixes the scale at 4 · 8 · 12 · 16 · 20 · 24 · 32 · 40 · 60.
+   `--spacing` is the 4px baseline, so those map to:
+     4→1  8→2  12→3  16→4  20→5  24→6  32→8  40→10  60→15
+   Use only those steps. `p-7` (28px) or `gap-11` (44px) are not in the system
+   even though Tailwind can generate them.
+   ========================================================================== */
+
+@import "tailwindcss" source(none);
+/* The slider is the one component whose visual mechanics cannot be expressed as
+   utilities — Chromium exposes its track and thumb only through shadow-DOM
+   pseudo-elements. It lives in its own file and lands in the `components`
+   layer, so a Tailwind utility on the same element still wins. */
+@import "./range.css";
+
+/* Explicit sources instead of Tailwind's automatic detection.
+
+   Automatic detection scans every non-gitignored file in the project —
+   including `src/App.css`. Bare words in legacy CSS (`display: flex`,
+   `transition: …`, `border: 1px solid`) were being extracted as candidates and
+   emitting `.flex`, `.transition`, `.border`, `.hidden` … utilities that no
+   element uses. Declaring sources stops the legacy stylesheet from injecting
+   class names into the utility layer, which is the "two competing design
+   systems" failure this migration exists to avoid.
+
+   It does not make the output minimal, and it is not meant to: Tailwind
+   extracts candidates from *any* text in the listed files, so inline-style
+   values (`style={{ display: "flex" }}`) and even comments produce utilities.
+   That is harmless. What would not be harmless is a generated utility whose
+   name matches a class the legacy markup actually uses, so that — not output
+   size — is what gets checked. `check-collisions.mjs` intersects the class
+   names present in the live DOM with the utility layer and reports any overlap;
+   it currently reports none. Re-run it after any change to the components. */
+@source "../**/*.{ts,tsx}";
+@source "../../index.html";
+
+/* The dev mock harness is development-only and must not contribute classes to
+   the production stylesheet. It uses inline styles today; this keeps it that
+   way if it ever doesn't. */
+@source not "../dev";
+
+/* --------------------------------------------------------------------------
+   Theme — design.md tokens
+   -------------------------------------------------------------------------- */
+
+@theme {
+  /* --- Base surfaces (4 tiers) ------------------------------------------ */
+  --color-bg: #171412;
+  --color-surface: #211c18;
+  --color-surface-2: #2a2420;
+  --color-surface-3: #332b25;
+
+  /* --- Fixed-bar gradient stop -------------------------------------------
+     The bottom dock's background is `linear-gradient(180deg, --bg, #14110f)`.
+     design.md permits gradients on fixed bars and only there ("Gradients only
+     on fixed bars (e.g. a bottom dock) and only subtly"), so this stop is a
+     token rather than an arbitrary value. It is a slightly deeper espresso than
+     --bg, which makes the dock read as a separate plane without a hard edge. */
+  --color-bg-deep: #14110f;
+
+  /* --- Borders ----------------------------------------------------------- */
+  --color-border: #2a241f;
+  --color-border-2: #3a322b;
+
+  /* --- Text -------------------------------------------------------------- */
+  --color-text: #e8dfd1;
+  --color-text-dim: #7d7166;
+  --color-text-faint: #57504a;
+
+  /* --- Semantic ---------------------------------------------------------- */
+  --color-accent: #c9873f;
+  --color-accent-hi: #d9994f;
+  --color-accent-lo: #a86f2f;
+  --color-idle: #5b7a72;
+  --color-warn: #b86a4a;
+  --color-danger: #8a3a30;
+
+  /* --- Spacing: the 4px baseline grid ----------------------------------- */
+  --spacing: 4px;
+
+  /* --- Shell metrics: the header's height, as one number -----------------
+     A named member of the spacing scale, so `h-header` and `top-header` read
+     from the same declaration and cannot drift apart.
+
+     They were two independent literals (`h-14` on the header in app-header.tsx,
+     `top-14` on the diagnostics drawer in App.tsx) that had to agree. They have
+     already disagreed once: the drawer was `fixed top-0`, spanning the full
+     window and covering the header's right side, so its own close button sat on
+     top of the toggle that opens it and the toggle could not be pressed twice.
+     Fixing that by editing one of the two numbers is what left the hazard in
+     place. */
+  --spacing-header: 56px;
+
+  /* --- Radii ------------------------------------------------------------- */
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* --- Type families ----------------------------------------------------- */
+  --font-ui: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* --- Type scale --------------------------------------------------------
+     Named by pixel size on purpose: `text-17` cannot be written because there
+     is no `--text-17`, so an off-scale size fails visibly instead of quietly
+     inventing a new step. Line heights follow design.md: 1.4 body,
+     1.2 headings, 1.0 for large numerals. */
+  --text-10: 10px;
+  --text-10--line-height: 1.4;
+  --text-11: 11px;
+  --text-11--line-height: 1.4;
+  --text-13: 13px;
+  --text-13--line-height: 1.4;
+  --text-14: 14px;
+  --text-14--line-height: 1.4;
+  --text-15: 15px;
+  --text-15--line-height: 1.2;
+  --text-18: 18px;
+  --text-18--line-height: 1.2;
+  --text-24: 24px;
+  --text-24--line-height: 1;
+
+  /* --- Tracking ---------------------------------------------------------- */
+  /* design.md specifies 0.15em for uppercase section labels. Chips are not
+     section labels — they are smaller and denser, and 0.15em on a 10px chip
+     makes short words like "IDLE" read as scattered letters. 0.08em keeps them
+     legible as words while staying visibly mono-spaced. Both are tokens so no
+     component writes an arbitrary tracking value. */
+  --tracking-label: 0.15em;
+  --tracking-chip: 0.08em;
+
+  /* --- Breakpoints -------------------------------------------------------
+     The four widths the design is checked at, replacing Tailwind's defaults so
+     every `sm:`/`md:`/`lg:`/`xl:` in the codebase means a width the design
+     actually specifies. Verio's window has no minimum size and defaults to
+     860×640, so `sm` (700px) is the floor the layout must survive, not an
+     edge case. Layouts are designed at 860 first and then allowed to breathe
+     upward. */
+  --breakpoint-*: initial;
+  --breakpoint-sm: 700px;
+  --breakpoint-md: 900px;
+  --breakpoint-lg: 1100px;
+  --breakpoint-xl: 1400px;
+
+  /* --- Motion ------------------------------------------------------------ */
+  --default-transition-duration: 140ms;
+  --default-transition-timing-function: ease;
+  --duration-fast: 140ms;
+  --duration-slow: 200ms;
+  --ease-verio: ease;
+
+  /* --- Elevation ---------------------------------------------------------
+     design.md permits exactly one shadow, for floating overlays only. Cards,
+     buttons and inputs never get one. */
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* --------------------------------------------------------------------------
+   Base layer
+   --------------------------------------------------------------------------
+   Tailwind's preflight is enabled (imported by `@import "tailwindcss"`). It is
+   required: it supplies `border: 0 solid` on every element, without which the
+   `border` utility would set a width against `border-style: none` and render
+   nothing.
+
+   Preflight is correct for a Tailwind-first app but it is NOT automatically
+   inert against an existing stylesheet. Rather than assume, every property it
+   touches was measured. `probe-all.mjs` enumerates the full computed style of
+   50 selectors across 4 screens × 2 widths and diffs pre/post Tailwind; the
+   result is 39 changed properties, of which exactly two were real.
+
+   Neutralised below (these changed visible rendering):
+     html { line-height: 1.5 }        App.css never set line-height, so the app
+                                      rendered at the UA default (`normal`).
+                                      1.5 reflowed every line box: 2.16% of
+                                      pixels changed on the lobby, 2.92% on the
+                                      room screen.
+     form controls letter-spacing:    Chromium's UA sets `normal` on controls;
+     inherit                          preflight makes them inherit. `.room-tag`
+                                      is 10px × 0.1em = exactly 1px and the
+                                      "Copy Code" button is its child, so the
+                                      button grew 89.88px → 98.88px.
+
+   Reviewed and accepted (measured to have no visual effect):
+     * { border: 0 solid }            width is 0, so nothing paints. Required
+                                      for the `border` utility. Changes only
+                                      `border-*-style` from none to solid.
+     img { max-width:100%;            `.brand-mark img` sets its own size and
+           height:auto;               sits in a flex row — geometry unchanged.
+           vertical-align:middle }
+     button/input/select font:inherit Bare `input` on these screens is
+                                      `input[type=range].slider-control`, which
+                                      App.css styles with `appearance: none`, so
+                                      font and colour do not paint. Every other
+                                      control sets its own font in App.css.
+     appearance: button               same as the native rendering for a
+                                      <button>.
+     tab-size 8 → 4,                  no <pre>/<textarea> with tabs; desktop
+     text-size-adjust,                only; touch-only.
+     -webkit-tap-highlight-color
+
+   The screenshot diff and the probe dumps in `design/screens/` are the
+   empirical record.
+   -------------------------------------------------------------------------- */
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+
+    /* Preflight sets `html { line-height: 1.5 }`. The app previously rendered
+       at the UA default, so leaving this in place reflowed every line box on
+       every screen. Restored to the UA value to keep the foundation inert.
+       design.md's line-height ratios are not lost — they are carried as the
+       `--text-*--line-height` tokens and applied per component as each screen
+       is migrated, where the change is visible and reviewable. */
+    line-height: normal;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Preflight sets `letter-spacing: inherit` on form controls, but Chromium's
+     UA stylesheet sets `normal` — controls are not meant to inherit tracking
+     from a label-like ancestor. Restored, because otherwise a button inside a
+     letterspaced tag silently inherits that tracking (see the header note). */
+  button,
+  input,
+  select,
+  optgroup,
+  textarea,
+  ::file-selector-button {
+    letter-spacing: normal;
+  }
+
+  /* design.md: a 2px accent outline offset by 2px, visible via :focus-visible
+     only — never on mouse click. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  ::selection {
+    background-color: var(--color-accent);
+    color: var(--color-bg);
+  }
+
+  /* Custom warm scrollbars, per design.md: 6px wide, 3px radius, thumb
+     --surface-3 at rest and --border-2 on hover, transparent track.
+
+     The ::-webkit-scrollbar pseudo-elements are used deliberately instead of
+     `scrollbar-width`/`scrollbar-color`: in Chromium, setting either of those
+     standard properties disables ::-webkit-scrollbar styling entirely, and
+     design.md specifies an exact 6px width and 3px radius that the standard
+     properties cannot express. Verio ships on WebView2 (Chromium). */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-surface-3);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-border-2);
+  }
+
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Custom utilities
+   -------------------------------------------------------------------------- */
+
+/* design.md: section labels are always uppercase with 0.15em letter-spacing.
+   Inter at 11px — mono is reserved for numbers, codes and addresses. */
+@utility label-caps {
+  font-family: var(--font-ui);
+  font-size: var(--text-11);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+
+/* Telemetry row labels — the diagnostics drawer's label/value pairs.
+   The same idea as `label-caps` (uppercase, tracked, Inter) at the chip size and
+   the chip tracking. design.md specifies 0.15em for *section* labels; at 10px a
+   two-word label tracked that wide is as wide as the value sitting beside it,
+   and the drawer has 280px of content width to fit both. `--tracking-chip`
+   exists for exactly this distinction. */
+@utility telemetry-label {
+  font-family: var(--font-ui);
+  font-size: var(--text-10);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: var(--tracking-chip);
+  text-transform: uppercase;
+}
+
+/* Every number, code and address: JetBrains Mono, tabular figures so digits
+   don't shift width as values change. */
+@utility mono-num {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum";
+}
+
+/* design.md press feedback: a 1px vertical translate. No scale, no bounce. */
+@utility press {
+  &:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+}

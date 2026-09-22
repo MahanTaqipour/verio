@@ -1880,3 +1880,1996 @@ No remote was created or pushed. Remote creation and pushing remain the user's r
 - Git printed line-ending normalization warnings while staging, expected because `.gitattributes` normalizes text files to LF.
 - `git ls-files | wc -l` is not available in this PowerShell environment because `wc` is not installed; the recorded tracked-file count uses the PowerShell equivalent.
 - This Session 16 entry was added after the initial commit so the initial commit hash could be recorded accurately.
+
+---
+
+## Session 17 (2026-09-20) — Frontend redesign: Phase 0 analysis, then Phase 1 foundation
+
+Goal: redesign the Verio frontend onto Tailwind CSS v4 + shadcn-style primitives while
+leaving the Rust side, the WebRTC/transport path and the app's real behaviour untouched.
+Phase 0 was an analysis-only pass ending in a stop-for-approval; Phase 1 establishes the
+styling foundation only.
+
+### Phase 0 — analysis (deliverable: `REDESIGN-PLAN.md`)
+
+Read `PROJECT.md`, `PROGRESS.md`, `design.md`, all 1821 lines of `ui/src/App.tsx`, the
+2062-line `ui/src/App.css`, the build configs, `ui/src-tauri/src/lib.rs` (command and
+event inventory), `capabilities/default.json`, `tauri.conf.json`,
+`crates/verio-app/src/settings.rs` and `MusicStatus` in `pipeline.rs`. Extracted the
+Stitch ZIP to `design/stitch/` (gitignored) and read all four `code.html` decks, the four
+`screen.png` renders and `broadcast_acoustic/DESIGN.md`.
+
+Findings that changed the plan:
+
+- The Stitch package is a **spec deck**, not four finished screens: each deck carries 2–3
+  alternative directions plus a "required states" matrix. So the workflow is *choose one
+  direction per screen*, not *implement the deck*.
+- `design.md` conflicts with the deck on surface tiers (4 vs 5), radii (5/8/12 vs 4/6/8),
+  text tiers, destructive colour, type sizes (the deck adds 12px and 32px) and icons (the
+  deck uses the Material Symbols **icon font**, which `design.md` forbids). `design.md`
+  wins every conflict.
+- **The default Tauri window is 860×640 with no minimum size.** The 700–900px band is the
+  default case, not the edge case. Design compact-first; larger windows get breathing room.
+- Legacy CSS beats Tailwind utilities: `App.css` is unlayered, Tailwind emits into
+  `@layer utilities`, and unlayered CSS wins regardless of specificity. That makes the
+  migration non-destructive and one-directional — and imposes one styling authority per
+  element.
+- Only eight net-new features were worth adding (B1–B8). Per-peer levels, jitter/loss,
+  playlist, recent rooms, ed25519/ChaCha20 identity, capacity presets, SOLO bus and
+  DSP-load telemetry were all rejected: the data does not exist and faking it is forbidden.
+- Six existing UI bugs found in components that will be redesigned, including a dead
+  `status-pill` button with no `onClick`, a hardcoded "Relay" transport label, a hardcoded
+  fake fallback endpoint `141.11.1.110:3478`, a duplicated "Last Relay Recv" row, an
+  unreachable `{false && …}` Direct-LAN block, and `setIsDiagnosticsOpen(true)` having
+  **zero call sites** (the diagnostics drawer is currently unreachable dead UI).
+
+Phase 0 ended with a stop for approval, as instructed. No application code was changed.
+
+### Phase 1 — foundation
+
+Scope was deliberately limited to: Tailwind v4, Verio tokens, primitives, the CSS layer
+strategy, the dev mock harness, and verifying that the real Tauri path and the mic meter
+are untouched. **The four screens were not rebuilt.**
+
+Files added:
+
+| Path | Purpose |
+|---|---|
+| `ui/src/styles/index.css` | Tailwind import, `@theme` tokens, base layer, custom utilities |
+| `ui/src/styles/range.css` | The slider's track/thumb (shadow-DOM pseudo-elements only) |
+| `ui/src/lib/utils.ts` | `cn()` = `clsx` + `tailwind-merge` |
+| `ui/src/components/verio/icons.tsx` | ~55 lucide icons behind a `makeIcon` wrapper |
+| `ui/src/components/verio/level-meter.tsx` | The imperative mic-meter contract |
+| `ui/src/components/ui/*.tsx` | `button`, `input`, `switch`, `select`, `slider`, `field`, `surface`, `badge`, `segmented`, `dialog` |
+| `ui/src/dev/**` | Dev-only mock harness (fixtures, IPC transport, control panel) |
+
+Modified: `ui/src/main.tsx` (dev-gated dynamic import of the harness), `ui/vite.config.ts`
+(Tailwind plugin + `@` alias), `ui/tsconfig.json` (path mapping), `ui/package.json`
+(dependencies), `ui/src/App.css` (see the h2 finding below).
+
+`ui/src/App.tsx` was **not** modified. `crates/`, `ui/src-tauri/` and `tauri.conf.json`
+were **not** modified — confirmed by `git status --porcelain`, which lists only frontend
+files.
+
+### The foundation had to be provably inert
+
+The foundation is not a redesign; its job is to change nothing, so that every later visual
+difference is attributable to the screen being migrated rather than to ambient drift. Two
+independent, re-runnable checks enforce that:
+
+- `shoot.mjs` captures 26 scenarios × 2 widths × 3 variants through the mock harness;
+  `diff.mjs` pixel-diffs them against a pre-Tailwind baseline.
+- `probe-all.mjs` enumerates the **complete** computed style of 50 selectors across
+  screens × variants × widths, and `probe-all-diff.mjs` reports every property that
+  changed, grouped by property name.
+
+Both found real regressions that eyeballing the screenshots would not have caught.
+
+**Finding 1 — preflight's `html { line-height: 1.5 }` reflowed the entire app.**
+`App.css` never set a line-height, so the app had been rendering at the browser default
+(`normal`). Loading Tailwind changed every line box in the application:
+
+```text
+before neutralising line-height:   2.1589%   9672 px  lobby-fresh__700__base.png
+                                   2.9225%  13093 px  room-10__700__base.png
+                                   3.2180%  17712 px  room-10__860__base.png
+```
+
+A control experiment (capturing the *same* build twice) showed the harness itself is
+deterministic to within 0.0042%, so the difference was real and not capture noise. After
+neutralising it, those same shots dropped to 0.00% / 0.05%.
+
+**Finding 2 — preflight's `letter-spacing: inherit` on form controls.**
+Chromium's UA stylesheet sets `letter-spacing: normal` on form controls; preflight makes
+them inherit. `.room-tag` is `font-size: 10px; letter-spacing: 0.1em` = exactly `1px`, and
+the "Copy Code" button is its child, so the button silently grew by 1px × 9 characters:
+
+```text
+.secondary-btn  letterSpacing: "normal" -> "1px"
+                width:         89.875px -> 98.875px
+```
+
+**Finding 3 — preflight's `h1–h6 { font-size: inherit; font-weight: inherit }`.**
+`.modal-header h2` was the only element in the app relying on the UA heading defaults
+(every other heading sets its own). It silently dropped from 21px/700 to 14px/400, which
+shrank `.modal-header` from 40px to 32px and shifted the whole Settings panel by 8px.
+Fixed by making the previously implicit values explicit in `App.css` — a 14-line addition
+and the only change to that file.
+
+**Finding 4 — preflight's `border: 0 solid` removes Chromium's UA button border.**
+`.keybind-chip` declared `background`, `border-radius`, `padding` and `font` but never a
+`border`, so it had been rendering with the UA's `2px outset` chrome. Losing it made the
+chip 4px shorter:
+
+```text
+button.keybind-chip|Ctrl+Shift+M
+    borderTopStyle: "outset" -> "solid"
+    borderTopColor: "rgb(0, 0, 0)" -> "rgb(125, 113, 102)"   (currentColor, width 0)
+    height:         "23px"   -> "19px"
+```
+
+Only `.keybind-chip` was affected — it is the only control in the app whose border style
+was `outset`.
+
+**Finding 5 — preflight's `svg { display: block; vertical-align: middle }` removes the
+inline-baseline gap beneath icons.** Buttons whose height is content-driven shrink by the
+descender gap:
+
+```text
+button.keybind-clear-btn        height: "23px" -> "20px"
+button (unclassed, icon-only)   height: "20px" -> "12px"
+```
+
+**How the last two were resolved.** Both are preflight removing UA chrome that legacy CSS
+relied on without saying so, and neither can be made inert *honestly*: restoring
+`border: 2px outset` would be writing nonsense to preserve an accident, and restoring
+`svg { display: inline }` would fight the design system on purpose. Choosing a *new*
+border for `.keybind-chip` is a design decision that belongs to the Settings surface
+redesign, not to the foundation. Both are therefore **accepted and recorded** rather than
+papered over. Measured impact: 0.229% of pixels on six Settings-modal shots, all of it the
+two keybind chips and their clear buttons; every other screen is at or below the harness's
+own noise floor (≤0.0076%). `.keybind-chip` is added to the Settings-phase checklist so it
+gets an explicit, deliberate treatment rather than inheriting a browser default.
+
+Neutralisations applied in the base layer: `line-height: normal` on `html`/`body`, and
+`letter-spacing: normal` on form controls. Reviewed and accepted as visually inert (each
+measured, not assumed): `border: 0 solid` on non-button elements (width 0; required for the
+`border` utility), `img { max-width:100%; height:auto; vertical-align: middle }` on
+`.brand-mark img` (no geometry change), `button/input/select { font: inherit }` on
+controls that carry no text (the bare `input` on these screens is
+`input[type=range].slider-control`, styled `appearance: none`, so font and colour do not
+paint), `appearance: button`, and `tab-size` / `text-size-adjust` /
+`-webkit-tap-highlight-color`.
+
+One consequence worth stating plainly: **the foundation is not pixel-identical to the
+pre-Tailwind app.** Three defects were found and fixed, two browser-default dependencies
+were found and deliberately accepted. `design/screens/final-foundation` is therefore the
+reference set for the remaining phases — diffing against the original `baseline` from here
+on would re-report the two accepted differences every time.
+
+### Utilities cannot be allowed to collide with legacy classes
+
+Tailwind extracts candidate class names from **any** text in the scanned files — inline
+style values and comments included. A comment in `lib/utils.ts` containing
+`className="p-4"` was enough to emit a `.p-4` utility. The risk is not output size; it is a
+generated utility whose name matches a class the legacy markup actually uses.
+
+Two measures:
+
+1. `@import "tailwindcss" source(none)` plus explicit `@source "../**/*.{ts,tsx}"` and
+   `@source "../../index.html"`, so the legacy stylesheet cannot inject candidates.
+   Verified: `accordion` appears only in `App.css` and is correctly absent from the
+   utility layer.
+2. `check-collisions.mjs` intersects the class names present in the live DOM with the
+   class selectors in the built utility layer. It reports **no collisions** across 5
+   scenarios × 2 widths.
+
+The guard needed one correction: Tailwind compiles `peer-*` variants to
+`:is(:where(.peer):checked ~ *)`, and a naive class extraction read `.peer` out of that
+and flagged Verio's `div.peer` peer cards. Those classes are conditions on *other*
+elements, never the styled subject, so the guard now strips `:is()`/`:where()`/`:not()`
+internals. This matters because Tailwind's `peer` marker class genuinely shares a name
+with Verio's `.peer` card class — verified harmless (the generated rules require
+`:checked`, which a `div` can never match) but worth knowing.
+
+### Verification (real output)
+
+Typecheck and build:
+
+```text
+$ pnpm exec tsc --noEmit
+EXIT=0
+
+$ pnpm build
+dist/index.html                                0.72 kB │ gzip:  0.39 kB
+dist/assets/verio-logo-primary-B6hxm-AW.png  863.52 kB
+dist/assets/index-D7xKsKi9.css                55.83 kB │ gzip:  9.99 kB
+dist/assets/index-C88yC07M.js                266.20 kB │ gzip: 79.29 kB
+✓ built in 2.45s
+```
+
+JS is unchanged at 266.20 kB: the primitives are not imported by any screen yet, so they
+are tree-shaken out. CSS carries ~7 kB of utilities for those not-yet-rendered components;
+that resolves itself as the screens are migrated.
+
+Production bundle contains no harness code:
+
+```text
+$ grep -rl "VERIO MOCK HARNESS\|__VERIO_MOCK__\|verio:mock:kill\|installMockHarness" ui/dist/
+(no matches)
+```
+
+Computed-style audit — the curated-selector pass, after the three fixes:
+
+```text
+summary: 15 distinct properties changed, 0 geometry difference(s)
+```
+
+The first run of that audit reported `23 distinct properties changed, 24 geometry
+difference(s)`; those geometry differences were entirely the Settings-modal shift from
+Finding 3. But that pass compares only the *first* match of each selector in a
+hand-maintained list, and `.keybind-chip` was not in it — which is precisely how Finding 4
+survived. A second pass was written to close the gap: `probe-controls.mjs` enumerates
+**every** button, input, select and textarea on the page, keyed by tag + class list + text,
+so nothing depends on a list being complete. It found the two accepted browser-default
+dependencies above and nothing else:
+
+```text
+$ node controls-diff.mjs without with
+appearance       (78)   "auto" -> "button"
+fontFamily       (42)   "Arial" -> "Inter, system-ui, ..."
+fontSize         (33)   "13.3333px" -> "14px"
+borderTopStyle   (33)   "outset" -> "solid"
+borderTopColor   (33)   "rgb(0, 0, 0)" -> "rgb(125, 113, 102)"
+color            (27)   "rgb(0, 0, 0)" -> "rgb(232, 223, 209)"
+height           (15)   e.g. "23px" -> "19px"
+```
+
+Screenshot regression, 65 shots, pre-Tailwind baseline → final foundation:
+
+```text
+compared 65 shots  (baseline → final-foundation)
+  byte-identical      : 22
+  diff ≤ 0.05%      : 37
+  diff > 0.05%      : 6
+
+largest differences:
+     0.2300%     1266 px  room-10__860__settings-open.png
+     0.2291%     1261 px  lobby-ready__860__settings-open.png
+     0.0076%       42 px  music-playing__860__music-open.png
+     0.0076%       34 px  room-6__700__base.png
+```
+
+The six shots above 0.05% are all the Settings modal, and all six are the accepted
+`.keybind-chip` / clear-button difference. Everything else is at or below the noise floor:
+a control experiment capturing the *same* build twice differed by up to 0.0042% (23 px) on
+its own, from the mock's measured ping value and mic-meter settle. For comparison, the
+same 65-shot diff before the line-height and letter-spacing fixes was `0 byte-identical,
+0 ≤ 0.05%, 65 > 0.05%`, with the worst shot at 3.22%.
+
+The mic meter remains imperative. `App.tsx` is unmodified and still does:
+
+```text
+155:  const micLevelRef = useRef<HTMLDivElement>(null);
+198:    listen<number>("input_level", (ev) => {
+202:        micLevelRef.current.style.width = `${pct}%`;
+```
+
+No React state is involved at ~20 Hz.
+
+### Decisions taken
+
+- **`design.md` wins all conflicts with Stitch.** No averaging.
+- **The mock harness is dev-only, behind four guards**: `import.meta.env.DEV`, a refusal to
+  install when a real Tauri runtime is detected, an explicit `?mock=1` opt-in, and a
+  sticky kill switch (`?mock=0` sets it, `?mock=1` will not override it). It uses Tauri's
+  own `mockIPC` at the `__TAURI_INTERNALS__.invoke` boundary, so the app's real
+  `invoke`/`listen` code paths run unmodified. It implements the event plugin itself
+  because Tauri's built-in event mock removes listeners by `args.id` while the real
+  unlisten sends `eventId`, which leaks listeners and logs at 20 Hz.
+- **Line-height is not applied globally yet.** `design.md`'s ratios are carried as the
+  `--text-*--line-height` tokens and get applied per component as each screen is migrated,
+  where the change is visible and reviewable.
+- **Zero new runtime dependencies for the primitives.** `select`, `slider`, `switch` and
+  `segmented` are built on native form controls; `dialog` uses the native `<dialog>`
+  element via `showModal()`, which provides focus trapping, Escape, `::backdrop` and top
+  layer without a portal or a Radix dependency. Custom listboxes and manual focus traps
+  are a known source of "looks functional but isn't" bugs.
+- **`IconButton`'s `iconSize` prop was removed.** It was accepted and then `void`-ed, i.e.
+  it did nothing. A prop that silently does nothing is the same class of problem as a dead
+  button.
+- **The two accepted browser-default dependencies were not papered over.** `.keybind-chip`
+  keeps its borderless, 4px-shorter rendering rather than being given `border: 2px outset`
+  to freeze an accident, and SVG icons keep their baseline gap removed. Both are recorded
+  above with measurements; `.keybind-chip` is scheduled for a deliberate treatment in the
+  Settings phase. If the preference is to freeze the old rendering instead, the fix is two
+  lines and reversible.
+- **`design/screens/final-foundation` is the new reference set**, replacing `baseline` for
+  all subsequent phase diffs.
+
+### Next
+
+Phase 2 is complete (primitives exist). Phases 3–7 remain: app shell → music player →
+lobby → settings surface → room. Per the approval, the 860×640 layout is the one that must
+be excellent, with larger widths as an expansion of it.
+
+Carry into the Settings phase:
+
+- `.keybind-chip` needs an explicit, deliberate treatment — it currently inherits whatever
+  the browser decides.
+- `.modal-header h2` carries `font-size: 21px`, which is the UA default for h2 at a 14px
+  base and **not** a design.md step. Give the Settings title an on-scale size (18px or 15px)
+  when the modal becomes a full surface.
+- The six in-scope UI bugs from `REDESIGN-PLAN.md` §6 still stand, including the
+  unreachable diagnostics drawer (`setIsDiagnosticsOpen(true)` has zero call sites) and the
+  hardcoded fallback relay endpoint `141.11.1.110:3478`.
+
+Reusable tooling added this session lives outside the repo, in
+`~/.workbuddy-ai/binaries/node/workspace/`: `shoot.mjs` (capture), `diff.mjs` (pixel diff),
+`bbox.mjs` / `characterize.mjs` / `visdiff.mjs` / `crop.mjs` (diagnose *where* and *what*),
+`probe-all.mjs` + `probe-all-diff.mjs` (curated computed-style audit),
+`probe-controls.mjs` + `controls-diff.mjs` (exhaustive control audit),
+`check-collisions.mjs` (utility/legacy class guard), `rmtree.mjs` (safe recursive delete,
+needed because the sandbox blocks bulk `rmSync`), `fix-links.mjs` (repairs pnpm's
+symlink-free `node_modules`).
+
+Still outstanding from the approval message: Q8 and Q9 were never seen in full, so they
+remain unanswered.
+
+
+---
+
+## Session 18 — Phase 3 begins: the app shell, and a foundation defect that invalidated every Tailwind spacing utility
+
+Phase 3 is "app shell + shared structure". This session did the header — the first
+component actually rebuilt in Tailwind — and in doing so found a defect that would have
+silently broken every screen in Phases 4–7.
+
+### 1. The defect: an unlayered reset was eating every Tailwind padding/margin utility
+
+`ui/src/App.css` line 53 read:
+
+```css
+* { box-sizing: border-box; margin: 0; padding: 0; }
+```
+
+Unlayered. Tailwind v4 emits every utility into `@layer utilities`, and **unlayered
+normal declarations beat layered normal declarations regardless of specificity**. So
+`padding: 0` on `*` outranked `.px-5`.
+
+What that looked like: the new header was given `px-5` (20px). The class was generated,
+was present in `dist/assets/*.css` inside `@layer utilities`, and was on the element.
+`getComputedStyle(header).paddingLeft` returned **`0px`**. The header's contents ran to
+the window edge and the status chip was clipped at 700px.
+
+Nothing else caught it. Not the build log, not `tsc`, not the 156-shot pixel diff, not
+the class-collision guard — because no *class name* collided, only a *property*. It took
+reading a computed style.
+
+**Fix** — move it into the layer:
+
+```css
+@layer base {
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+}
+```
+
+This changes nothing for legacy elements. `@layer base` still outranks UA defaults, and
+`App.css`'s own class rules are still unlayered so they still win over it — and always
+did, on specificity. But `@layer utilities` is declared after `base`, so Tailwind now
+wins, which is the entire premise of the migration.
+
+Verified in the built bundle (`inspect-layers.mjs`): layer order is
+`properties, theme, base, components, utilities`; the app's reset lands in a second `base`
+group at offset 24153, still before `utilities` in layer order. Also confirmed Tailwind
+v4's own preflight already emits `*, :after, :before, ::backdrop { box-sizing; border;
+margin; padding }` in `@layer base` — so the app's rule is now *redundant* with preflight.
+The only thing that ever made it dangerous was being unlayered. It is kept explicitly
+rather than deleted so the requirement survives if preflight is ever turned off.
+
+**After the fix**, measured at 700px and 860px: `header` padding `20px / 20px`, status
+chip right edge at `680` (700 − 20) and `840` (860 − 20), no horizontal overflow.
+
+A new guard, `foundation-live.mjs`, now checks this class of bug directly: it reads the
+computed style of every element carrying a `p*`/`m*`/`gap-*` utility, recomputes what the
+class means from the 4px scale, and fails on any mismatch. Current result: **208 spacing
+declarations checked, all live.** The guard was proven non-vacuous by re-injecting
+`* { padding: 0 !important }` and confirming it detects the regression
+(`header padding-left 20px → 0px`).
+
+`audit-unlayered.mjs` (new, CSSOM-based) sweeps the rest of `App.css` for the same
+pattern. 282 unlayered rules collected; **2** can broadly outrank a utility:
+
+| selector | properties | consequence |
+| --- | --- | --- |
+| `html, body` | `color`, `font-size`, `height` | a `text-*`/`text-sm` utility on `html`/`body` will be ignored. `styles/index.css` already sets the same values in `@layer base`, so this is duplication, not a visible conflict. |
+| `button:focus-visible` | `outline-offset` | a `focus-visible:outline-*` utility on any button will be ignored. Relevant to the Settings/Room phases. |
+
+### 2. Header height was content-sized, and changed when you joined a call
+
+Measured from the baseline PNGs by locating the header's 1px bottom border row
+(`find-header-edge.mjs`):
+
+| state | old header height | new |
+| --- | --- | --- |
+| lobby (no room chip) | **59px** | 56px |
+| in a call (room chip present) | **64px** | 56px |
+
+The legacy `.header` declared `min-height: 56px` with `padding: 16px 20px` and no fixed
+height, so its real height depended on its children — and the room chip made it 5px
+taller. Joining a call therefore shifted the entire app by 5px. The rebuilt header is a
+fixed `h-14` = 56px everywhere: the declared intent, and a clean 14 × 4 on the spacing
+scale. `design.md` does not specify a header height.
+
+### 3. Verification: proving the change is confined to the header
+
+A naive diff is useless here — every shot containing the header changes, and the header's
+height change moves everything below it. Two new tools separate the questions:
+
+- `diff-scope.mjs` — is every changed pixel inside the header band?
+- `diff-shift.mjs` — after compensating a uniform vertical offset, what is left below?
+
+Neither was sufficient on its own: in a call the offset is 8px (integer), but the lobby
+content is **vertically centred**, so its effective offset is 1.5px — fractional, and no
+integer shift can align it. Every glyph re-renders with different antialiasing and the
+residual stays enormous whether or not anything actually changed.
+
+So the confound was removed instead of subtracted. `verify-header-isolation.mjs` reads the
+baseline header height off the baseline pixels, re-captures the **new** build with the
+header pinned to exactly that height, and compares only the rows below it. Result:
+
+| scenario | baseline h | forced h | residual below header | where |
+| --- | --- | --- | --- | --- |
+| room-10 @860 | 64 | 64 | 9 | dock meter (noise) |
+| room-10 @700 | 64 | 64 | 3 | dock meter (noise) |
+| room-3 @860 | 64 | 64 | 21 | dock meter (noise) |
+| room-self-muted @860 | 64 | 64 | 0 | — |
+| room-ptt @860 | 64 | 64 | 15 | dock meter (noise) |
+| edge-long-strings @860 | 64 | 64 | 18 | dock meter (noise) |
+| music-playing @860 | 64 | 64 | 6 | dock meter (noise) |
+| audio-error @860 | 64 | 64 | 0 | — |
+| lobby-fresh @860 | 59 | 59 | 2319 | Host Call card only |
+| lobby-fresh @700 | 59 | 59 | 2314 | Host Call card only |
+| settings-normal @860 | 59 | 59 | 696 | Host Call card (left of modal) + dock |
+
+**Every in-call screen is pixel-identical below the header** (0–21px, all inside the
+dock's mic meter — the known noise floor). The only real below-header change is the lobby
+Host Call card, which is the intended transport fix (see §4).
+
+The 700px lobby initially showed a **33,702px** residual spanning `y194..435`: the longer
+hint text wrapped to a third line, growing the card and reflowing the centred lobby. The
+copy was tightened in response (`transport.ts`) — `"picks a path automatically: direct
+when possible, relay otherwise"` → `"direct when possible, relay otherwise"` — which
+brought it to 2,314px confined to the card. Recorded because it is a real constraint: the
+lobby card is 240px wide at the 700px floor, so the parenthetical must stay short.
+
+### 4. Bugs fixed
+
+The four header bugs from `REDESIGN-PLAN.md` §6, plus one exposed by fixing them:
+
+1. **Transport label was the hardcoded string `"Relay"`.** `getTransportBadgeInfo()`
+   returned it unconditionally, so the label never changed regardless of configuration or
+   live path. Now derived from `diagnostics.mode` via `describeLiveTransport()`.
+2. **The status dot never changed colour.** Its `connected` / `connecting` / `idle`
+   classes had no CSS rule anywhere. Now driven by the real `RoomState`.
+3. **The status control was a `<button>` with no `onClick`** — it looked interactive and
+   did nothing. Now a real button in a call, an inert `<span>` otherwise.
+4. **The diagnostics drawer was unreachable.** `setIsDiagnosticsOpen(true)` had zero call
+   sites. The header chip now opens it.
+5. **`.diag-drawer` was `position: fixed; top: 0`**, spanning the full window height and
+   covering the header's right side. Harmless while the drawer was unreachable; fatal once
+   the chip opens it — the drawer's own close button sat over the chip, so the toggle could
+   never be pressed a second time. Now `top: 56px`, which must equal the header height.
+   Phase 7 replaces the magic number with real layout.
+
+Verified behaviourally by `header-probe.mjs` against the real component (all pass):
+
+```
+lobby-fresh   status is an inert <span>; dot rgb(87,80,74) = --text-faint; no room chip
+joining       status is a <button aria-expanded=false>; dot rgb(201,135,63) = --accent
+              header claims NO transport path while connecting
+room-10       dot rgb(91,122,114) = --idle; header label "Connected·Relay"
+              drawer opens on click, Transport Path = "Encrypted relay", closes on 2nd click
+room-1        header label "Connected·Direct"; drawer Transport Path = "Direct P2P"
+```
+
+The two connected scenarios producing different labels (`Relay` vs `Direct`) is the
+evidence bug 1 is actually fixed. `joining` claiming no path while the drawer says
+"Not established" is the "only expose what the app actually knows" rule working.
+
+### 5. Files
+
+Created:
+
+- `ui/src/lib/transport.ts` — live vs configured transport descriptors. Values verified
+  against the Rust enums; no invented fallbacks; `known: false` renders as an absence.
+- `ui/src/components/verio/app-header.tsx` — the rebuilt header. Uses the Stitch
+  `win-titlebar` direction (brand + breadcrumb left, status cluster right) and
+  **deliberately omits the deck's minimise/maximise/close buttons**: Verio uses Tauri's
+  native window decorations, so drawing our own would be three controls that look
+  functional and do nothing.
+
+Modified:
+
+- `ui/src/App.tsx` — `AppHeader` wired in; `getTransportBadgeInfo()` replaced by
+  `liveTransport` / `configuredTransport`; diagnostics drawer and lobby card updated;
+  now-unused `verioLogo` import removed. The mic meter is untouched
+  (`micLevelRef.current.style.width = …`, ~20 Hz imperative path preserved).
+- `ui/src/App.css` — the `@layer base` fix; legacy header rules deleted (`.header`,
+  `.brand`, `.brand-mark` including the later 26px override, `.brand-word`, `.brand-dot`,
+  `.header-right`, `.rtt`, `.room-chip`, and the dead `.status-pill .dot` rules).
+  `.status-pill` is deliberately **kept** — the music panel still uses it (Phase 4).
+  `.diag-drawer` `top: 0` → `top: 56px`.
+- `ui/src/styles/index.css` — the four design breakpoints added to `@theme`
+  (`sm` 700 / `md` 900 / `lg` 1100 / `xl` 1400, with `--breakpoint-*: initial`).
+- `ui/src/lib/transport.ts` — lobby hint copy tightened (see §3).
+
+### 6. A guard that could not fail, rewritten
+
+`check-collisions.mjs` v1 asked "does any DOM element carry a class the utilities layer
+defines?" That was the right question before components migrated. Once they migrate *on
+purpose*, the answer is always yes and it reported **43 bogus collisions**.
+
+It now checks the two invariants that actually matter:
+
+- **LEAK** — a class token used by the still-legacy `App.tsx` markup that is also a
+  Tailwind utility name with no `App.css` rule. Tailwind styles it silently.
+- **MIX** — a single live element carrying both an `App.css` class and a utilities-layer
+  class. Two styling authorities on one element.
+
+It also now reads utility names from the **live page's CSSOM** unioned with `dist`, rather
+than `dist` alone: the DOM scan must run against the dev server (the mock harness is gated
+on `import.meta.env.DEV`, so `dist` cannot select a scenario), and comparing a dev-server
+DOM against a `dist` stylesheet compares two different compilations. Current result:
+**123 utility selectors, 282 App.css selectors, LEAK clean, MIX clean.**
+
+`header-metrics.mjs` v1 was also vacuous: it tested
+`left.w + right.w + gap <= width` where `gap = right.left - left.right`, which simplifies
+to `right.right - left.left <= width` — true whenever two boxes sit inside a viewport-wide
+box. It reported "ok at every breakpoint" while the header's padding was 0. Rewritten to
+assert the properties that define "fits": no horizontal overflow, padding non-zero, left
+cluster at `paddingLeft`, right cluster at `viewport − paddingRight`, single row. Now
+reports correct at 700/860/1100/1400 for both lobby and in-call.
+
+### 7. Tooling added
+
+`check-collisions.mjs` (rewritten), `foundation-live.mjs`, `diff-scope.mjs`,
+`diff-shift.mjs`, `verify-header-isolation.mjs`, `header-probe.mjs`, `header-metrics.mjs`,
+`audit-unlayered.mjs`, `find-header-edge.mjs`, `sample-pixels.mjs`, `inspect-layers.mjs`.
+All mirrored into the `verio-frontend-migration` skill, which now documents the unlayered
+reset trap and the "a check that cannot fail is not a check" rule.
+
+### 8. Discovered, not fixed (out of scope, recorded)
+
+- **The brand logo is a 1254×1254, 863 kB PNG** (`ui/src/assets/verio-logo-primary.png`)
+  rendered at 24×24 — a ~52× downscale decoded on every startup, and 863 kB of the
+  1.1 MB bundle. The header now imports it at `size-6`. Worth a properly sized asset.
+- **The backend pins the transport mode.** `crates/verio-app/src/room.rs` sets
+  `let effective_mode = crate::settings::TransportModeSetting::CloudRelay;`, so the user's
+  `transport_mode` setting has no effect and the `PeerHost` / `DirectP2P` arms are dead
+  code. The UI now reports the *configured* value truthfully in the lobby and the *live*
+  value from diagnostics; it does not paper over the disconnect.
+
+### 9. Carry into the rest of Phase 3
+
+Remaining shell pieces: `Dock`, `TelemetryRow`, `StateChip`, `KbdChip`, `MeterWell`,
+`EmptyState`. `Panel` and `SectionLabel` already exist as primitives.
+
+Then Phases 4–7 (music → lobby → settings → room), each following the five-step procedure,
+and Phase 8 cleanup.
+
+Carry-forward:
+
+- The music panel's status dot has the same bug as the old header dot: `.status-dot`
+  hardcodes `background: var(--text-faint)`, so the pill's `status-sending` /
+  `status-paused` classes recolour the text but never the dot. The two dead
+  `.status-pill.status-X .dot` rules that used to patch it were deleted this session. Fix
+  belongs in the Phase 4 music rebuild.
+- `.brand-section` / `.brand-title` in `App.css` are provably unused (no markup references
+  them) — lobby-scoped, so delete in Phase 5 rather than here.
+- `button:focus-visible` (unlayered) will beat any Tailwind `focus-visible:outline-*`
+  utility. Address before styling focus in Settings or Room.
+- The lobby Host Call card is 240px wide at the 700px floor; parenthetical hint copy must
+  stay short or the card grows a line and reflows the centred layout.
+- `html, body` colour/font-size/height are owned by unlayered `App.css` while
+  `styles/index.css` sets the same values in `@layer base`. Duplication, not conflict —
+  resolve when `App.css` is finally removed.
+
+Still outstanding from the approval message: Q8 and Q9 were never seen in full.
+
+
+## Session 19 — Phase 3: the dock rebuilt in Tailwind, and the defect the rebuild introduced
+
+Second shell component after the header. The dock is now
+`ui/src/components/verio/dock.tsx`, wired from `App.tsx`, with its legacy CSS deleted
+from `App.css`.
+
+### 1. What moved
+
+- `App.tsx`: the 150-line legacy `<footer className="dock">` block is now a 33-line
+  `<Dock>` call. No behaviour was added or removed; every prop maps to something the
+  component already had.
+- The `input_level` subscription moved out of the initial-load effect into
+  `useMicLevelStream(micLevelRef)`. Same event, same dB→percent mapping, same direct
+  `style.width` write on a ref. Only the registration moved, so the meter owns its own
+  lifecycle. `micLevelRef` is now `useRef<LevelMeterHandle>` rather than
+  `useRef<HTMLDivElement>`.
+- New shared primitives: `state-chip.tsx` (one chip; renders an inert `<span>` unless
+  given an `onClick`, so "looks clickable" and "is clickable" cannot come apart),
+  `kbd-chip.tsx`, `level-meter.tsx`.
+- `icons.tsx`: `IconDeafen` replaced by the `IconEar` / `IconEarOff` pair, matching the
+  module's existing `X`/`XOff` convention (`IconMic`/`IconMicOff`).
+- `app-header.tsx`: two hand-rolled `<svg>` icons at `strokeWidth="1.2"` replaced with
+  `IconCopy`. They violated design.md's 1.3–1.5 stroke range and bypassed the icon
+  module — a leftover from the header rebuild.
+
+### 2. The five measured dock defects — all fixed
+
+Every one was measured on the live element before the change, by reading
+`getBoundingClientRect()`, not by reading `.dock` in the stylesheet.
+
+| # | defect | measured | now |
+|---|---|---|---|
+| 1 | height was content-dependent | 72px, but **76px** once the music strip appeared | fixed `h-18` = 72px, identical in every scenario |
+| 2 | identity block wrapped to two lines | `.me-meta` had `flex-wrap: wrap` | single non-wrapping row |
+| 3 | mic meter shrank | 90px → **78px** when the strip appeared (no `flex-shrink: 0`) | `shrink-0` |
+| 4 | deafen showed no hotkey while mic did | both hotkeys exist in settings | both controls expose a `<kbd>` |
+| 5 | music strip was a clickable `<div>` | unreachable by keyboard | real `<button>` |
+
+Defect 1 is why the dock "grew" when you played a track. Defect 3 matters because a
+fixed-scale readout must not depend on what else happens to be in the bar.
+
+### 3. The defect the rebuild introduced — and it was found by measuring, not reviewing
+
+At the 700px floor with the music strip present, the **user's own display name clipped to
+0px**. The identity cluster was being starved by the flex algorithm.
+
+The mechanism is worth writing down, because it is silent:
+
+- The identity cluster is `flex-1` = `flex: 1 1 0%` with `min-w-0`. A flex base size of 0
+  means that when there is a deficit the item has *nothing to shrink from* — it is simply
+  assigned whatever is left over.
+- The strip has `flex-basis: auto`, so it keeps its full 138px.
+- So the cluster was assigned 136px while its children needed ~258px, and the children
+  overflowed inside it. The only visible symptom was the name going to zero width.
+
+Measured budget at 700px, in-call, music playing: left cluster **136px**, music button
+40px, strip 138px, call controls 286px, gaps 60px = 660px content. Nothing overflowed the
+dock, which is exactly why the standard overflow checks said "ok".
+
+**Fix**, in order of how much confidence each part deserves:
+
+1. The dock is now a **container** (`@container`), and the strip is `@max-[800px]:hidden`.
+   The dock's capacity is a property of the dock; 800px is not on the fixed
+   700/900/1100/1400 viewport scale and should not be forced onto it. **Verified the
+   variant actually compiled** — `@container not (min-width:800px){…{display:none}}` is
+   present in `dist/assets/*.css`. A successful build says nothing about whether a
+   Tailwind variant generated.
+2. Hiding the strip created an information gap, so the music button now takes the accent
+   while `music.playing` is true — a fact the backend reports. Hiding chrome obliges you
+   to carry its state somewhere else, or the user loses information rather than just
+   pixels.
+3. Meter 90px → **40px**. 90px is off design.md's spacing scale and consumed 40% of the
+   identity cluster's entire budget at the floor. 40px is the nearest on-scale step that
+   still reads as a level; the binary "am I transmitting" signal is the accent fill, not
+   the bar's width.
+4. The name got `min-w-8`, so it truncates rather than vanishing.
+
+After the fix, nothing truncates at any of 700 / 860 / 1100 / 1400.
+
+Two follow-ups from reviewing the captured screenshots:
+
+- **60px was tried for the meter first and measured out.** It clips the display name to
+  its 32px minimum at the 700px floor in every scenario. The name is worth more than 20px
+  of meter, so it is 40px. The code comment records the measurement so this is not
+  re-litigated.
+- **I broke an accessible name without noticing.** The music toggle was relabelled
+  "Music player" (a noun) from "Toggle music player panel" (an action). For an icon-only
+  toggle the name should describe the action, and `aria-pressed` already carries the
+  state — but the change also broke the screenshot harness, which drives that button by
+  its label. 24 of 48 shots failed to open the music panel and were silently captured in
+  the wrong state. Restored, with the playing state moved to the `title`. The lesson is
+  the same shape as the rest of this session: a harness failure that still produces
+  output is worse than one that produces none.
+
+### 4. `dock-metrics.mjs` — a probe written against the old defects
+
+The assertions are chosen so the probe can distinguish the old dock from the new one; a
+check that passes for both proves nothing. It also prints a per-child **width budget**,
+which is how the starvation above was located rather than guessed at.
+
+It additionally proves the imperative mic path: a `MutationObserver` over the whole app
+while `input_level` streams, asserting **0 childList mutations** across 1.2s plus at least
+3 distinct fill widths. Routing the value through `useState` would produce childList
+churn; nothing else in the app does. Result: 20/20 samples distinct, 0 childList
+mutations, attribute writes only on the meter fill and the music panel's slider.
+
+Three probe bugs had to be fixed before the output could be trusted:
+
+- It identified buttons by accessible name and reported "no Mic button found" against a
+  perfectly good button: the `<kbd>` is `aria-hidden`, so the accessible name is "Mic"
+  while `textContent` is "Mic" + the hotkey. Now matches on `title`.
+- It flagged `span.truncate` as overflow. A truncating element is *supposed* to have
+  content wider than its box; `text-overflow: ellipsis` + `white-space: nowrap` is the
+  declaration of that intent. It is now reported as information, with the clip amount,
+  while still failing if a name is clipped by more than 8px.
+- `display: none` elements still match `querySelectorAll`. Presence and visibility are
+  two different facts, and the probe now measures them separately.
+
+### 5. Legacy CSS deleted
+
+`strip-dock-css.mjs`: 9 exact-match replacements, **4747 bytes** removed from `App.css`.
+It refuses to write unless every replacement matches exactly once, and reports byte
+counts — stronger than N independent edits, and it cannot half-apply.
+
+Removed: the entire "Bottom dock" section (`.dock`, `.dock-left`, `.dock-right`, `.me`,
+`.me-meta`, `.me-name`, `.me-state`, `.dock-btn` plus all its hover/active/muted/deafened/
+is-active rules, `.kbd`), the dead `.meter` / `.meter.live` VU rules, `.dock-mode-badge`,
+`.btn-dock-music` (from three shared selector groups *and* its own later override block),
+`.dock-music-strip`, `.strip-play-glyph`, `.strip-info`, `.strip-title`,
+`.strip-progress-bar`, `.strip-progress-fill`, `.mic-meter-track`, `.mic-meter-fill`, and
+the dead `.brand-section` / `.brand-title` / `.brand-mark` header leftovers.
+
+**`@keyframes vu` was deliberately kept.** I had recorded it as dead alongside `.meter.live`,
+but `.peer.is-speaking .vu span` still animates with it. Checking before deleting avoided a
+real regression.
+
+The deletion guard first aborted reporting **18 survivors** while the deletion had in fact
+worked perfectly — its own tombstone comments named every deleted class, so the substring
+search matched the explanation. Comments are now stripped before any textual check over
+source.
+
+### 6. Tooling hazard: parallel edits to one file
+
+**Two `Edit` calls targeting the same file in one message both report success, but only the
+second is written.** The first is lost silently — no error, no warning, no diff.
+
+It happened twice this session, both times to an import statement, so `tsc` caught it. Had
+it been a CSS value or a JSX attribute it would have shipped. This is the same class of
+failure as the unlayered reset: **a reported success that did not happen.** Working rule
+from here: one edit per file per message, then re-read the file to confirm.
+
+### 7. Verification — real output
+
+| check | result |
+|---|---|
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean, 1907 modules, css 55.68 kB / js 329.48 kB |
+| mock harness in bundle | 0 occurrences |
+| `dock-metrics.mjs` | ALL CHECKS PASSED — heights 72/72/72, meters 40/40/40, no truncation, strip hidden@700 visible@860+ |
+| `foundation-live.mjs` | 582 spacing declarations, every one applying its named value |
+| `check-collisions.mjs` | LEAK clean, MIX clean |
+| `header-metrics.mjs` | 56px, padding 20/20, clusters flush, ok at 700/860/1100/1400 |
+| `audit-unlayered.mjs` | 231 unlayered rules; the same 2 known hazards, both already carried forward |
+
+### 7b. Isolation: did the dock change touch anything it shouldn't?
+
+`after-header` (the Session 18 state) is the right baseline for a dock-only check —
+`final-foundation` predates the header rebuild and reports ~980k "spilled" pixels for
+reasons that have nothing to do with this session.
+
+`diff-bands.mjs` (new) answers "did anything change outside an allow-list of bands?",
+which a percentage cannot. Allow-listed the header (0–58) and the dock (568–640):
+
+- **`lobby-ready`, `room-1`, `room-ptt`@860 — 0 pixels outside the bands.** Clean.
+- **Every y=564 spill is the dock's top border moving 4px.** Measured by reading the
+  `--border` row: the *old* dock's top border sat at y=564 in `room-ptt@700` and
+  `music-playing@860` (i.e. it was 76px tall, not 72px) and at y=568 elsewhere. The new
+  dock is at y=568 in every single shot. So these "spills" are precisely the bug being
+  fixed, and they propagate into the music panel, which is positioned above the dock.
+- **One unattributed difference: 64 pixels**, ≤3/255 per channel, exclusively on the four
+  rounded corner arcs of the one peer card whose peer is `speaking` (`room-self-muted`).
+  The card's box, position and border colour are identical; only the corner
+  anti-aliasing differs.
+
+  This is **not** harness noise — the control experiment (same build captured twice,
+  `ctrl-a` vs `ctrl-b`) is clean on that element, and a fresh capture matches `after-dock`
+  exactly while differing from `after-header`. It is also **not** the container query:
+  removing `@container` and re-capturing did not reintroduce it. The most plausible
+  remaining cause is the deletion of the dead `.meter.live span` rules, which were the
+  other consumer of `@keyframes vu` — removing 12 animation instances could shift the
+  browser's compositing heuristics for the `peer.is-speaking` card. Not verified, so it is
+  recorded as unattributed rather than explained away.
+
+### 8. Carry-forward
+
+- Phase 3 remaining: `TelemetryRow`, `MeterWell`, `EmptyState`. (`Panel`, `SectionLabel`,
+  `StateChip`, `KbdChip` are done.)
+- Then Phases 4–7 in order: Music → Lobby → Settings → Room.
+- Backend defect, **not fixed** (the redesign is frontend-only): `crates/verio-app/src/room.rs:700`
+  pins `let effective_mode = crate::settings::TransportModeSetting::CloudRelay;`, so
+  `Settings.transport_mode` has no effect and the `PeerHost` / `DirectP2P` arms are dead
+  code. The UI now reports the *live* mode from `TransportDiagnostics.mode`, which is
+  honest about what is actually carrying voice, rather than the configured mode, which
+  would be a lie.
+- Logo asset: 1254×1254 / 863 kB PNG rendered at 24×24.
+- Unchanged from Session 18: music panel `.status-dot` never recolours (Phase 4);
+  `button:focus-visible` unlayered beats Tailwind `focus-visible:outline-*`; the lobby card
+  is 240px wide at the 700px floor so parenthetical copy must stay short; `html, body`
+  duplication between unlayered `App.css` and `@layer base`.
+- Still outstanding from the approval message: Q8 and Q9 were never seen in full.
+
+
+---
+
+## Session 20 — scope decisions from the user, and a correction to the probe
+
+### 1. Decisions taken (these override the original brief in two places)
+
+I asked four blocking questions before continuing. The answers:
+
+**Q1 — Voice transport.** *"the voice transport is for older version of app now we dont
+need that remove it"*
+
+The transport-**mode** concept is legacy; Verio is cloud-relay only now. So the
+create-room panel's transport label and its `"Change voice transport mode in Settings"`
+tooltip are to be **removed**, along with `describeConfiguredTransport` and its call site.
+This also resolves the lie I found: the panel was telling the user which transport their
+room would use, based on a setting that (a) no UI control could change, (b) the frontend
+never sent via the existing `set_transport_mode` command, and (c) `room.rs:700` ignored
+anyway. Three stacked falsehoods, all now moot.
+
+The *live* transport reading (`TransportDiagnostics.mode`, shown in the header chip and the
+diagnostics drawer) is measured data, not a configuration claim, so it stays. Recorded as a
+judgement call: if the whole transport surface is unwanted, say so and I will remove the
+live reading too.
+
+**Q2 — Rust boundary.** *"you can change the rust code but only setting and things that
+you're sure its not gonna effect the voice transport and app"*
+
+So: Rust changes are permitted, restricted to settings-adjacent code and changes I am
+confident cannot affect voice transport or app behaviour. Concretely this **does not**
+license touching `room.rs:700` — that line is the transport path itself, and it is now moot
+anyway. The logo asset is in scope.
+
+**Q3 — Music scope.** *"Add playlist to the backend"*
+
+This is a genuine scope increase beyond the original "frontend redesign only, do not modify
+Rust" brief, and I am treating it as authorised because it was chosen explicitly. It means
+new backend work in `verio-dsp/src/music.rs` + `verio-app/src/pipeline.rs` and new commands.
+It will be designed so that it is **additive to track selection only** — the queue decides
+which file is loaded next through the existing `music_open` path — so it cannot reach the
+voice path. Full design recorded separately before implementation.
+
+**Q4 — Review cadence.** *"i check after everything is done"* — I run Phase 3 → Phase 8
+through and present the whole thing at the end, rather than stopping per screen.
+
+### 2. Correction: the carry-forward list above is stale
+
+It lists `TelemetryRow` as still remaining in Phase 3. `TelemetryRow` and `TelemetryList`
+were completed and are in use by the diagnostics drawer. The real remaining Phase 3 items
+are `MeterWell` and `EmptyState` only.
+
+### 3. `check-collisions.mjs` was never actually clean
+
+The Session 19 line "LEAK clean, MIX clean" was a **false pass**. Three successive bugs in
+the class-name extractor, one of which I introduced while fixing the previous one:
+
+| Extractor | Defect |
+| --- | --- |
+| `\.([A-Za-z0-9_-]+)` | read decimals out of values as classes — `rgba(0,0,0,0.4)` → `.4`, `letter-spacing: 0.08em` → `.08em`. Those decimals also exist in the utilities layer, so it reported a phantom `LEAK: .08em .4 .5` |
+| `(?<![\w.-])\.(…)` — **my own regression** | silently dropped the second class of every chained selector. `.dock-mode-badge.is-live` yielded only `dock-mode-badge`. Removing it took the App.css set from 140 → 152 names: **12 real class names had been invisible** |
+| `\.(-?[A-Za-z_][A-Za-z0-9_-]*)` without a trailing-backslash check | captured the variant keyword out of `.active\:bg-accent-lo`, so bare `active` entered the utilities set and collided with App.css's genuinely-authored `.active` |
+
+The first character class `-?[A-Za-z_]` is the whole fix for decimals — a CSS identifier
+cannot begin with a digit. The lookbehind was both unnecessary and harmful. The
+trailing-backslash check is separate and also required.
+
+**The verdict had been worthless because the check had never once been seen to fail.** So I
+made it fail on purpose: injected `.mono-num { color: rgb(255 0 0) }` into `App.css`,
+confirmed `LEAK` fired on `.mono-num` with `node exit=1`, then restored from backup and
+`cmp` confirmed the restore byte-identical (44235 bytes).
+
+Final state: `LEAK` clean, `MIX` clean, `exit=0`. Utilities 155 names (was 182 — the 27
+escaped variant keywords are now correctly excluded), App.css 152, App.tsx 146.
+
+LEAK's *definition* was also wrong and is now fixed: it was "a class token used by
+still-legacy `App.tsx` markup", which became undecidable once `App.tsx` began containing
+migrated components — you cannot infer authorial intent from source text. It is now "a
+class name defined by both `App.css` and the utilities layer".
+
+### 4. Stale figure corrected
+
+An earlier note said `App.css` was ~41850 bytes after the drawer deletion; it is 44235. I
+verified the content rather than the number — all ten legacy dock/diag class names now
+appear only inside tombstone comments — so the deletions are genuine and the note was
+imprecise, not the file.
+
+---
+
+## Session 20 (continued) — Phase 4 closed, and the check that was missing
+
+Phase 4 (the Music screen) is **done and verified**. The work that mattered, though, was
+not the panel — it was discovering that the migration's verification suite had a hole, and
+that the hole had already let dead CSS survive a "successful" deletion.
+
+### 1. Phase 4 as specified
+
+Per the per-screen procedure in `REDESIGN-PLAN.md` §4.2:
+
+1. **Inventory** — the music panel's state, handlers, debounces and command calls.
+2. **Extract** — `ui/src/lib/use-music.ts` owns status, queue, `seekDraft`, `volumeDraft`
+   and every command. The 100 ms volume debounce and the seek-draft shadow are preserved
+   exactly; they are behaviour, not styling.
+3. **Rebuild** — `ui/src/components/verio/music-panel.tsx` (presentation only) plus
+   `empty-state.tsx`. The 205 lines of legacy panel JSX in `App.tsx` became 8.
+4. **Delete legacy CSS** — 67 selectors, 7100 bytes.
+5. **Verify** — below.
+
+`App.tsx` now calls `useMusic({ onStatus })` and renders `<MusicPanel>`; the `Dock` prop was
+reduced to `music={music.status}` / `musicPercent={music.percent}`.
+
+### 2. The gap: `check-collisions.mjs` cannot see dead CSS
+
+`check-collisions.mjs` answers two questions — LEAK (a class name both systems define) and
+MIX (one element styled by both systems). Neither is "does `App.css` define a class that
+nothing uses?". That gap is not academic:
+
+`strip-music-css.mjs` took a **hand-written list** of 41 dead names. It removed 67 selectors,
+printed success, and left behind `.music-panel-head`, `.music-panel-title`,
+`.music-panel-controls`, `.bar-fill`, `.music-time`, `.music-controls` and `.warn-note` —
+because the list, not the code, decided what "music CSS" meant. **A maintained list can only
+ever be as correct as the person maintaining it**, and the script's own guard could not
+catch it: the guard checked the same list.
+
+So the question is now asked from evidence. `dead-css.mjs` compares every class `App.css`
+defines against every class any source file mentions. It found **38 dead classes**, not 7:
+
+```
+.app-header .app-main .bar .bar-fill .btn .btn-danger .btn-ghost .btn-primary
+.circle-btn .digit-input .header-status .hero-tagline .hero-title .highlight
+.icon-btn .is-active .is-deafened .is-error .mono .music-art .music-artist
+.music-controls .music-meta .music-panel-controls .music-panel-head
+.music-panel-title .music-progress .music-time .music-title .peer-head
+.peer-status .peer-volume .peer-volume-fill .peer-volume-meta .peer-volume-track
+.span-2 .vu .warn-note
+```
+
+### 3. `dead-css.mjs` had two bugs of its own, both under-reporting
+
+A finder that misses a *use* turns live CSS into a "dead" verdict, which is the dangerous
+direction — the report invites deletion. Both bugs were in the literal harvester:
+
+| Bug | Effect |
+| --- | --- |
+| A template literal was whitespace-split, so a nested string kept its quotes: `` className={`peer ${cond ? "is-speaking" : ""}`} `` produced the token `"is-speaking"`, which fails the identifier test | the single most common JSX conditional-class pattern was invisible — `.is-speaking` was reported dead |
+| `${...}` was stripped and **discarded**, and a conditional's class names live inside it | same blind spot, second route |
+
+Both fixed by recursing into quoted substrings and harvesting the literal runs on either side
+of an interpolation. The harvest is deliberately confined to *literal contents*: running it
+over a whole source file instead would add every identifier (`const`, `src`, `readFile`) to
+the used-set, and a class named `mono` or `flex` would then be "used" by any variable of that
+name.
+
+**Proven able to produce both verdicts** before being trusted: `.zzz-probe-unused` appended
+to a copy is reported DEAD; `.peer` is not. Every one of the 38 was then confirmed by an
+independent `className`-focused grep, and the generic names were checked individually —
+`.bar`'s only textual hits were prose inside comments, and `.btn` is never used bare (only
+`primary-btn`, `secondary-btn`, `danger-btn`, `keybind-clear-btn`).
+
+### 4. `strip-dead-css.mjs` — the remover now imports the verdict
+
+The remover no longer holds a list. It imports `computeDead()` from `dead-css.mjs`, so the
+report and the edit **cannot drift apart**. The parser is carried over from
+`strip-music-css.mjs` unchanged, because all four of its bugs were found and fixed there.
+
+One new bug of its own, caught by its own guard: `isDeadPart` skipped any selector part
+containing `:not(`. `.peer:not(.is-speaking) .vu span:nth-child(1)` is dead — `.vu` never
+exists, so the rule can never match — but the blunt rule kept it and reported a survivor. The
+fix is to *empty* the functional pseudo rather than skip the part:
+
+```
+.peer:not(.is-speaking) .vu span  ->  .peer .vu span  ->  dead (vu)
+.peer:not(.vu)                    ->  .peer           ->  kept
+```
+
+The second case matters: a dead class inside `:not()` makes the part match *more*, not less.
+
+Final: **67 selectors + 1 keyframes block, 6575 bytes.** `App.css` is down from 152 class
+selectors to **67**, all 67 of them live. CSS bundle 49.52 → **44.05 kB**.
+
+### 5. Orphaned keyframes are dead CSS too
+
+Removing every `.vu` rule left `@keyframes vu` with nothing to animate. The file's own
+Session 19 comment claimed this had been "verified before removal" *by hand* — and a hand
+check is exactly what missed `.music-panel-head` for a whole session. It is a check now:
+`dead-css.mjs` reports `@keyframes` blocks that no `animation`/`animation-name` declaration
+references, and the remover drops them. `@keyframes ring` is guarded as a known-live anchor,
+because `.peer.is-speaking .peer-avatar::after` still consumes it.
+
+### 6. A real user-visible bug, found by the dead-CSS pass
+
+`App.tsx` rendered the toast as `` className={`toast-banner ${statusMsg.isError ? "error" : ""}`} ``,
+and `App.css` defined **`.toast-banner.is-error`**. There was no `.error` rule anywhere in the
+file — so **error toasts were styled identically to ordinary ones**, and had been. The CSS was
+written for a class name the JSX never emitted. `isError: true` appears at 9 call sites, so
+the path is reachable and the bug was user-visible.
+
+Fixed by emitting the class the CSS already expects (`is-error`), which restores the intended
+`--danger` treatment rather than inventing anything. The evidence-driven remover then
+correctly stopped reporting `.is-error` as dead — the pipeline responded to the fix.
+
+### 7. Four stale comments corrected
+
+A comment that asserts something false is its own defect — it is how a wrong belief survives
+a session. All four said the music panel still owned something it no longer did:
+
+- "`.status-pill` … the music panel still uses it. It moves with that panel in Phase 4."
+- "NOTE (known bug, deferred to Phase 4): `.status-dot` hardcodes `--text-faint` … Fix belongs
+  in the music rebuild." — **verified actually fixed**: `music-panel.tsx` renders a `StateChip`
+  whose dot class comes from `TONE_DOT[tone]`, the same tone that picks the label, so the dot
+  and the text cannot disagree.
+- "The `@keyframes vu` animation is still used by `.peer.is-speaking .vu span`, so it stays."
+- "verified before removal, which is the check that saved `@keyframes vu` from the same fate."
+
+### 8. The mock was reporting a state the app cannot reach
+
+`verify-music.mjs` asserted that pausing flips the status chip. It did not, and the fault was
+**the harness, not the panel**. Rust derives `active` in one place —
+`decoder.is_some() && g.playing` (`MusicSource::status`, and `is_active` is the same
+expression). The mock hand-set the field at **five** call sites, and three disagreed:
+
+| Site | Mock | Backend |
+| --- | --- | --- |
+| `music_open` | `active: true` | `open()` sets `playing = false` → **false** |
+| `music_play` | never touched | `playing = true` → true |
+| `music_pause` | left true | `playing = false` → **false** |
+
+Not cosmetic: the panel's chip reads `active` to decide whether to claim "Sending to room", so
+the mock made a correct UI look like it was broadcasting silence while paused — the mirror
+image of the failure a harness exists to catch. Fixed with one `emitMusicStatus()` that derives
+the value and emits; every status emit routes through it and the five literals are gone.
+
+The patch script then **inflicted its own bug**: it inserted the helper and *then* replaced
+every emit call, which rewrote the helper's body into a call to itself — infinite recursion.
+The only signal was the routed count reading 17 where the pre-patch file had 16. Fixed by
+replacing first and inserting after, plus a post-condition that the helper body contains the
+raw emit call.
+
+### 9. Verification
+
+`verify-music.mjs`: 6 scenarios × 2 widths (860, 700), then 9 interaction assertions on
+`music-playing` — pause/resume, next, previous, per-track repeat, queue repeat, jump to a
+queue row, Add files, Clear, collapse. Every control is clicked and the resulting DOM change
+asserted, which is the anti-fake-feature check: a button that renders but does nothing fails
+here.
+
+| Check | Result |
+| --- | --- |
+| `tsc --noEmit` | exit 0 |
+| `vite build` | clean · CSS 49.52 → **44.05 kB** · JS 330.94 kB |
+| harness absent from `dist` | 0 hits for all 5 strings |
+| `check-collisions.mjs` | LEAK clean, MIX clean, exit 0 |
+| `dead-css.mjs` | DEAD none, ORPHAN KEYFRAMES none |
+| `verify-music.mjs` | all states render, all controls wired, no overflow at 700px, no console errors |
+
+Two of the script's own checks were wrong and were fixed: the favicon filter tested
+`m.text()` when the URL is only in `m.location()` (so a favicon 404 was reported as a real
+failure), and `ul > li button` matches **two** buttons per queue row — the jump button and the
+remove button — so `nth(2)` hit row 1 and reported a jump failure that did not exist.
+
+**Both checks were then proven able to fail**, since a check that has never failed is not a
+check. Re-introducing the `active` bug made exactly the chip assertion fail; making
+`music_queue_jump` ignore its index made exactly the jump assertion fail. Each was reverted
+and `cmp` confirmed byte-identical.
+
+### 10. Open question — the header's live transport badge
+
+The header still renders a transport label from `TransportDiagnostics.mode` via
+`describeLiveTransport`; with the mock's `direct_p2p` fixture it reads **DIRECT**. This is the
+*live* half of the transport surface (the *configured* half was removed as provably
+unreachable). The user's instruction was that the voice transport is legacy and should be
+removed. Two readings — the badge reports a real backend value and could legitimately vary
+(`forced_relay` on a failed direct connection), or it is a leftover of a removed concept that
+can only ever read one thing because `room.rs` pins the mode. **Raised rather than decided.**
+
+
+---
+
+## Session 21 (2026-09-21) — Phase 5: Lobby
+
+Phase 5 (the Lobby screen) is **done and verified**. But three of the four things worth
+recording here are not the lobby: a systemic class of silent no-op, a defect in my own diff
+tool that had been manufacturing "no change" verdicts for several sessions, and a new check
+that was written to catch the first of those — and that reported "clean" on deliberately
+broken input until its own bugs were found.
+
+The pattern is the same each time. **The code that was wrong kept running and kept printing
+a verdict.** That is the failure mode this project keeps producing, and it is the one worth
+writing down.
+
+### 1. Phase 5 as specified
+
+| Step | Outcome |
+| --- | --- |
+| Inventory state/handlers/effects/keyboard/commands | Done — full Lobby region of `App.tsx` read and traced |
+| Extract the tangled logic (minimum needed) | **Deviation:** no hook extracted. The Lobby's only outbound state is "is a room action in flight", so it receives `busy: boolean` instead of the whole `RoomState` (which is declared in three places). A `useLobby` hook would have wrapped two `invoke` calls in a pass-through. |
+| Rebuild with Tailwind + tokens | `components/verio/lobby.tsx` (new), `components/verio/room-code-input.tsx` (new) |
+| Delete the legacy CSS | 13 class selectors removed; `App.css` 67 → **54**, all 54 live |
+| Verify | §7 below |
+
+Two real defects were found in the original lobby and fixed rather than faithfully
+re-rendered:
+
+1. **The OTP boxes collapsed at 700 px.** Declared 52×52, measured **~31 px** at 700 px
+   (`.lobby-container`'s `auto-fit` grid squeezed them). The rebuild uses `size-10`
+   (40 px, matching `Button size="lg"`) inside a `sm:grid-cols-2` grid, and 700 px was
+   re-measured after the change.
+2. **Nested scrolling.** `.lobby-container` set its own `overflow-y: auto` inside
+   `.main { overflow-y: auto }`, which `design.md` forbids. The rebuild keeps
+   `min-h-full` and sets **no** overflow — `.main` is the single scroll owner.
+
+Also noted for Phase 6: `.primary-btn` was defined and used **nowhere** (Settings uses
+`secondary-btn` / `danger-btn` / `keybind-clear-btn`), so Settings currently has no
+accent-styled primary action. Confirmed by an independent grep, not by the dead-CSS tool
+alone. Removed; the gap is a Settings design question, not a lobby one.
+
+### 2. `duration-fast` — 13 silent no-ops across 9 files
+
+The headline finding, and it was not in the lobby.
+
+While checking that the OTP boxes should be recessed like every other input in the app, I
+audited `duration-*` usage and found **`duration-fast` used 13 times across 9 files and
+emitted by nothing.**
+
+Tailwind scanned the very same className strings and produced `.tracking-chip` and
+`.ease-verio` from them. It never produced `.duration-fast`, because `--duration-fast` is a
+*theme token*, not a utility namespace — Tailwind v4 has no `--duration-*` namespace, so
+`duration-fast` is not a class it knows how to build. Settled empirically against the built
+stylesheet, not by reasoning:
+
+```
+duration-fast  MISSING   (13 call sites, 9 files)
+duration-200   EXISTS    .duration-200{--tw-duration:.2s}
+ease-verio     EXISTS
+tracking-chip  EXISTS
+```
+
+Every one of the 13 was a no-op that *looked correct*, because
+`--default-transition-duration` happens to be the same 140 ms. Nothing failed, so nothing
+reported. Removed all 13 (replaced with `duration-200` where a duration was actually
+wanted); the `--duration-fast` **token stays**, because `styles/range.css` legitimately
+consumes it as `var(--duration-fast)`.
+
+**Proof the removal changed nothing:** the `joining` scenario renders the in-call view, which
+contains the header and dock — the elements carrying most of the 13 uses. Its before/after
+screenshots are **byte-identical**. Not "within tolerance" — byte-identical.
+
+### 3. My diff tool was lying, and had been for sessions
+
+The OTP background change (`bg-surface` → `bg-bg`) produced a reported **0 pixels of
+difference**. The change had definitely applied — `probe-otp.mjs` measured the box at
+`rgb(23,20,18)` = `--bg` against the panel's `rgb(33,28,24)` = `--surface`.
+
+The cause was in `diff.mjs`:
+
+```js
+const diffPixels = pixelmatch(a.data, b.data, diff.data, a.width, a.height, {
+  threshold: 0.1,          // ← hardcoded
+});
+```
+
+`--threshold=` on the CLI only set the *reporting bucket*, never the comparison. A delta of
+(10,8,6) sits under pixelmatch's 0.1 tolerance, so **"0 px" had been meaning "no pixel
+exceeded a loose colour tolerance"**, not "identical". Every "unchanged" verdict this tool
+had produced was weaker than I had been treating it as.
+
+Fixed: the two concerns are now separate. The colour tolerance is a distinct constant
+(0.02), and `--threshold=` governs reporting only. Re-running the same comparison with the
+fix showed **5696 px at 700 and 5699 px at 860** — exactly the four OTP boxes — while the
+header and dock stayed at zero. The measurement that had been invisible for sessions was
+there all along.
+
+### 4. A second harness bug, same shape
+
+`shoot.mjs` filtered console errors with `!m.text().includes("favicon")`. The favicon URL is
+only in `m.location()`, never in the text — so a favicon 404 was reported as a real console
+error and every capture carried one. The filter now checks both. Confirmed by re-capturing:
+"no console errors or page errors in any shot".
+
+### 5. `check-phantom-classes.mjs` — the check that could not fail
+
+A class token that resolves to no rule is invisible to every existing guard: a screenshot
+diff cannot see it (the pixels are what they are), `tsc` cannot see it (it is a string), and
+the dead-CSS check looks the *opposite* direction (rules no source mentions). So it needed
+its own check: **source tokens vs. every class name the app can resolve** (built bundle ∪
+`App.css`), with selectors unescaped first so `.hover\:bg-x` compares as `hover:bg-x`.
+
+It reported "clean". Then I injected `duration-fast` and `grid-colss-1` on purpose and it
+reported "clean" again. **It had three bugs, all of which failed by silence:**
+
+1. `balanced(open)` compared `src[i] === open` — an index against a character. Always false,
+   so `depth` never incremented, the function always returned `null`, and both call sites
+   (guarded on `end !== null`) did nothing. **Every `className={…}` and every `cn(…)` /
+   `clsx(…)` / `cva(…)` argument was skipped.** The 171 tokens it "checked" came only from
+   plain `className="literal"`. Fixing this alone took the count 171 → **250**.
+2. The selector regex required a *plain* first character, so `.\@max-\[800px\]\:hidden` was
+   invisible — and a perfectly valid container query was reported as a phantom. Escapes are
+   now allowed in the first position, including the hex form (`\32 ` for a leading `2`).
+3. Comments were scanned as code. `room-code-input.tsx` names the legacy `.otp-box:focus`
+   rule inside a backtick pair while explaining what replaced it, and the backticks were read
+   as a template literal — so `.otp-box` was reported as a class that does not exist. A
+   comment-stripper (a small lexer, because `//` also appears in `https://`) now runs first.
+
+The `--find=<token>` flag exists because of bug 1: a check whose failure mode is silence needs
+a way to be interrogated. `selfTest()` runs on every invocation and asserts the extractor can
+see a token in all 13 shapes it claims to support, including a conditional branch inside a
+`${…}` interpolation — that recursion was added because discarding interpolation bodies is
+exactly how `.toast-banner.is-error` shipped broken once already.
+
+**Final state: 250 tokens checked, 0 phantoms, self-test 13/13, exit 0.** And it now fails
+correctly: with `duration-fast` and `grid-colss-1` injected it reports both and exits 1;
+reverted, `cmp` confirms byte-identical.
+
+`@max-[800px]:hidden` is genuinely live — the `@container` class is on the dock's own
+`<footer>` and the button is its child, so the query measures the dock, as its comment says.
+
+### 6. The music panel now uses `Panel`
+
+`music-panel.tsx` hand-rolled `rounded-md border border-border bg-surface p-4`, which is
+exactly `components/ui/surface.tsx`'s `Panel`. It now consumes it, giving `Panel` a second
+real consumer. `verify-music.mjs` selected on `section[aria-label="Music player"]`, which the
+primitive does not emit, so its selector was updated to match the `data-slot` the primitive
+actually renders.
+
+### 7. Verification
+
+| Check | Result |
+| --- | --- |
+| `tsc --noEmit` | exit 0 |
+| `vite build` | clean · CSS 44.05 → **41.42 kB** · JS 330.94 → **324.15 kB** |
+| `dead-css.mjs` | defines 54, all live · DEAD none · ORPHAN KEYFRAMES none |
+| `check-collisions.mjs` | LEAK clean · MIX clean |
+| `check-phantom-classes.mjs` | self-test 13/13 · 250 tokens · 0 phantoms · exit 0 |
+| `verify-music.mjs` | all states render, all controls wired, no overflow, no console errors |
+| lobby capture | 12 shots at 860 + 700, 6 states, no console errors |
+| `before-lobby` vs `after-lobby4` | 12/12 changed, 13.4–14.6% of pixels; in-call scenarios unchanged |
+
+The in-call scenarios being unchanged is itself the evidence that the lobby rebuild touched
+only the lobby: the header and dock are present in both and did not move.
+
+### 8. Still open
+
+**The Lobby's responsive structure contradicts the approved plan — and the plan contradicts
+the design deck.** `REDESIGN-PLAN.md` §4.1 says the Lobby is *"Direction 1 Split Workbench,
+with the sidebar collapsing to a 56 px rail below 900 px and the two action panels stacking
+below 900 px"*. Checked against the deck's own `code.html`:
+
+- There is **no sidebar** in the lobby deck. The only grids are `.action-grid` (the two
+  action panels) and `.state-grid` (the six-card states matrix, which is deck presentation
+  chrome, not app UI). The plan sentence appears to describe the board's own left nav.
+- `.action-grid` is `grid-template-columns: 1fr 1fr` with **no media query at all** — the deck
+  never stacks the two panels. Only `.state-grid` has breakpoints (1180 → 2 cols, 768 → 1).
+  So the plan's "stacking below 900 px" looks like it conflated the deck's `state-grid`
+  breakpoints with the app's `action-grid`.
+
+The rebuild as shipped uses `sm:grid-cols-2`, i.e. the panels stack below **640 px**, and at
+700/860 they sit side by side — **matching the deck, not the plan.** Measured at 700, 860,
+900, 1100 and 1400: zero horizontal overflow at every width, and the OTP boxes hold a
+constant 40×40 at all five (the legacy 52 → 31 px collapse is gone everywhere, not just at
+700). The cards do grow without a cap: 302 → 382 → 402 → 502 → 652 px.
+
+**Raised, not silently resolved.** Either the plan's sentence is wrong and should be corrected
+to match the deck, or the deck should win for 700–900 and the plan needs a different rule.
+`design.md` states no max content width, so the unbounded card growth at 1400 is a separate
+open question.
+
+**The header's live transport badge** — carried over from Session 20, still undecided. It
+renders `TransportDiagnostics.mode` via `describeLiveTransport` and reads **DIRECT** under the
+mock's `direct_p2p` fixture. Either it reports a real backend value that can legitimately vary
+(`forced_relay` after a failed direct connection), or it is a leftover of a concept the user
+asked to remove and can only ever read one thing. Raised again rather than decided.
+
+**Phase 6 (Settings)** is next. The `.primary-btn` gap above is the first thing to settle
+there. Carried forward unchanged, all re-verified this session: `MeterWell` has **zero**
+references; **5** of the 10 Phase 2 primitives have **zero** importers (`badge`, `dialog`,
+`input`, `segmented`, `select`); and the header logo is still an **843 kB** PNG rendered at
+24×24 (`app-header.tsx` imports `verio-logo-primary.png`).
+
+
+---
+
+## Session 22 (2026-09-22) — two decisions closed, then Phases 6–8
+
+User decisions taken at the top of the session:
+
+- **Lobby structure:** correct the plan to match the deck, and cap the cards' width. Done, §1.
+- **Header transport badge:** *"we dont need this badge to be shown"* — remove it. Done, §2.
+- **`.primary-btn`:** *"idc about this right now"* — no action. It was already removed as dead
+  CSS in Session 21; the underlying gap (Settings has no accent primary action) stays open and
+  is not to be re-raised.
+- **Nav rows with no real content are not built** — if a Settings section has nothing honest to
+  show, it is omitted rather than filled in.
+
+### 1. The header transport badge is gone
+
+The status chip used to render `Connected · Relay`, the suffix coming from
+`diagnostics.mode` via `describeLiveTransport`. It is removed from
+`components/verio/app-header.tsx` entirely — both the visible suffix and the tooltip that
+surfaced the same value.
+
+**Why it was safe to remove, checked rather than assumed:** `room.rs` sets
+`effective_mode = TransportModeSetting::CloudRelay` unconditionally (line 699), and the only
+remaining input to the label is `Settings.transport_mode`, which the UI has not been able to
+change since Session 11 removed the transport plumbing. With its `auto` default that resolves
+to `cloud_relay` — so in the real app the chip could only ever read **Relay**. The
+`direct_p2p` branch is reachable only via `activate_session`, whose four callers are the
+direct-LAN and invite paths that no longer have any UI. A value that cannot vary is not
+information.
+
+`lib/transport.ts` **stays**: the descriptor still has exactly one consumer, the diagnostics
+drawer, which has room for its label and its hint. That is the surface where it is real.
+
+`AppHeaderProps.transportMode` was removed and `App.tsx` no longer passes it.
+
+**Verified** — `after-lobby3` → `after-badge`, 16 shots at 860 + 700:
+
+| Result | Count |
+| --- | --- |
+| byte-identical | **12** (every lobby scenario — the badge never rendered there) |
+| changed | 2 (`edge-long-strings` @ both widths, ~0.86–1.05%) |
+| 4–6 px | 2 (`lobby-ready`, the dock meter) |
+
+`diff-scope.mjs --band=56` put the real change inside the header band (y = 12→56). It also
+reported a 14–18 px spill at (279–283, 603–606) in `lobby-ready`, which the control capture
+did **not** reproduce — so it was not dismissed as noise. Cropped and inspected: it is the
+**mic level meter**, whose fill differed by ~2px.
+
+Proven non-deterministic rather than asserted — four identical loads of `lobby-ready`:
+
+```
+run 1: meter=40px  fill=13px
+run 2: meter=40px  fill=15px
+run 3: meter=40px  fill=14px
+run 4: meter=40px  fill=14px
+distinct fill widths across 4 identical loads: 3 -> 13, 15, 14
+```
+
+The meter is a constant 40px; only the fill varies, because the fill is the last `input_level`
+value received. So a 14–18 px dock diff between two builds is sampling noise.
+
+### 2. The plan's lobby structure was wrong, and is corrected
+
+`REDESIGN-PLAN.md` §4.1 described the Lobby as *"Direction 1 Split Workbench, with the sidebar
+collapsing to a 56px rail below 900px and the two action panels stacking below 900px."*
+**Both halves were wrong, in the same way** — they read deck presentation chrome as app UI:
+
+- **There is no sidebar in the lobby deck.** `code.html` has exactly two grids: `.action-grid`
+  (the two action panels) and `.state-grid` (the six-card states matrix, which is the deck's
+  own board layout). The old sentence was describing the board.
+- **`.action-grid` is `grid-template-columns: 1fr 1fr` with no media query at all.** Only
+  `.state-grid` has breakpoints (1180px → 2 cols, 768px → 1). Those were read as the app's.
+
+The deck is the visual source of truth, so the deck wins and the shipped `sm:grid-cols-2` was
+already correct. The plan now says so, with the evidence.
+
+**Added the missing width cap:** `max-w-256` (256 × the 4px `--spacing` = 1024px) plus
+`mx-auto`, matching the existing `max-w-140` convention rather than an arbitrary
+`max-w-[1024px]`. 1024px is where the deck's own "standard desktop" band (901–1150px) tops
+out. Measured before and after, at 700 / 860 / 900 / 1100 / 1400:
+
+| width | card width, before | card width, after |
+| --- | --- | --- |
+| 700 | 302 | 302 |
+| 860 | 382 | 382 |
+| 900 | 402 | 402 |
+| 1100 | 502 | **484** |
+| 1400 | 652 | **484** |
+
+Zero horizontal overflow at all five widths, and the OTP boxes hold a constant 40×40 at all
+five. Nothing changed at the three primary widths.
+
+### 3. Phase 6 — the Settings screen, rebuilt
+
+`ui/src/components/verio/settings.tsx` is new: a full-screen opaque surface with a nav rail on
+the left and one section's content on the right, replacing the centred 560px modal on a
+translucent scrim. Six sections — Transmission, Shortcuts, Audio, Quality, Server,
+Diagnostics.
+
+**Presentation only, deliberately.** Every value, every command, and the hotkey-capture
+keyboard handling still live in `App.tsx` and arrive as props. The capture path is the
+highest-risk behaviour in the app; leaving it untouched is what makes this rebuild unable to
+change it. The component's header comment says so.
+
+**What was cut, and why.** The legacy modal had a seventh section, *Voice Transport*, whose
+entire body was a static row reading *"Encrypted relay — Every call runs through the Verio
+relay server. Nothing to configure."* plus an `Active` badge. A settings row that says there is
+nothing to configure is not content. It also contradicted §1 of this session, where the same
+constant value was removed from the status chip for the same reason. Signalling port, host port
+and transport mode stay unexposed: `REDESIGN-PLAN.md` §6 lists those commands as
+live-but-intentionally-unexposed, so re-surfacing them would undo a decision rather than fix an
+omission. The VPS address stays — it is already user-facing and works.
+
+**`debug_wavs` gets its first caller.** The command (`set_debug_wavs`) and the persisted field
+both existed with no UI path to either (`REDESIGN-PLAN.md` B4). It now has a real row under
+Diagnostics.
+
+**Accessibility is not decoration here.** The legacy segmented control was two `<button>`s whose
+`.active` class was the only statement of which was selected — no group, no checked state, no
+accessible name on the keybind chips. The rebuilt surface uses `ui/segmented` (a real radio
+group in a `fieldset`), `ui/switch` (a real checkbox with `role="switch"`) and a `KeybindButton`
+whose `aria-label` states both the current combo and that it is editable.
+
+**Escape closes it.** The legacy modal had no keyboard exit at all, which was survivable because
+you could click the scrim. With the scrim gone, a close button alone would strand keyboard-only
+users.
+
+#### 3a. The `inert` wrapper — making `aria-modal` true rather than aspirational
+
+`App.tsx` now wraps the header, main view, music panel, dock and context menu in a single
+`<div className="contents" inert={isSettingsOpen || undefined}>`. `display: contents` keeps the
+wrapper out of the layout — its children remain the flex items of `.app-container`, so nothing
+moves — while giving `inert` one node to apply to. While Settings is open, everything behind it
+is removed from the tab order and from assistive tech.
+
+Without this, `aria-modal="true"` on the surface would have been a false claim: the legacy modal
+made no such claim and left the entire app tabbable behind it. The context menu moved inside the
+wrapper too, since it must not be reachable either and is always dismissed by the same click that
+opens Settings.
+
+#### 3b. Two handlers changed behaviour, both to stop reporting success they had not earned
+
+- `handleSetVoiceQuality` / `handleSetMusicQuality` did `invoke(...).catch(console.error)` and
+  then set the local value **and** the `"Voice quality set to N kbps."` toast unconditionally —
+  so a rejected command still told you it had worked. Both now report the outcome.
+- `handleClearHotkey` is new and reports failure. The legacy clear buttons awaited
+  `set_hotkey` with no `catch`; that command rejects on an unparseable combo, so a rejection was
+  an unhandled promise rejection and the chip went on showing the old binding.
+
+#### 3c. Legacy CSS deleted, in the same change
+
+Removed from `App.css`: `.settings-overlay` `.settings-panel` `.settings-section`
+`.settings-section-title` (declared twice) `.settings-row` (declared twice) `.settings-label`
+`.settings-hint` `.settings-meta` `.modal-header` (+ its `h2` rule) `.modal-body` `.text-input`
+`.custom-select` `.segmented-control` `.segmented-item` (declared twice) `.switch`
+`.switch-track` `.keybind-chip` `.keybind-clear-btn`, plus the later "styled switch" block, the
+`.settings-row > select/.switch/…` centring block, `.custom-select, .text-input { line-height }`,
+and `.badge.cloud-badge`.
+
+Kept because the Room screen still uses them and Phase 7 has not run: `.secondary-btn`
+`.danger-btn` `.slider-control` `.toast-close` `.badge` `.card-badges` `.volume-row`
+`.volume-meta` `.pill-tag` `.room-tag` `.room-number`.
+
+The `.text-input:focus` rule went with them. It set `outline: none` and substituted a
+border-colour change, contradicting design.md's single focus treatment (a 2px accent outline,
+applied globally in `styles/index.css`).
+
+#### 3d. `verify-settings.mjs` — 30 assertions across five questions
+
+New script, `~/.workbuddy-ai/binaries/node/workspace/verify-settings.mjs`. Structure, sections,
+wiring, inertness, Escape. The wiring block is the one that matters: it wraps
+`window.__TAURI_INTERNALS__.invoke` and asserts the actual `(cmd, args)` pairs the app
+dispatches, because a control can render perfectly and do nothing.
+
+**Two of its own checks had to be thrown away, and the way they were caught is the point.**
+
+The first was *"press Tab and see where you land inside the dialog"*. It passed **with and
+without** `inert` — the dock button that opens the dialog sits immediately before it in DOM
+order, so Tab from there reached the dialog either way. A check that could not fail.
+
+The replacement was *"enumerate every visible focusable element and assert none is outside the
+dialog"*. That failed **with `inert` present**, because inertness does not remove layout: an
+inert button still has a non-zero bounding box and is still `visibility: visible`. Visibility is
+not reachability.
+
+What works is asking the browser directly — call `focus()` on each candidate and see whether it
+took, since an inert element refuses focus. That version passes when `inert` is present, fails
+when it is removed, and names the ten elements that became reachable:
+
+```
+FAIL  open: nothing outside the dialog accepts focus  — 10 candidate(s); accepted focus =
+      [Create Room, Room code digit 1, Room code digit 2, Room code digit 3,
+       Room code digit 4, Change your display name, Toggle music player panel,
+       MicM, DeafenD, Settings]
+```
+
+with the paired positive assertion (*"the dialog itself does accept focus"*) staying green, so
+the check cannot pass by the surface simply being dead.
+
+Both mistakes were found by mutation, not by review: deleting `inert` and watching which
+assertions changed. Two of five changed — which is how the weak one was identified.
+
+#### 3e. Verification
+
+**The four invariants** — all green after the final build:
+
+```
+check-phantom-classes.mjs   SELF-TEST: 13/13 shapes extracted
+                            checked: 246 distinct class token(s)
+                            PHANTOM: none — every class token resolves to a rule.
+
+check-collisions.mjs        utilities 189, App.css 34, markup 68
+                            LEAK: clean — no class name is defined by both systems.
+                            MIX:  clean — every element has exactly one styling authority.
+
+dead-css.mjs                defines 34 class selector(s), 34 of them mentioned
+                            DEAD: none.  ORPHAN KEYFRAMES: none.
+
+verify-music.mjs            all states render, all controls wired, no overflow,
+                            no console errors.
+```
+
+Each was mutation-tested this session rather than trusted:
+
+| Check | Mutation | Result |
+| --- | --- | --- |
+| `check-phantom-classes` | added `bogus-phantom-xyz` to a `className` | reported it; 246 → 247 tokens |
+| `verify-settings` (wiring) | reverted `set_input_gain` to the Session 14 `{ db }` arg | **only** the gain assertion failed, printing `args={"db":17}` |
+| `verify-settings` (inertness) | deleted `inert` | 3 of 6 failed, naming the 10 elements that became reachable |
+| `verify-settings` (Escape) | deleted `e.stopPropagation()` from the capture handler | "surface stays open" failed, as predicted |
+| `verify-contents-wrapper` | injected `main.style.paddingTop = "40px"` between the two measurements | 40 of 40 configurations reported the shift |
+| `dead-css` | appended `.totally-dead-probe` to `App.css` | reported it, 34 → 35 selectors |
+
+Each mutation was reverted and the revert confirmed byte-exact by the build hash returning to
+`index-CP2hxoKk.css` / `index-DbtgYZid.js`.
+
+**The `contents` wrapper is layout-neutral — measured, not assumed.** `after-badge` is the last
+pre-Phase-6 baseline and only covers 16 shots, so a full before/after diff is not available.
+Instead `verify-contents-wrapper.mjs` asks the question directly: it measures 8 element rects
+plus the document scroll box in the shipped DOM, then **physically unwraps** the wrapper at
+runtime (`insertBefore` each child, then `remove()`) and measures again.
+
+```
+40 configuration(s): the contents wrapper is layout-neutral in all of them.
+```
+
+8 scenarios × 5 widths, with `moved: 3` confirming the unwrap actually relocated the header,
+main view and dock rather than silently doing nothing.
+
+**Diff against the pre-Phase-6 baseline** (`after-badge` → `after-phase6`, the 16 shots both
+have):
+
+| Result | Count |
+| --- | --- |
+| byte-identical | **13** |
+| ≤ 0.0055% | 3 (`edge-long-strings` at both widths, `lobby-ready` @700) |
+| > 0.05% | 0 |
+
+The three non-identical shots are the known mic-meter sampling noise from §1 — the same
+scenario, the same dock meter, the same ~1px fill difference.
+
+**Full matrix captured with no runtime errors:**
+
+```
+captured 156 shots → design/screens/after-phase6
+no console errors or page errors in any shot
+```
+
+26 scenarios × 2 widths (700, 860) × 3 variants (base, music-open, settings-open).
+
+**Screenshots of the new surface:** `design/screens/after-settings/` — all six sections at 860,
+the surface at 700 / 900 / 1100 / 1400, the PTT row after switching mode, and mid-capture.
+
+#### 3f. One thing found and deliberately not fixed
+
+**`prepare_hotkey_capture` is a live Rust command with no caller.** `src-tauri/src/lib.rs`
+~line 341. Its own doc comment states its purpose: *"Called when the UI enters hotkey-capture
+mode: unregisters the action's current global binding so pressing the old combo mid-capture
+cannot fire the action."* Nothing in `ui/src` calls it — and the legacy modal did not either
+(`git show HEAD:ui/src/App.tsx` shows the chip's `onClick` was `setCapturingAction("mute")` and
+nothing else). So this is a pre-existing gap, not something the rebuild introduced.
+
+**Why it was not wired up here.** The command's contract is a pair — it *returns* the previous
+binding so Escape can restore it — and the frontend's Escape path only does
+`setCapturingAction(null)`. Calling it alone would leave the hotkey permanently unregistered
+after a cancelled rebind: a worse bug than the one it fixes. That is a behaviour change in the
+single highest-risk code path in the app, and it needs its own change and its own verification
+rather than being smuggled into a presentation-only phase.
+
+Recorded in the migration skill's "already known" list so it is not re-discovered.
+
+
+---
+
+## Session 23 (2026-09-22) — Phase 7: Room
+
+### 1. What was built
+
+| File | Change |
+| --- | --- |
+| `ui/src/components/verio/room.tsx` | **new**, 437 lines — presentation only |
+| `ui/src/components/verio/toast.tsx` | **new**, 62 lines — `StatusBanner`, the last legacy shell markup |
+| `ui/src/App.tsx` | 1061 → 1018 lines — the in-call markup, the toast markup and `getInitials` removed; `handleTogglePeerMute` added |
+| `ui/src/App.css` | 741 → 455 lines — **34 class selectors → 8** |
+
+The Room is the last screen and the one the redesign was for. Everything the app actually knows
+about a peer is seven fields (`uuid, name, speaking, mute, deafen, music, music_title`), so the
+tile is built from those and nothing else. `REDESIGN-PLAN.md` §3 C/D lists what the deck draws
+that the transport does not produce — per-peer level meters, per-peer RTT, jitter, packet loss,
+codec bitrate, waveforms, `-6.2 dBFS`, `EXCHANGING ICE CANDIDATES…`, `HOST`/`BUS GAIN`, DSP
+load, ring-buffer occupancy — and none of it appears.
+
+`ice_state` does exist, but on `TransportDiagnostics`: it describes *this* client's transport,
+not any peer's, so it stays in the diagnostics drawer rather than being attributed to a tile.
+
+**The label lost "of 10".** The legacy read `In call - N of 10`. No backend enforces a capacity,
+so the app cannot know one — an eleventh joiner would have rendered "11 of 10". It now reads
+`In call — N participants`, with a singular form. `PROJECT.md` documents 2–10 as the design
+target, which is not the same thing as a limit the client can report.
+
+**Plan item B1 landed:** per-peer local mute. There is no `set_peer_mute` command and there does
+not need to be — a local mute *is* `set_peer_volume(uuid, 0)`, the call the slider already
+makes. What B1 adds is memory, so unmuting restores the level the user had rather than a
+hardcoded 100 %. That is a `useRef`, not state: it never needs to render.
+
+### 2. The plan's Room row was half right, and the wrong half was measured
+
+`REDESIGN-PLAN.md` §4.1 chose Direction 1 because *"auto-sizing 1→3 columns handles 1–10
+participants without a scrolling panel, satisfying the `design.md` scrollbar rule."*
+
+The first half is implemented. **The second half is false.** At 860×640 the grid has ~318px of
+height; ten participants is ten tiles, which at three columns is four rows. Measured, the grid
+overflows by **48px at 860** and **104px at 700**. The honest options were to scroll or to shrink
+the card to ~70px tall, which is not a card any more. So it scrolls — and the plan's claim is
+corrected here.
+
+What *is* new is that the scroll is confined to the grid. The legacy layout put the header
+inside the scrolling container, so at ten participants the room code and the Leave button
+scrolled out of the viewport. In the rebuilt Room they are outside it and stay put; the check
+that proves it is in §6.
+
+### 3. Two silent defects in the legacy room markup
+
+Both looked fine:
+
+1. It used `var(--text-muted)` twice and `var(--text-primary)` once. **Neither token exists.**
+   The declarations were dropped and the elements inherited instead, so "Waiting for others" and
+   the room code rendered at full text brightness rather than dimmed. Same shape as the
+   `duration-fast` no-op found in Session 21 — it renders, it looks plausible, it does nothing.
+2. The empty-state tile drew a **music-note glyph** next to "Waiting for others". It is now
+   `IconUsers`.
+
+Also: the legacy peer volume slider was a bare `<input type="range">` with no accessible name.
+It has one now (`Volume for <name>`).
+
+### 4. `.peer` is both a Verio card class and Tailwind's variant marker
+
+The single most interesting find of the session, and it was not in the Room's own code.
+
+`ui/segmented.tsx` and `ui/switch.tsx` put `className="peer sr-only"` and
+`className="peer absolute inset-0 …"` on their inputs — `peer` is Tailwind's marker for
+`peer-checked:*` / `peer-focus-visible:*`. `App.css` also defined `.peer` as the participant
+card. **Both were landing on the same elements.** Measured in the running app:
+
+```
+before   radio.peer   computed position: relative   display: flex
+after    radio.peer   computed position: absolute   display: block
+```
+
+`relative` and `flex` are `.peer`'s values; `absolute` is `sr-only`'s. Because `.peer` was
+unlayered and `sr-only` lives in `@layer utilities`, the legacy card rule was overriding the
+primitive — and a rule walk of every stylesheet confirmed `.peer` sat in no layer at all.
+
+The visible damage was small (the switch's `h-full w-full` happened to compensate; the radio
+stayed 1px and clipped), which is exactly why it survived four phases. It was found by chasing
+why `dead-css.mjs` reported `.peer` as *live* after every use of it had been deleted.
+
+**`dead-css.mjs` has two blind spots, and both are in the safe-looking direction.** It reports a
+class as live if its exact token appears in any string literal, which means:
+
+- **Tailwind marker names.** `className="peer"` is read as a mention of `.peer`.
+- **English prose in UI strings.** `"Voice flows straight between peers with no relay in the
+  path."` in `lib/transport.ts` was read as a mention of `.peers`.
+
+Neither can be fixed by tightening the tokenizer without risking the dangerous direction (a
+missed use turns live CSS into a "dead" verdict). `check-collisions.mjs` cannot help either:
+LEAK asks whether both systems *define* a name, and Tailwind v4 emits no `.peer` rule — the
+marker exists for variants only. So the collision is real, live, and invisible to both checks.
+Both blind spots are now documented in the script headers. `.peer`/`.peers` were removed by
+`remove-peer-css.mjs`, whose dead set came from the browser rule walk rather than from memory.
+
+Two of my own guards in the removal scripts also had to be fixed, both for the same reason —
+they tested text that appears in the file's own comments: `strip-dead-css.mjs`'s new
+"no `@keyframes` should survive" guard fired on four comments that mention `@keyframes` while
+explaining earlier removals, and `remove-peer-css.mjs`'s survivor guard used `/\.peer\b/`, which
+matches `.peer-body` because `\b` falls before a hyphen.
+
+### 5. My own new component was wrong twice, in one line
+
+`room.tsx` wrapped the speaking avatar in `animate-speak-ring`. Two independent problems:
+
+1. **It does not exist.** There is no `--animate-speak-ring` in `@theme`, so the class resolved
+   to no rule at all — a phantom class. `check-phantom-classes.mjs` catches it; nothing else
+   would. Mutation-tested: injecting it back into a clean build reports
+   `PHANTOM: 1 … animate-speak-ring`, and nothing else.
+2. **Even if it had resolved it would have been wrong.** `design.md` says the speaking indicator
+   *may* use a single 1.8s pulse — permissive, not prescriptive — while the deck says "flat
+   mossy-green outline (explicitly no pulsating rings/halos)" and `REDESIGN-PLAN.md` §4.0
+   resolves that row to the same. Choosing not to use a permission is not a conflict, so the
+   plan's resolution stands. The legacy app *did* pulse here, so this removes an animation; that
+   is the one place the Room is not a pure restyle, and it is deliberate.
+
+**Speaking colour was left as `--accent` (amber), and the discrepancy is reported rather than
+silently resolved.** The deck and §4.0's Signals row say mossy green (`--idle`) means
+transmitting. But `state-chip.tsx` — shipped in Phase 2 — defines the tone vocabulary as
+"`accent` … reserved for primary actions and the speaking indicator", the legacy
+`.peer.is-speaking` was amber, and `app-header.tsx` separately reserves `--idle` for
+*connected*. Changing it inside the Room would make one screen disagree with three primitives.
+**Open question for the user:** move the speaking indicator to `--idle` across all four
+consumers, or amend §4.0's Signals row to say amber.
+
+### 6. The dimmed avatar was 1.75:1, so it was removed
+
+The first version gave a muted or deafened peer `bg-surface-3 text-text-faint`. A screenshot
+made it look unreadable, which is not a finding — so `probe-room-contrast.mjs` computes the real
+WCAG ratio from the rendered nodes. It was **1.75:1**. Not a scan aid; a smudge.
+
+The state is already carried explicitly by the MUTED / DEAFENED chips, which is what
+`state-chip.tsx` says the `warn` tone is for ("intentional states that should still be
+visible"), and neither `design.md` nor the deck asks for a dimmed avatar. The fill stays
+`--idle`. Measured after:
+
+| Element | Ratio | Note |
+| --- | --- | --- |
+| Peer name | **12.79:1** | |
+| Speaking avatar initials | **6.13:1** | `--accent` + `--bg` |
+| Idle avatar initials | **3.9:1** | `--idle` + `--bg` — inherited from the legacy `.peer-avatar` and design.md's mossy green |
+| Volume readout | **3.56:1** | `--text-dim` on `--surface` — the app-wide secondary tier |
+
+The last two are below AA for 14px text, and both are **pre-existing, app-wide** choices rather
+than Room regressions — `--text-dim` is used for every settings hint and telemetry value, and
+`--idle`-on-`--bg` is the legacy avatar fill the Lobby and header also use. Reported, not
+changed in a screen phase.
+
+### 7. Two of my own checks could not fail — again
+
+The same failure mode as Session 22, twice more, both found by mutation rather than review.
+
+**The scroll-confinement check scrolled the wrong element.** It did `ul.parentElement.scrollTop
+= …` and asserted the header had not moved — which passed *even when the header was inside the
+scrolling box*, because the element it scrolled was not scrollable, so nothing moved at all.
+Reproducing the legacy bug (moving `overflow-y-auto` from the grid wrapper to the Room root)
+left it green. Fixed in two steps, each of which was also wrong first:
+
+1. Walking up to the first ancestor with `scrollHeight > clientHeight` — which stops on an
+   element with `overflow: visible` that merely *has* overflowing content. `scrollHeight` is not
+   scrollability; `overflow-y` must be `auto`/`scroll` **and** the content must overflow.
+2. Only then does the structural assertion mean anything: the scroll container must not contain
+   the header. On the mutation it now fails with the real number — **the header moved 208px at
+   700 and 96px at 860**, which is precisely the legacy bug.
+
+**The status-banner check passed on "no banner appeared".** It clicked a guessed "edit nickname"
+button, found nothing, and reported PASS. Now it asserts a banner *exists* before checking its
+role, and drives the non-error branch through `Leave call` → `"Left call."` rather than through
+a control that may not be there.
+
+### 8. Verification
+
+`verify-room.mjs` — **67 assertions**, seven sections: structure across five widths, tile states,
+command wiring (asserted against the real `(cmd, args)` pairs from the `invoke` call log, not the
+DOM), B1 round-trip, scroll confinement, the diagnostics drawer, and the status banner.
+
+Two checks in it exist purely to catch a class of bug this project keeps hitting, and both are
+mutation-tested rather than trusted:
+
+| Mutation | Result |
+| --- | --- |
+| `animate-speak-ring` injected into a clean build | `PHANTOM: 1 … animate-speak-ring` |
+| `overflow-y-auto` moved to the Room root (the legacy bug) | header moves 208px @700, 96px @860 |
+| `peerVolumeMemory` restore replaced with a hardcoded `1` | `unmute restores the REMEMBERED level` fails, `100%` |
+
+The B1 mutation is the one worth keeping: a "mute" that sends the wrong number looks identical
+to one that works, so the check asserts the exact volume (`0.4` in, `0.4` back) rather than
+that *a* command fired.
+
+```
+verify-room            ALL ROOM CHECKS PASSED   (67/67)
+verify-settings        ALL CHECKS PASSED
+verify-music           all states render, all controls wired
+verify-contents-wrapper 40 configurations: layout-neutral in all of them
+check-phantom-classes  PHANTOM: none
+check-collisions       LEAK: clean · MIX: clean
+dead-css               DEAD: none · ORPHAN KEYFRAMES: none
+tsc --noEmit           clean
+vite build             clean
+```
+
+Reverts confirmed byte-exact by the build hash returning to `index-CXOOeuCy.css` /
+`index-CIqSZNVy.js`. Screenshots: `design/screens/after-room/` — 16 shots covering 1/3/6/10
+participants, self-muted, PTT, degraded, connection-lost, the drawer, and the ten-participant
+grid scrolled to the bottom with the header still in place.
+
+### 9. Found, not fixed
+
+**The mock harness has dead configuration, and one fixture's note is false.**
+`room-connection-lost` says *"The real ICE-loss error string, emitted as a `room_error` event on
+boot."* Nothing emits it: `emitRoomError` is declared on the transport interface and implemented
+in `invoke.ts`, and its only caller is the harness panel's "room error" button. Separately,
+`behavior.serverReachable` is set in 20 scenarios and **read by nothing**. So the app's
+`room_error` path — and therefore B8's "relay unreachable" state — is reachable by hand and by
+no scenario. The banner itself is verified (§8) by driving that button, which is the only way to
+reach it.
+
+**`prepare_hotkey_capture` still has no caller** — carried over from Session 22, still needs its
+own change and its own verification.
+
+**"Encrypted relay"** is the diagnostics drawer's label for `cloud_relay`
+(`ui/src/lib/transport.ts`, written before this session). WebRTC media is DTLS-SRTP, so it is
+true of the transport — but every other row in that panel is a value the app *measured*, and
+this one is asserted from architecture. Worth a decision: keep it, qualify it, or drop to
+"Relay".
+
+### 10. Next
+
+Phase 8 (cleanup): `pnpm tauri build --no-bundle`, `cargo test --workspace`, the mock-harness
+decision from §9, the 5 unimported primitives, and the 843 kB logo.
+
+
+---
+
+## Session 24 (2026-09-22) — Phase 8: cleanup
+
+Phase 8 is the last phase. Four items closed, three carried as decisions.
+
+### 1. Build and tests
+
+**`pnpm tauri build --no-bundle`** — the first attempt **failed, but not on the code**: the
+sandbox's safe-delete shim blocked Vite's `prepareOutDir` from emptying `dist/assets`
+(`SAFE_DELETE_BULK_CONFIRM_REQUIRED`, 60 entries > 50 threshold). `ui/dist` is gitignored build
+output (4 files, 1.2 MB); cleared it and the build passed.
+
+```text
+target/release/verio.exe   18,966,016 bytes   16:26
+```
+
+**`cargo test --workspace` cannot pass in this environment, and that is pre-existing by design.**
+`ui/src-tauri/build.rs` sets `<requestedExecutionLevel level="requireAdministrator">`, with a
+comment explaining why: Verio registers global hotkeys, and Windows only delivers key events to
+an elevated process while a game holds the foreground. The `verio` bin target therefore embeds
+an admin manifest, so its *test harness* cannot be launched:
+
+```text
+error: test failed, to rerun pass `-p verio --bin verio`
+Caused by: could not execute process `...\verio-d7978cc4c551dcb6.exe` (never executed)
+Caused by: The requested operation requires elevation. (os error 740)
+```
+
+That abort happens **before** the later crates run, so a bare `cargo test --workspace` reports
+red while covering only part of the workspace. Real coverage, both green:
+
+| command | result |
+| --- | --- |
+| `cargo test --workspace --exclude verio` | **69 passed, 0 failed** — app 22, dsp 25, discovery 8, transport 8, server 6, audio 0 |
+| `cargo test -p verio --lib` | **2 passed, 0 failed** — `ping_rejects_empty_name`, `test_shortcut_parsing` |
+
+**71 passed, 0 failed.** Recorded here so nobody later reads a red `cargo test --workspace` as a
+regression. Rust is untouched by the whole migration, as R14 required.
+
+### 2. "The 5 unimported primitives" was wrong — it is 1
+
+Session 21 recorded that 5 of the 10 Phase 2 primitives had zero importers (`badge`, `dialog`,
+`input`, `segmented`, `select`). That was true then. Phases 4–7 migrated screens and
+`settings.tsx` now imports four of them, so the set legitimately shrank. I did not take the old
+number on trust — I built `dead-modules.mjs` (a real import-graph walk from the entry points)
+and measured:
+
+```text
+seeds:        App.tsx, main.tsx
+modules:      34
+reachable:    33
+unreachable:  1
+  UNREACHABLE  components/ui/dialog.tsx
+```
+
+`MeterWell`, the other item from that note, no longer exists — `grep -rn MeterWell` returns
+nothing, so it was removed in an earlier phase.
+
+**Three bugs in my own scanner, found because I made it fail on purpose.** The first run
+reported 18 dead modules; the second, 6. All three were the scanner's fault, not the code's:
+
+1. `[\s\S]*?` between `import`/`export` and `from` could cross a statement boundary, so an
+   `export function Foo(` swallowed every import down to the next `from`. Fixed with `[^;]`.
+2. It ignored the `@/` alias, so every aliased module read as dead (`16` of `34` "reachable").
+3. `EXTS` contains `/index.ts`-style entries, so `resolveSpec` returned mixed-separator paths
+   (`.../dev/index.tsx`) that never string-matched the `join()`-produced `allSet` entries
+   (`...\dev\index.tsx`). Every directory-index module was silently dropped. Fixed with
+   `resolve()`.
+
+Mutation-tested: pointing `main.tsx`'s `import("./dev")` at a non-existent module raised the
+count to 6 (dialog + the 5 harness files); reverting restored the file byte-exact
+(`git hash-object` → `6dcf1538…`).
+
+**Blind spot, stated rather than papered over:** this is *module* reachability, not *export*
+reachability. An unused export inside a used module is invisible to it.
+
+### 3. The logo: 863,517 → 5,315 bytes
+
+Measured, not assumed: `ui/src/assets/verio-logo-primary.png` is **1254×1254**, **RGB with no
+alpha**, and carries a **baked-in gradient background** — corners ~`#1a1513`, centre `#181310`,
+against the header's `--color-bg: #171412`. Its content bbox is `(442, 477, 812, 752)`: centred
+horizontally, 12.5px above vertical centre. It renders into a **24×24** box (`size-6`,
+`object-fit: fill`, no radius) — a ~52× downscale decoded on every startup.
+
+The master is *not* junk: it is byte-identical (md5 `3dd5eaa4…`) to
+`design/logo/verio-logo-primary.png`, which is the source the `src-tauri/icons/*` were
+regenerated from. So the master stays where it is and the **web** copy becomes a derivative.
+
+Added `ui/src/assets/verio-logo-primary-96.png` (96×96, LANCZOS, 5,315 bytes), repointed
+`app-header.tsx`, deleted the 863 kB duplicate.
+
+Two measurements, each with its controls, because "it looks the same" is not a result:
+
+| test | control | negative control | result |
+| --- | --- | --- | --- |
+| asset at 24×24, 1× | master vs itself **0.000** | white logo **4.643** mean / **157** max | 96px: **0/576 perceptible pixels** |
+| asset at 24×24, 2× | master vs itself **0.000** | white logo **4.946** / **222** | 96px: 6/2304 (**0.3%**) |
+| **real header**, before vs after, 1× | **0.000** | — | **0/48,160 (0.00%)** |
+| **real header**, before vs after, 2× | **0.000** | — | 12/192,640 (**0.01%**) |
+
+Bundle effect:
+
+```text
+before:  dist/assets/verio-logo-primary-B6hxm-AW.png   863.52 kB
+after:   dist/assets/verio-logo-primary-96-C1smzLm4.png   5.32 kB
+```
+
+The frontend payload drops from ~1.2 MB to ~342 kB. The header's rendered box is unchanged
+(24×24, radius 0, `object-fit: fill`) — asserted, not assumed.
+
+### 4. The mock harness: keep it, because it provably cannot ship
+
+The plan said the harness "would be removed (or left dev-gated) at Phase 8". Measured the
+decisive fact first — **the harness is absent from the production bundle**:
+
+```text
+installMockHarness 0 · MockHarness 0 · room-connection-lost 0 · mock=1 0 · src/dev 0
+occurrences of "mock" in index-Z16RCKWe.js: 0
+```
+
+with a positive control proving the search works (`participant` 1, `Verio` 1,
+`set_peer_volume` 1, `Leave` 2) and zero `.map` files in `dist`. `import.meta.env.DEV` is
+statically replaced, so the dynamic `import("./dev")` is dead-code-eliminated exactly as
+`main.tsx`'s comment claims.
+
+So removal buys **nothing** and would destroy the only mechanism that makes browser
+verification honest (plan R15). **Decision: keep it dev-gated, and fix the two things it lied
+about.**
+
+**`serverReachable` was dead config.** Set in **26** scenarios, read by **nothing** — no code
+ever consulted it, so it controlled no behaviour. It was also redundant: every scenario that set
+it `false` already produced its state through a mechanism that *is* read — `relay-unreachable`
+through `failures`, `room-connection-lost` through `diagOffline()`. Removed: the interface field
+plus all 26 assignments.
+
+**`room-connection-lost`'s note was false.** It claimed the ICE-loss string was "emitted as a
+`room_error` event on boot". It was not: `emitRoomError`'s only caller was the harness panel's
+button, so the scenario *named* "connection lost" rendered no banner at all. Fixed by following
+the file's own `audioError` pattern — added `roomError?: string` to `MockBehavior`, wired it in
+`invoke.ts`, and set it on the scenario with the real string from
+`crates/verio-transport/src/lib.rs:888`. The note is now true.
+
+New **`verify-harness.mjs`** (8 assertions): (A) the banner appears with the panel hidden via
+`panel=0`, carries the real string, is `role="alert"`/`aria-live="assertive"`, and is visible;
+(B) **control** — `room-3` must show *no* alert, so A cannot pass vacuously; (C)
+`relay-unreachable` still rejects through `failures`. Mutation-tested: disabling the emission
+fails 4 of A's checks.
+
+One probe bug found on the way, same class as always: C failed first run because the scenario
+sets `latency.write: 1200` and the probe read the still-pending "Creating room…" status at
+700 ms. It was reporting the wrong thing, not finding a defect.
+
+### 5. Verification (all against a fresh build)
+
+`tsc --noEmit` clean · `vite build` clean · `assert-fresh` · `check-phantom-classes`
+PHANTOM: none · `check-collisions` LEAK/MIX clean · `dead-css` DEAD: none, ORPHAN KEYFRAMES:
+none · `verify-harness` 8/8 · `verify-room` · `verify-settings` · `verify-music` ·
+`verify-contents-wrapper` 40/40. The rebuild after the harness change produced **hash-identical**
+assets (`index-4sd499AT.css` / `index-Z16RCKWe.js`), confirming the dev-only edit does not touch
+the shipped bundle.
+
+### 6. Open decisions (not taken unilaterally)
+
+1. **`components/ui/dialog.tsx`** — the one remaining unimported primitive. It is proven
+   unreachable, so removal is sanctioned; but it is a documented, hand-written native-`<dialog>`
+   primitive with no Radix dependency, and Phase 6 chose a full-screen surface instead. Delete
+   it, or keep it as an available building block?
+2. **`tauri.conf.json` Q6 was never applied.** `beforeDevCommand`/`beforeBuildCommand` are still
+   `npm run dev` / `npm run build` in a pnpm project, and there is no `minWidth`/`minHeight`.
+   Note the plan contradicts itself here: Q6 proposed `minWidth` ~720 while the verification
+   protocol renders at **700**, which the user has said must remain reachable.
+3. Carried forward unchanged: the **speaking colour** (`--accent` vs the deck's mossy green),
+   the diagnostics drawer's **"Encrypted relay"** label, and **`prepare_hotkey_capture`** (still
+   no caller; its contract is a pair, so wiring it alone would leave a hotkey permanently
+   unregistered).
+
+

@@ -1,0 +1,87 @@
+/* ==========================================================================
+   Range input — one of the few legitimate pieces of custom CSS
+   ==========================================================================
+
+   design.md specifies the slider precisely:
+     - track: 4px high, radius 2px
+     - thumb: a 12x16px vertical rectangular block with fine grip ridges
+     - no shadows, no glow
+
+   `::-webkit-slider-runnable-track` and `::-webkit-slider-thumb` cannot be
+   expressed as Tailwind utilities, and the thumb needs a repeating gradient for
+   the grip ridges. This is exactly the "highly specific visual mechanics"
+   exception the migration brief allows, so it lives here rather than being
+   forced into arbitrary utility soup.
+
+   Everything is driven by the design.md tokens. No literal colours.
+   ========================================================================== */
+
+@layer components {
+  .verio-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 16px; /* hit area; the visible track is drawn inside */
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .verio-range::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+  }
+
+  .verio-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 16px;
+    margin-top: -7px; /* centre the 16px thumb on the 4px track */
+    border-radius: 2px;
+    border: 1px solid var(--color-border-2);
+    background-color: var(--color-text);
+    /* fine vertical grip ridges, per design.md */
+    background-image: repeating-linear-gradient(
+      to right,
+      transparent 0 2px,
+      color-mix(in srgb, var(--color-bg) 55%, transparent) 2px 3px
+    );
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 8px 8px;
+    transition: border-color var(--duration-fast) var(--ease-verio);
+  }
+
+  .verio-range:hover::-webkit-slider-thumb {
+    border-color: var(--color-accent);
+  }
+
+  .verio-range:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .verio-range:disabled::-webkit-slider-thumb {
+    background-color: var(--color-text-faint);
+    border-color: var(--color-border);
+  }
+
+  /* Filled portion, driven by a CSS custom property the component sets.
+     Chromium cannot style the pre-thumb track without this technique. */
+  .verio-range {
+    background-image: linear-gradient(
+      to right,
+      var(--range-fill-color, var(--color-accent)) 0 var(--range-fill, 0%),
+      transparent var(--range-fill, 0%) 100%
+    );
+    background-repeat: no-repeat;
+    background-position: 0 center;
+    background-size: 100% 4px;
+  }
+
+  .verio-range::-webkit-slider-runnable-track {
+    background: color-mix(in srgb, var(--color-bg) 100%, transparent);
+  }
+}
