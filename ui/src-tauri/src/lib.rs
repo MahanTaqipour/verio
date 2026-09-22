@@ -531,6 +531,140 @@ fn music_pick_file(bridge: State<Bridge>) -> Option<String> {
     Some(picked.display().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Session 20: music queue commands
+// ---------------------------------------------------------------------------
+
+/// Payload of `music_queue_changed`.
+#[derive(Clone, Serialize)]
+struct QueueEvent {
+    items: Vec<verio_app::pipeline::QueueItem>,
+    index: Option<usize>,
+}
+
+/// Result of adding files, so the UI can report partial success honestly instead
+/// of a bare "ok" that hides unreadable files.
+#[derive(Clone, Serialize)]
+struct QueueAddResult {
+    added: usize,
+    skipped: Vec<String>,
+}
+
+/// Push the queue contents to the UI. Emitted only when the queue actually
+/// changes — the list can be long, and `music_status_changed` fires on every
+/// fader movement.
+fn emit_music_queue(app: &AppHandle, bridge: &Bridge) {
+    let (items, index) = bridge.music.queue_snapshot();
+    let _ = app.emit("music_queue_changed", QueueEvent { items, index });
+}
+
+#[tauri::command]
+fn music_queue_list(bridge: State<Bridge>) -> Vec<verio_app::pipeline::QueueItem> {
+    bridge.music.queue_snapshot().0
+}
+
+/// Resolve each path into a queue entry and append it. Container parsing happens
+/// here, on the command thread; the audio thread never opens a file.
+#[tauri::command]
+fn music_queue_add(
+    paths: Vec<String>,
+    app: AppHandle,
+    bridge: State<Bridge>,
+) -> QueueAddResult {
+    let mut items = Vec::with_capacity(paths.len());
+    let mut skipped = Vec::new();
+    for p in &paths {
+        match verio_app::pipeline::MusicSource::describe_track(std::path::Path::new(p)) {
+            Some(item) => items.push(item),
+            None => skipped.push(p.clone()),
+        }
+    }
+    let added = items.len();
+    bridge.music.queue_append(items);
+    emit_music_queue(&app, &bridge);
+    emit_music_status(&app, &bridge);
+    QueueAddResult { added, skipped }
+}
+
+#[tauri::command]
+fn music_queue_remove(index: usize, app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.queue_remove(index);
+    emit_music_queue(&app, &bridge);
+    emit_music_status(&app, &bridge);
+}
+
+#[tauri::command]
+fn music_queue_clear(app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.queue_clear();
+    emit_music_queue(&app, &bridge);
+    emit_music_status(&app, &bridge);
+}
+
+#[tauri::command]
+fn music_queue_move(from: usize, to: usize, app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.queue_move(from, to);
+    emit_music_queue(&app, &bridge);
+}
+
+#[tauri::command]
+fn music_queue_set_loop(on: bool, app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.set_queue_looping(on);
+    emit_music_status(&app, &bridge);
+}
+
+/// Load a queue entry. `play` is explicit so that building a queue can load its
+/// first track paused — otherwise adding files would start broadcasting music
+/// into the room before the user pressed anything.
+#[tauri::command]
+fn music_queue_jump(
+    index: usize,
+    play: bool,
+    app: AppHandle,
+    bridge: State<Bridge>,
+) -> Result<(), String> {
+    bridge.music.jump_to(index, play)?;
+    emit_music_status(&app, &bridge);
+    send_room_state(&bridge);
+    Ok(())
+}
+
+/// Advance immediately. `request_next` only names the target; servicing it here
+/// keeps the button instant, while the background task covers end-of-track.
+#[tauri::command]
+fn music_next(app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.request_next();
+    bridge.music.service_advance();
+    emit_music_status(&app, &bridge);
+    send_room_state(&bridge);
+}
+
+#[tauri::command]
+fn music_prev(app: AppHandle, bridge: State<Bridge>) {
+    bridge.music.request_prev();
+    bridge.music.service_advance();
+    emit_music_status(&app, &bridge);
+    send_room_state(&bridge);
+}
+
+/// Multi-select picker, starting in the folder used last time.
+#[tauri::command]
+fn music_pick_files(bridge: State<Bridge>) -> Option<Vec<String>> {
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Audio", &["mp3", "flac", "wav", "ogg"])
+        .set_title("Add audio files");
+    if let Some(dir) = bridge.settings.get().music_last_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    let picked = dialog.pick_files()?;
+    if let Some(first) = picked.first() {
+        if let Some(parent) = first.parent() {
+            let dir = parent.display().to_string();
+            bridge.settings.update(|s| s.music_last_dir = Some(dir));
+        }
+    }
+    Some(picked.iter().map(|p| p.display().to_string()).collect())
+}
+
 /// Play an earcon through the live pipeline (no-op when the pipeline is stopped).
 fn play_cue(app: &tauri::AppHandle, kind: verio_app::EarconKind) {
     let bridge = tauri::Manager::state::<Bridge>(app);
@@ -915,6 +1049,16 @@ pub fn run() {
             music_set_loop,
             music_set_monitor,
             music_pick_file,
+            music_queue_list,
+            music_queue_add,
+            music_queue_remove,
+            music_queue_clear,
+            music_queue_move,
+            music_queue_set_loop,
+            music_queue_jump,
+            music_next,
+            music_prev,
+            music_pick_files,
             set_voice_quality,
             set_music_quality,
         ])
@@ -1085,6 +1229,14 @@ pub fn run() {
 
             // Session 13: push music status to the UI (~4 Hz while playing, and
             // immediately on any state transition).
+            //
+            // Session 20: this loop also services queue advances. It is the right
+            // place because it already holds an Arc<MusicSource> and it is an
+            // ordinary OS thread — opening the next file here keeps that work off
+            // the audio thread, which only ever *names* the next index. The poll
+            // runs at 50 ms so the gap between tracks stays short; status is still
+            // computed and emitted on the original 250 ms cadence (every 5th
+            // iteration), so the event rate the UI sees is unchanged.
             {
                 let tick_app = app.handle().clone();
                 let tick_music = std::sync::Arc::clone(&bridge.music);
@@ -1092,14 +1244,22 @@ pub fn run() {
                     .name("verio-music-status".into())
                     .spawn(move || {
                         let mut last = String::new();
+                        let mut tick: u32 = 0;
                         loop {
-                            std::thread::sleep(std::time::Duration::from_millis(250));
-                            let status = tick_music.status();
-                            let json = serde_json::to_string(&status).unwrap_or_default();
-                            if status.playing || json != last {
-                                last = json;
-                                let _ = tick_app.emit("music_status_changed", status.clone());
+                            // Cheap when nothing is pending: one uncontended lock
+                            // and an Option::take.
+                            tick_music.service_advance();
+
+                            tick = tick.wrapping_add(1);
+                            if tick == 1 || tick % 5 == 0 {
+                                let status = tick_music.status();
+                                let json = serde_json::to_string(&status).unwrap_or_default();
+                                if status.playing || json != last {
+                                    last = json;
+                                    let _ = tick_app.emit("music_status_changed", status.clone());
+                                }
                             }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                         }
                     });
                 if let Err(e) = spawned {

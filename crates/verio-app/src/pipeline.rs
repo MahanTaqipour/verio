@@ -718,7 +718,25 @@ pub struct MusicInfo {
     pub channels: u16,
 }
 
+/// One entry in the music queue.
+///
+/// Metadata is resolved when the entry is *added*, on the command thread, never
+/// on the audio thread — `MusicDecoder::open` parses container headers and must
+/// not run under the music mutex that `next_chunk` takes.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueItem {
+    pub path: String,
+    pub title: String,
+    pub duration_ms: u64,
+}
+
 /// Live music state, serialized straight to the UI.
+///
+/// Deliberately carries the queue's *shape* (`queue_index`, `queue_len`,
+/// `queue_looping`) but not its contents. This struct is emitted on every volume
+/// change, and a fader drag emits many times per second; serializing a 500-track
+/// queue each time would be pure waste. The UI pulls the list via
+/// `music_queue_list` and refreshes it on the `music_queue_changed` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct MusicStatus {
     pub active: bool,
@@ -731,6 +749,11 @@ pub struct MusicStatus {
     #[serde(rename = "loop")]
     pub loop_track: bool,
     pub monitor: bool,
+    /// Index into the queue of the track currently loaded, if any.
+    pub queue_index: Option<usize>,
+    pub queue_len: usize,
+    /// When true the queue wraps from the last entry back to the first.
+    pub queue_looping: bool,
 }
 
 impl Default for MusicStatus {
@@ -745,6 +768,9 @@ impl Default for MusicStatus {
             volume: 1.0,
             loop_track: false,
             monitor: false,
+            queue_index: None,
+            queue_len: 0,
+            queue_looping: false,
         }
     }
 }
@@ -757,6 +783,23 @@ struct MusicInner {
     volume: f32,
     loop_track: bool,
     monitor: bool,
+    /// Session 20: the play queue. `queue_index` is the entry the loaded decoder
+    /// came from, or `None` when a track was opened outside the queue.
+    queue: Vec<QueueItem>,
+    queue_index: Option<usize>,
+    queue_looping: bool,
+    /// Set by `next_chunk` (audio thread) when a track has ended, or by a manual
+    /// next/prev, to the queue index that should be loaded next. The audio thread
+    /// only ever *sets* this — it never opens the file. `service_advance` performs
+    /// the I/O on a separate task, because opening a file inside `next_chunk`
+    /// would parse container headers while holding this mutex on the audio thread
+    /// and stall the outgoing mix.
+    ///
+    /// This is an index rather than a boolean so that "previous" can name its
+    /// target directly; a flag would have to be pre-decremented by the caller and
+    /// then incremented again by the advance, which is exactly the kind of
+    /// two-place bookkeeping that drifts.
+    advance_to: Option<usize>,
 }
 
 /// Thread-safe music bus shared by the audio pipeline (which pulls 10 ms chunks
@@ -783,6 +826,10 @@ impl MusicSource {
                 volume: volume.clamp(0.0, 2.0),
                 loop_track,
                 monitor,
+                queue: Vec::new(),
+                queue_index: None,
+                queue_looping: false,
+                advance_to: None,
             }),
         }
     }
@@ -808,6 +855,10 @@ impl MusicSource {
     }
 
     /// Load a track. Playback always starts paused (the UI calls `play`).
+    ///
+    /// A directly-opened file is not a queue member, so this clears `queue_index`.
+    /// Without that, a stale index would survive and `status().queue_index` would
+    /// name an entry that is no longer the loaded track.
     pub fn open(&self, path: &Path) -> Result<MusicInfo, String> {
         let decoder = MusicDecoder::open(path).map_err(|e| e.to_string())?;
         let info = decoder.info();
@@ -816,6 +867,8 @@ impl MusicSource {
         g.path = Some(info.path.clone());
         g.title = Some(info.title.clone());
         g.playing = false;
+        g.queue_index = None;
+        g.advance_to = None;
         Ok(MusicInfo {
             path: info.path.display().to_string(),
             title: info.title,
@@ -876,6 +929,264 @@ impl MusicSource {
         }
     }
 
+    // ---------------------------------------------------------- Session 20 ---
+    // Play queue. Every method here runs on the command thread except where
+    // noted; none of them touch the audio thread's contract.
+    // ------------------------------------------------------------------------
+
+    /// The index to play after `cur`, or `None` at the end of a non-looping queue.
+    #[must_use]
+    fn successor(cur: usize, len: usize, looping: bool) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        if cur + 1 < len {
+            return Some(cur + 1);
+        }
+        if looping {
+            return Some(0);
+        }
+        None
+    }
+
+    /// Resolve a file into a queue entry. Parses the container header, so this
+    /// belongs on the command thread — never the audio thread.
+    #[must_use]
+    pub fn describe_track(path: &Path) -> Option<QueueItem> {
+        let decoder = MusicDecoder::open(path).ok()?;
+        let info = decoder.info();
+        Some(QueueItem {
+            path: info.path.display().to_string(),
+            title: info.title,
+            duration_ms: info.duration_ms,
+        })
+    }
+
+    /// Snapshot of the queue and the index of the loaded entry.
+    #[must_use]
+    pub fn queue_snapshot(&self) -> (Vec<QueueItem>, Option<usize>) {
+        let Ok(g) = self.inner.lock() else {
+            return (Vec::new(), None);
+        };
+        (g.queue.clone(), g.queue_index)
+    }
+
+    pub fn queue_append(&self, items: Vec<QueueItem>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.queue.extend(items);
+        }
+    }
+
+    pub fn queue_replace(&self, items: Vec<QueueItem>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.queue = items;
+            g.queue_index = None;
+        }
+    }
+
+    /// Remove one entry, keeping `queue_index` pointing at the same *track* rather
+    /// than the same number.
+    pub fn queue_remove(&self, index: usize) {
+        if let Ok(mut g) = self.inner.lock() {
+            if index >= g.queue.len() {
+                return;
+            }
+            g.queue.remove(index);
+            g.queue_index = match g.queue_index {
+                // The loaded track is still loaded; it is simply no longer an
+                // addressable member of the queue.
+                Some(cur) if cur == index => None,
+                Some(cur) if cur > index => Some(cur - 1),
+                other => other,
+            };
+        }
+    }
+
+    pub fn queue_clear(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.queue.clear();
+            g.queue_index = None;
+        }
+    }
+
+    /// Reorder one entry, carrying `queue_index` with the track it names.
+    pub fn queue_move(&self, from: usize, to: usize) {
+        if let Ok(mut g) = self.inner.lock() {
+            if from >= g.queue.len() || to >= g.queue.len() || from == to {
+                return;
+            }
+            let item = g.queue.remove(from);
+            g.queue.insert(to, item);
+            if let Some(cur) = g.queue_index {
+                g.queue_index = Some(if cur == from {
+                    to
+                } else if from < cur && to >= cur {
+                    cur - 1
+                } else if from > cur && to <= cur {
+                    cur + 1
+                } else {
+                    cur
+                });
+            }
+        }
+    }
+
+    pub fn set_queue_looping(&self, on: bool) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.queue_looping = on;
+        }
+    }
+
+    /// Load a queue entry by index. The decoder is opened *before* the lock is
+    /// taken, so a slow file does not block the audio thread.
+    ///
+    /// `play` is explicit rather than always-on because loading the first entry of
+    /// a freshly-built queue must not start broadcasting music into the room. A
+    /// separate "load then immediately pause" call would leave a window in which
+    /// the audio thread could pull a chunk, which is why this is a parameter
+    /// rather than something the caller sequences.
+    pub fn jump_to(&self, index: usize, play: bool) -> Result<(), String> {
+        let path = {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| "music lock poisoned".to_string())?;
+            let item = g
+                .queue
+                .get(index)
+                .ok_or_else(|| "queue index out of range".to_string())?;
+            PathBuf::from(&item.path)
+        };
+        let decoder = MusicDecoder::open(&path).map_err(|e| e.to_string())?;
+        let info = decoder.info();
+        let old = {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| "music lock poisoned".to_string())?;
+            let old = g.decoder.replace(decoder);
+            g.path = Some(info.path.clone());
+            g.title = Some(info.title.clone());
+            g.queue_index = Some(index);
+            g.playing = play;
+            g.advance_to = None;
+            old
+        };
+        drop(old);
+        Ok(())
+    }
+
+    /// Ask for the next entry. The advance task performs it within one tick.
+    pub fn request_next(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            let target = match g.queue_index {
+                Some(cur) => Self::successor(cur, g.queue.len(), g.queue_looping),
+                // Nothing loaded yet: start the queue from the top.
+                None if !g.queue.is_empty() => Some(0),
+                None => None,
+            };
+            if target.is_some() {
+                g.advance_to = target;
+            }
+        }
+    }
+
+    /// Restart the current track when it is past the intro, otherwise step back.
+    /// The 3 s convention is what a previous button conventionally does.
+    pub fn request_prev(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            let past_intro = g
+                .decoder
+                .as_ref()
+                .map(|d| d.position_ms() > 3_000)
+                .unwrap_or(false);
+            if past_intro {
+                if let Some(d) = g.decoder.as_mut() {
+                    let _ = d.reset();
+                }
+                return;
+            }
+            if let Some(cur) = g.queue_index {
+                if cur > 0 {
+                    g.advance_to = Some(cur - 1);
+                }
+            }
+        }
+    }
+
+    /// Perform one pending advance, if any. Called from a dedicated task — never
+    /// from the audio thread. Returns true when a new track was installed.
+    ///
+    /// An unreadable file is skipped rather than stalled on, and the walk is
+    /// bounded by the queue length so a looping queue of broken files cannot spin
+    /// forever.
+    pub fn service_advance(&self) -> bool {
+        let Some(first) = self.take_advance_target() else {
+            return false;
+        };
+        let len = self.queue_snapshot().0.len();
+        let mut target = Some(first);
+        let mut tried = 0usize;
+        while let Some(idx) = target {
+            if tried > len {
+                break;
+            }
+            tried += 1;
+            let path = {
+                let Ok(g) = self.inner.lock() else { break };
+                match g.queue.get(idx) {
+                    Some(item) => PathBuf::from(&item.path),
+                    None => break,
+                }
+            };
+            match MusicDecoder::open(&path) {
+                Ok(decoder) => {
+                    let info = decoder.info();
+                    let Ok(mut g) = self.inner.lock() else {
+                        return false;
+                    };
+                    let old = g.decoder.replace(decoder);
+                    g.path = Some(info.path.clone());
+                    g.title = Some(info.title.clone());
+                    g.queue_index = Some(idx);
+                    // Stays true across the swap: the transmit gate is held open
+                    // by `is_active`, and a track change must not flap it.
+                    g.playing = true;
+                    g.advance_to = None;
+                    drop(g);
+                    // Previous decoder is freed outside the lock.
+                    drop(old);
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(%e, path = %path.display(), "queued track failed to open; skipping");
+                    target = self.successor_of(idx);
+                }
+            }
+        }
+        if let Ok(mut g) = self.inner.lock() {
+            g.playing = false;
+            g.advance_to = None;
+        }
+        false
+    }
+
+    /// Clear and return the pending advance target.
+    fn take_advance_target(&self) -> Option<usize> {
+        let Ok(mut g) = self.inner.lock() else {
+            return None;
+        };
+        g.advance_to.take()
+    }
+
+    /// Successor of `idx` per the queue's own looping rule.
+    fn successor_of(&self, idx: usize) -> Option<usize> {
+        let Ok(g) = self.inner.lock() else {
+            return None;
+        };
+        Self::successor(idx, g.queue.len(), g.queue_looping)
+    }
+
     #[must_use]
     pub fn status(&self) -> MusicStatus {
         let Ok(g) = self.inner.lock() else {
@@ -900,6 +1211,9 @@ impl MusicSource {
             volume: g.volume,
             loop_track: g.loop_track,
             monitor: g.monitor,
+            queue_index: g.queue_index,
+            queue_len: g.queue.len(),
+            queue_looping: g.queue_looping,
         }
     }
 
@@ -926,7 +1240,18 @@ impl MusicSource {
             }
         }
         if n == 0 && !loop_track {
-            g.playing = false;
+            // End of track. The audio thread names the next entry but must not
+            // open it — `service_advance` does the file I/O on its own task. Note
+            // `playing` deliberately stays true when a successor exists, so
+            // `is_active` keeps the transmit gate open across the track gap
+            // instead of flapping it closed for the length of a file open.
+            match g
+                .queue_index
+                .and_then(|cur| Self::successor(cur, g.queue.len(), g.queue_looping))
+            {
+                Some(next) => g.advance_to = Some(next),
+                None => g.playing = false,
+            }
         }
         n
     }
@@ -1266,5 +1591,226 @@ mod music_bus_tests {
         assert!(st.path.is_some());
         assert_eq!(st.duration_ms, 1000);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ------------------------------------------------------ Session 20 queue ---
+
+    /// Drain a source to end-of-track, or give up after `max` chunks.
+    fn drain(src: &MusicSource, max: usize) {
+        let mut chunk = [0.0_f32; RNNOISE_FRAME];
+        for _ in 0..max {
+            if src.next_chunk(&mut chunk) == 0 {
+                return;
+            }
+        }
+        panic!("track never reached EOF within {max} chunks");
+    }
+
+    #[test]
+    fn successor_wraps_only_when_the_queue_loops() {
+        assert_eq!(MusicSource::successor(0, 3, false), Some(1));
+        assert_eq!(
+            MusicSource::successor(2, 3, false),
+            None,
+            "end of a non-looping queue"
+        );
+        assert_eq!(MusicSource::successor(2, 3, true), Some(0), "looping wraps");
+        assert_eq!(
+            MusicSource::successor(0, 0, true),
+            None,
+            "an empty queue has no successor even when looping"
+        );
+    }
+
+    /// The audio thread must only *name* the next track. If it opened the file
+    /// itself, container parsing would happen under the music mutex on the audio
+    /// thread and stall the outgoing mix — so this asserts the two-step split.
+    #[test]
+    fn eof_names_the_successor_without_opening_it() {
+        let a = std::env::temp_dir().join("verio_q_adv_a.wav");
+        let b = std::env::temp_dir().join("verio_q_adv_b.wav");
+        write_tone(&a);
+        write_tone(&b);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![
+            MusicSource::describe_track(&a).expect("describe a"),
+            MusicSource::describe_track(&b).expect("describe b"),
+        ]);
+        src.jump_to(0, true).expect("jump to first");
+        assert_eq!(src.status().queue_index, Some(0));
+
+        drain(&src, 300);
+
+        let st = src.status();
+        assert_eq!(st.queue_index, Some(0), "the swap has not happened yet");
+        assert!(
+            st.playing,
+            "playing stays true across the track gap, so the transmit gate does not flap"
+        );
+
+        assert!(src.service_advance(), "the advance task installs the next track");
+        let st = src.status();
+        assert_eq!(st.queue_index, Some(1));
+        assert!(
+            st.path.as_deref().unwrap_or_default().ends_with("verio_q_adv_b.wav"),
+            "advanced to the second entry, got {:?}",
+            st.path
+        );
+        assert!(src.is_active(), "still active after the swap");
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn eof_stops_when_the_queue_is_exhausted() {
+        let a = std::env::temp_dir().join("verio_q_last.wav");
+        write_tone(&a);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![MusicSource::describe_track(&a).expect("describe")]);
+        src.jump_to(0, true).expect("jump");
+        drain(&src, 300);
+
+        assert!(!src.is_active(), "no successor and not looping -> stops");
+        assert!(!src.service_advance(), "there is nothing to advance to");
+
+        let _ = std::fs::remove_file(&a);
+    }
+
+    /// A queue entry whose file has gone missing must be skipped, not stalled on.
+    #[test]
+    fn advance_skips_an_unreadable_entry() {
+        let a = std::env::temp_dir().join("verio_q_skip_a.wav");
+        let c = std::env::temp_dir().join("verio_q_skip_c.wav");
+        write_tone(&a);
+        write_tone(&c);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![
+            MusicSource::describe_track(&a).expect("describe a"),
+            QueueItem {
+                path: std::env::temp_dir()
+                    .join("verio_q_does_not_exist_9f3a.wav")
+                    .display()
+                    .to_string(),
+                title: "missing".into(),
+                duration_ms: 0,
+            },
+            MusicSource::describe_track(&c).expect("describe c"),
+        ]);
+        src.jump_to(0, true).expect("jump");
+        src.request_next();
+
+        assert!(src.service_advance(), "skips the missing file and lands on the third");
+        let st = src.status();
+        assert_eq!(st.queue_index, Some(2), "landed past the broken entry");
+        assert!(st
+            .path
+            .as_deref()
+            .unwrap_or_default()
+            .ends_with("verio_q_skip_c.wav"));
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&c);
+    }
+
+    /// Reordering must carry the loaded track with it, not leave `queue_index`
+    /// pointing at a position that now holds a different track.
+    #[test]
+    fn queue_move_carries_the_loaded_track() {
+        let a = std::env::temp_dir().join("verio_q_move.wav");
+        write_tone(&a);
+        let item = MusicSource::describe_track(&a).expect("describe");
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![item.clone(), item.clone(), item.clone()]);
+        src.jump_to(2, true).expect("jump to the third");
+
+        // Moving an earlier entry to the loaded one's position shifts it back.
+        src.queue_move(0, 2);
+        assert_eq!(src.status().queue_index, Some(1), "index follows the track");
+
+        // Moving the loaded entry itself carries it to the new position.
+        src.queue_move(1, 0);
+        assert_eq!(src.status().queue_index, Some(0));
+
+        let _ = std::fs::remove_file(&a);
+    }
+
+    #[test]
+    fn queue_remove_keeps_the_loaded_track_addressed() {
+        let a = std::env::temp_dir().join("verio_q_rm.wav");
+        write_tone(&a);
+        let item = MusicSource::describe_track(&a).expect("describe");
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![item.clone(), item.clone(), item.clone()]);
+        src.jump_to(2, true).expect("jump");
+
+        // Removing an entry before the loaded one shifts the index down.
+        src.queue_remove(0);
+        assert_eq!(src.status().queue_index, Some(1));
+
+        // Removing the loaded entry leaves it loaded but unaddressable — a stale
+        // index here would name whichever track slid into that slot.
+        src.queue_remove(1);
+        assert_eq!(src.status().queue_index, None);
+        assert!(src.status().path.is_some(), "the track itself is still loaded");
+
+        let _ = std::fs::remove_file(&a);
+    }
+
+    /// `open()` is not a queue operation, so it must not leave a stale index
+    /// behind naming an entry that is no longer the loaded track.
+    #[test]
+    fn direct_open_clears_the_queue_index() {
+        let a = std::env::temp_dir().join("verio_q_direct_a.wav");
+        let b = std::env::temp_dir().join("verio_q_direct_b.wav");
+        write_tone(&a);
+        write_tone(&b);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![MusicSource::describe_track(&a).expect("describe")]);
+        src.jump_to(0, true).expect("jump");
+        assert_eq!(src.status().queue_index, Some(0));
+
+        src.open(&b).expect("direct open");
+        assert_eq!(
+            src.status().queue_index,
+            None,
+            "a directly-opened file is not a queue member"
+        );
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// Loading a queue entry paused must not start playback. The audio thread
+    /// reads `playing` to decide whether to pull samples, so a wrong value here
+    /// would broadcast music into the room the moment files are added.
+    #[test]
+    fn jump_to_can_load_without_playing() {
+        let a = std::env::temp_dir().join("verio_q_load.wav");
+        write_tone(&a);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![MusicSource::describe_track(&a).expect("describe")]);
+
+        src.jump_to(0, false).expect("load paused");
+        let st = src.status();
+        assert!(st.path.is_some(), "the track is loaded");
+        assert!(!st.playing, "but not playing");
+        assert_eq!(st.queue_index, Some(0), "and it is the current queue entry");
+        assert!(
+            !src.is_active(),
+            "a paused load must not open the transmit gate"
+        );
+
+        src.jump_to(0, true).expect("load playing");
+        assert!(src.is_active(), "an explicit play starts it");
+
+        let _ = std::fs::remove_file(&a);
     }
 }
