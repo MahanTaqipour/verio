@@ -1,5 +1,29 @@
 @echo off
+setlocal
 cd /d C:\dev\verio
-cargo clippy --workspace -- -D warnings > C:\dev\verio\clippy7.log 2>&1
-cargo test --workspace > C:\dev\verio\test7.log 2>&1
-echo ALLDONE > C:\dev\verio\verify_done.flag
+set FAIL=0
+
+echo === cargo clippy --workspace -- -D warnings ===
+cargo clippy --workspace -- -D warnings
+if errorlevel 1 set FAIL=1
+
+rem The `verio` bin target carries a requireAdministrator manifest (needed for global hotkeys),
+rem so its test harness cannot be launched from a non-elevated shell: it dies with os error 740
+rem and aborts the run before the later crates are reached. `cargo test --workspace` therefore
+rem always reports failure on a healthy tree. Exclude it here and test its lib target separately.
+echo === cargo test --workspace --exclude verio ===
+cargo test --workspace --exclude verio
+if errorlevel 1 set FAIL=1
+
+echo === cargo test -p verio --lib ===
+cargo test -p verio --lib
+if errorlevel 1 set FAIL=1
+
+if "%FAIL%"=="1" (
+  echo.
+  echo VERIFY FAILED
+  exit /b 1
+)
+echo.
+echo VERIFY OK
+exit /b 0
