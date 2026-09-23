@@ -1431,6 +1431,13 @@ pub fn spawn_relay_session_with_mode(
 }
 
 /// Spawn a voice session over a UDP relay or peer-host with candidate endpoints (probes all until response, then locks on).
+// Eight parameters trips `clippy::too_many_arguments` (threshold 7). Two of them
+// (`_remote_identity`, `_silence_frame`) are unused here: this path derives each datagram's
+// sender from its UUID prefix (see the `sender_uuid` binding below) and runs its own ping
+// keepalive, so it needs neither. They are kept so this signature stays interchangeable with
+// `spawn_relay_session_with_mode`, which forwards to it. Bundling them into a params struct
+// would change a public API consumed by `verio-app`; that is a backend refactor, not a lint fix.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_relay_session_with_candidates(
     primary_addr: SocketAddr,
     fallback_addrs: Vec<SocketAddr>,
@@ -1677,11 +1684,11 @@ pub fn spawn_relay_session_with_candidates(
                         return;
                     }
                     // Check room code
-                    if &buf[0..4] != &room_bytes {
+                    if buf[0..4] != room_bytes {
                         return;
                     }
                     // Ignore our own echo
-                    if &buf[4..20] == &local_uuid_bytes {
+                    if buf[4..20] == local_uuid_bytes {
                         return;
                     }
                     if n == 20 {

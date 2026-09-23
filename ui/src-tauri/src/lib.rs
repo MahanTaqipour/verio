@@ -1251,7 +1251,7 @@ pub fn run() {
                             tick_music.service_advance();
 
                             tick = tick.wrapping_add(1);
-                            if tick == 1 || tick % 5 == 0 {
+                            if tick == 1 || tick.is_multiple_of(5) {
                                 let status = tick_music.status();
                                 let json = serde_json::to_string(&status).unwrap_or_default();
                                 if status.playing || json != last {

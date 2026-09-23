@@ -528,9 +528,14 @@ fn short_uuid(uuid: &[u8; 16]) -> String {
     uuid[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Clients in one room, keyed by their 16-byte peer UUID.
+pub type RoomClients = HashMap<[u8; 16], RelayClient>;
+/// Every live room, keyed by room code.
+pub type Rooms = Arc<RwLock<HashMap<String, RoomClients>>>;
+
 #[derive(Clone, Default)]
 pub struct SharedRelayHub {
-    pub rooms: Arc<RwLock<HashMap<String, HashMap<[u8; 16], RelayClient>>>>,
+    pub rooms: Rooms,
 }
 
 impl SharedRelayHub {
