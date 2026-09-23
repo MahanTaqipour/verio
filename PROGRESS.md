@@ -4012,10 +4012,6 @@ too soon after a restart fails with `ERR_CONNECTION_REFUSED` rather than a real 
 - **`identifier: "ir.verio.app"`** ends in `.app`; `tauri build` warns it conflicts with the
   macOS bundle extension. Changing it moves the Windows app-data path, so it needs a deliberate
   decision.
-- **The clippy gate lints lib and bin targets only.** `verify.bat` runs
-  `cargo clippy --workspace -- -D warnings`, which does **not** include `--all-targets`, so test
-  and bench code is unlinted. Whether `--all-targets` is clean has **not been measured**. Adding
-  it is a one-word change but may surface a new chain of findings in test code.
 - Carried: **`prepare_hotkey_capture`** (live command, no caller, contract is a pair).
 
 
@@ -4110,5 +4106,32 @@ never touched these lines. None affect the shipping binary: a lint denied by `-D
 
 ### 6. Still open
 
-See §8 of Session 25. Two additions this session: the `too_many_arguments` suppression above,
-and the unmeasured `--all-targets` gap now recorded there.
+See §8 of Session 25, plus the `too_many_arguments` suppression above.
+
+### 7. Follow-up, same session: the `--all-targets` gap, measured and closed
+
+§4 left one thing unmeasured: whether `cargo clippy --all-targets` is clean, since the gate ran
+without it and so never linted test or bench code. It is not clean — **two more findings**, both
+in `verio-transport`'s test module, both previously invisible for the same fail-fast reason:
+
+- `empty_line_after_outer_attr` at `lib.rs:1816` — a stray blank line between `#[cfg(test)]` and
+  `mod tests {`.
+- `collapsible_match` at `lib.rs:1979` — `if let Ok(ev) = rx.recv_timeout(..) { if let
+  TransportEvent::Audio { .. } = ev { .. } }`. Collapsed into one `if let`. Verified safe before
+  changing it: the outer body was *solely* the inner `if let`, so a non-Audio event still falls
+  through to the next `while` iteration exactly as before.
+
+`cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**, and the gate now runs with
+`--all-targets`. Worth stating why this is the right flag *here* specifically: clippy only
+**checks** targets, it never launches them, so it can cover the `verio` **bin** whose test
+harness `cargo test` cannot run at all. The tool that is blocked from *running* the bin can still
+*lint* it.
+
+**A method failure worth recording, because it nearly went unnoticed.** The two edits were issued
+as two calls in one message; the second was applied against a copy of the file predating the
+first, so it silently clobbered it. `verify.bat` then still failed on the surviving finding, which
+is the only reason it was caught. **One `Edit` per file per message** — the tool reports success
+for both, and nothing tells you one was lost.
+
+Re-verified after both changes: `VERIFY OK`, `EXITCODE=0`, with **71 passed, 0 failed** — which
+also confirms the collapsed `if let` is behaviour-preserving, since that test exercises it.
