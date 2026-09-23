@@ -16,7 +16,6 @@ verio-app = { path = "../../crates/verio-app" }
 verio-audio = { path = "../../crates/verio-audio" }
 verio-discovery = { path = "../../crates/verio-discovery" }
 verio-transport = { path = "../../crates/verio-transport" }
-uuid = { version = "1", features = ["v4"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { workspace = true, features = [] }

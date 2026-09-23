@@ -1,18 +1,28 @@
-//! Settings persistence: JSON at `<app_config_dir>/verio/settings.json`.
+//! Settings: the `Settings` shape, and the store that owns it.
 //!
-//! Loaded once at launch; saved debounced (500 ms) on change by a background
-//! persister thread. A corrupt/unreadable file falls back to defaults with a
-//! warning — never panics.
+//! Session 28 moved persistence into the local database ([`crate::db`]) at
+//! `<config_dir>/verio.db`. What used to be `<config_dir>/settings.json` is now
+//! **imported once and renamed** — see [`import_legacy`]. Nothing reads or writes
+//! the JSON afterwards, which is the point: two stores for one setting is how a
+//! setting silently stops taking effect.
+//!
+//! Saves are debounced (500 ms) by a background thread. An unreadable stored blob
+//! falls back to the legacy file, then to defaults, with a warning — never a panic.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-/// Debounce window before a change hits disk.
+use crate::db::Db;
+
+/// Debounce window before a change hits the database.
 const SAVE_DEBOUNCE_MS: u64 = 500;
-pub const SETTINGS_FILE_NAME: &str = "settings.json";
+
+/// The pre-Session-28 store. Read once by [`import_legacy`], then renamed to
+/// `settings.json.imported` so it cannot be mistaken for the live settings.
+pub const LEGACY_SETTINGS_FILE_NAME: &str = "settings.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -56,9 +66,6 @@ pub struct Settings {
     pub loopback: bool,
     pub debug_wavs: bool,
     pub hotkeys: HotkeySettings,
-    /// Persistent peer identity (uuid v4) — one per profile. Generated on first
-    /// load; the LARGER uuid becomes the WebRTC offerer (deterministic role).
-    pub peer_id: String,
     /// TCP port for direct-connect signaling. Default 49860.
     pub signaling_port: u16,
     /// Last 5 direct-connect addresses (most recent first).
@@ -82,6 +89,11 @@ pub struct Settings {
     pub music_bitrate_kbps: u32,
 }
 
+// Session 28 removed `peer_id` from this struct. It was generated on every load
+// and read by nothing — the wire identity has come from a per-process uuid since
+// two-instance testing needed it. The persistent half of the identity now lives
+// in `identity.user_id` (see `crate::db`), which is the only authority for it.
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -93,7 +105,6 @@ impl Default for Settings {
             loopback: false,
             debug_wavs: false,
             hotkeys: HotkeySettings::default(),
-            peer_id: String::new(),
             signaling_port: verio_discovery::DEFAULT_SIGNALING_PORT,
             direct_recent: Vec::new(),
             vps_address: "ws://127.0.0.1:8443".to_string(),
@@ -133,14 +144,6 @@ impl Settings {
         }
     }
 
-    /// Generate the persistent peer uuid (uuid v4) if missing. Idempotent.
-    pub fn ensure_peer_id(&mut self) {
-        if self.peer_id.is_empty() {
-            self.peer_id = uuid::Uuid::new_v4().to_string();
-            tracing::info!(peer_id = %self.peer_id, "generated persistent peer uuid");
-        }
-    }
-
     /// Record a direct-connect address as most-recently-used (dedup, max 5).
     pub fn remember_direct_addr(&mut self, addr: &str) {
         let addr = addr.trim();
@@ -156,44 +159,31 @@ impl Settings {
 /// Shared, thread-safe settings handle with debounced persistence.
 #[derive(Clone)]
 pub struct SettingsStore {
-    dir: PathBuf,
+    db: Db,
     inner: Arc<Mutex<Settings>>,
     /// Notify channel to the persister thread.
     notify: Arc<mpsc::Sender<()>>,
 }
 
 impl SettingsStore {
-    /// Load settings from `dir/settings.json`. A missing file → defaults (no
-    /// warning). A corrupt/unreadable file → defaults + warning. The persister
-    /// thread is started either way.
+    /// Load settings, importing the legacy `settings.json` from `legacy_dir` the
+    /// first time. The persister thread is started either way.
     #[must_use]
-    pub fn load(dir: &Path) -> Self {
-        let file = dir.join(SETTINGS_FILE_NAME);
-        let (mut settings, corrupt) = read_settings(&file);
-        // Phase 2: every load produces a valid, stable peer uuid per profile and
-        // clamps the new network fields.
-        settings.ensure_peer_id();
-        settings.sanitize();
-        if corrupt {
-            tracing::warn!(
-                file = %file.display(),
-                "settings file unreadable/corrupt — falling back to defaults (overwritten on next change)"
-            );
-        } else {
-            tracing::info!(file = %file.display(), "settings loaded");
-        }
+    pub fn load(db: Db, legacy_dir: &Path) -> Self {
+        let settings = import_legacy(&db, legacy_dir);
+        tracing::info!(settings = ?settings, "settings loaded");
         let inner = Arc::new(Mutex::new(settings));
 
         let (tx, rx) = mpsc::channel::<()>();
-        let persist_dir = dir.to_path_buf();
+        let persist_db = db.clone();
         let persist_inner = Arc::clone(&inner);
         std::thread::Builder::new()
             .name("settings-persister".into())
-            .spawn(move || persister_loop(persist_dir, persist_inner, rx))
+            .spawn(move || persister_loop(persist_db, persist_inner, rx))
             .expect("spawn settings persister");
 
         Self {
-            dir: dir.to_path_buf(),
+            db,
             inner,
             notify: Arc::new(tx),
         }
@@ -223,49 +213,143 @@ impl SettingsStore {
     /// Save immediately (used on exit / when the persister is unavailable).
     pub fn flush(&self) {
         let snapshot = self.inner.lock().expect("settings lock").clone();
-        if let Err(e) = write_settings(&self.dir.join(SETTINGS_FILE_NAME), &snapshot) {
+        if let Err(e) = save_settings(&self.db, &snapshot) {
             tracing::error!("failed to save settings: {e}");
         }
     }
 }
 
-/// Returns `(settings, corrupt)` — corrupt=true means the file existed but
-/// could not be read/parsed.
-fn read_settings(path: &Path) -> (Settings, bool) {
-    match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<Settings>(&text) {
-            Ok(mut s) => {
-                s.sanitize();
-                (s, false)
+/// What the legacy file held, if it was there at all.
+struct LegacyFile {
+    settings: Settings,
+    /// The old `peer_id`, which was the persistent identity before Session 28.
+    peer_id: Option<String>,
+    /// The file existed but could not be read or parsed.
+    corrupt: bool,
+}
+
+/// Read `settings.json` if present. `None` means "no legacy file", which is the
+/// normal case for a fresh install and for every launch after the first.
+fn read_legacy_settings(path: &Path) -> Option<LegacyFile> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(file = %path.display(), error = %e, "legacy settings.json is unreadable");
+            return Some(LegacyFile {
+                settings: Settings::default(),
+                peer_id: None,
+                corrupt: true,
+            });
+        }
+    };
+    // Read `peer_id` from the raw value, not from `Settings`: the field is gone
+    // from the struct, but the value is still the user's persistent identity.
+    let peer_id = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("peer_id").and_then(|p| p.as_str()).map(str::to_string));
+    match serde_json::from_str::<Settings>(&text) {
+        Ok(mut settings) => {
+            settings.sanitize();
+            Some(LegacyFile {
+                settings,
+                peer_id,
+                corrupt: false,
+            })
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "legacy settings.json parse error detail");
+            Some(LegacyFile {
+                settings: Settings::default(),
+                peer_id,
+                corrupt: true,
+            })
+        }
+    }
+}
+
+/// Import the legacy `settings.json` into the database, exactly once.
+///
+/// Returns the settings to run with. The database wins whenever it already holds
+/// a blob, so after the first launch this only reads the database. A corrupt
+/// legacy file is **left on disk untouched** — the app runs on defaults, and the
+/// file stays for the user to inspect rather than being silently destroyed.
+fn import_legacy(db: &Db, legacy_dir: &Path) -> Settings {
+    let legacy_path = legacy_dir.join(LEGACY_SETTINGS_FILE_NAME);
+    let legacy = read_legacy_settings(&legacy_path);
+
+    // Identity first: the old `peer_id` is the user's persistent id, so adopt it
+    // before anything can generate a replacement. `adopt_user_id` refuses to
+    // overwrite an identity that already exists.
+    if let Some(peer_id) = legacy.as_ref().and_then(|f| f.peer_id.as_deref()) {
+        match db.adopt_user_id(peer_id) {
+            Ok(true) => tracing::info!("persistent identity carried over from settings.json"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not adopt the legacy peer_id: {e}"),
+        }
+    }
+
+    // The database is authoritative once it holds a blob.
+    match db.load_settings_json() {
+        Ok(Some(json)) => match serde_json::from_str::<Settings>(&json) {
+            Ok(mut stored) => {
+                stored.sanitize();
+                return stored;
             }
+            // Unreadable blob: fall through and re-import rather than run on
+            // defaults while pretending the stored values are still in play.
             Err(e) => {
-                tracing::debug!(error = %e, "settings parse error detail");
-                (Settings::default(), true)
+                tracing::warn!(error = %e, "stored settings are unreadable; re-importing");
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), false),
-        Err(_) => (Settings::default(), true),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("could not read settings from the database: {e}"),
     }
+
+    let (mut settings, imported) = match legacy {
+        Some(found) => (found.settings, !found.corrupt),
+        None => (Settings::default(), false),
+    };
+    settings.sanitize();
+
+    if let Err(e) = save_settings(db, &settings) {
+        tracing::error!("could not write settings to the database: {e}");
+    }
+
+    if imported {
+        // The file is no longer read. Rename it so nobody edits a file that has
+        // stopped doing anything. The database already holds the values, so a
+        // failure here is cosmetic.
+        let done = legacy_path.with_extension("json.imported");
+        match std::fs::rename(&legacy_path, &done) {
+            Ok(()) => tracing::info!(
+                to = %done.display(),
+                "legacy settings.json imported into verio.db and renamed"
+            ),
+            Err(e) => tracing::warn!("imported settings.json but could not rename it: {e}"),
+        }
+    } else if legacy_path.exists() {
+        tracing::warn!(
+            file = %legacy_path.display(),
+            "legacy settings.json could not be parsed; running on defaults and leaving the file in place"
+        );
+    }
+
+    settings
 }
 
-fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    let text = serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
-    // Write-then-rename so an interrupted write never corrupts the file.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
+fn save_settings(db: &Db, settings: &Settings) -> Result<(), String> {
+    let json = serde_json::to_string(settings).map_err(|e| format!("serialize settings: {e}"))?;
+    db.save_settings_json(&json)
 }
 
-fn persister_loop(dir: PathBuf, inner: Arc<Mutex<Settings>>, rx: mpsc::Receiver<()>) {
+fn persister_loop(db: Db, inner: Arc<Mutex<Settings>>, rx: mpsc::Receiver<()>) {
     while rx.recv().is_ok() {
         // Debounce window: coalesce any notifications arriving while we wait.
         std::thread::sleep(std::time::Duration::from_millis(SAVE_DEBOUNCE_MS));
         while rx.try_recv().is_ok() {}
         let snapshot = inner.lock().expect("settings lock").clone();
-        match write_settings(&dir.join(SETTINGS_FILE_NAME), &snapshot) {
+        match save_settings(&db, &snapshot) {
             Ok(()) => tracing::debug!("settings saved"),
             Err(e) => tracing::error!("failed to save settings: {e}"),
         }
@@ -275,43 +359,26 @@ fn persister_loop(dir: PathBuf, inner: Arc<Mutex<Settings>>, rx: mpsc::Receiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn roundtrip_via_json() {
-        let dir = std::env::temp_dir().join("verio-settings-test-rt");
+    /// A private directory per test — SQLite will not share a file between cases.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("verio-settings-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join(SETTINGS_FILE_NAME);
-        let mut s = Settings { nickname: "Mahan".into(), input_gain_db: 12.5, ..Settings::default() };
-        s.hotkeys.mute = "Ctrl+Alt+Z".into();
-        write_settings(&path, &s).expect("write");
-        let (loaded, corrupt) = read_settings(&path);
-        assert!(!corrupt);
-        assert_eq!(loaded, s);
-        let _ = std::fs::remove_file(&path);
+        dir
     }
 
-    #[test]
-    fn corrupt_file_falls_back_to_defaults() {
-        let dir = std::env::temp_dir().join("verio-settings-test-corrupt");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join(SETTINGS_FILE_NAME);
-        std::fs::write(&path, "{ not json !!!").expect("write junk");
-        let (s, corrupt) = read_settings(&path);
-        assert!(corrupt);
-        assert_eq!(s, Settings::default());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn missing_file_is_not_corrupt() {
-        let (s, corrupt) = read_settings(Path::new("Z:/definitely/not/here/settings.json"));
-        assert!(!corrupt);
-        assert_eq!(s, Settings::default());
+    fn open(dir: &Path) -> Db {
+        Db::open(dir).expect("open db")
     }
 
     #[test]
     fn sanitize_clamps_gain() {
-        let mut s = Settings { input_gain_db: 55.0, ..Settings::default() };
+        let mut s = Settings {
+            input_gain_db: 55.0,
+            ..Settings::default()
+        };
         s.sanitize();
         assert!((s.input_gain_db - 30.0).abs() < 1e-6);
     }
@@ -326,23 +393,144 @@ mod tests {
     }
 
     #[test]
-    fn store_roundtrip_keeps_nonempty_nickname() {
-        let dir = std::env::temp_dir().join("verio-settings-test-nickname");
+    fn a_fresh_install_needs_no_json_file() {
+        let dir = temp_dir("fresh");
+        let store = SettingsStore::load(open(&dir), &dir);
+        assert_eq!(store.get().nickname, "");
+        // The database is the only sink: nothing wrote a JSON file.
+        assert!(
+            !dir.join(LEGACY_SETTINGS_FILE_NAME).exists(),
+            "loading a fresh install created a settings.json"
+        );
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    }
+
+    #[test]
+    fn legacy_settings_json_is_imported_and_then_renamed() {
+        let dir = temp_dir("import");
+        let legacy = Settings {
+            nickname: "Mahan".into(),
+            input_gain_db: 12.5,
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            serde_json::to_string(&legacy).expect("serialize"),
+        )
+        .expect("write legacy");
+
+        let store = SettingsStore::load(open(&dir), &dir);
+        assert_eq!(store.get().nickname, "Mahan");
+        assert!((store.get().input_gain_db - 12.5).abs() < 1e-6);
+
+        // The JSON is no longer the store, and must not look like it still is.
+        assert!(!dir.join(LEGACY_SETTINGS_FILE_NAME).exists());
+        assert!(dir.join("settings.json.imported").exists());
+        // And the value really reached the database.
+        let db = open(&dir);
+        let blob = db.load_settings_json().expect("read").expect("a blob");
+        let stored: Settings = serde_json::from_str(&blob).expect("parse");
+        assert_eq!(stored.nickname, "Mahan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_database_wins_over_a_reintroduced_legacy_file() {
+        let dir = temp_dir("db-wins");
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            serde_json::to_string(&Settings {
+                nickname: "from-file".into(),
+                ..Settings::default()
+            })
+            .expect("serialize"),
+        )
+        .expect("write legacy");
+
         {
-            let store = SettingsStore::load(&dir);
+            let store = SettingsStore::load(open(&dir), &dir);
+            assert_eq!(store.get().nickname, "from-file");
+            store.update(|s| s.nickname = "from-db".into());
+            store.flush();
+        }
+
+        // Someone drops a fresh settings.json back in. It must not take over.
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            serde_json::to_string(&Settings {
+                nickname: "stale".into(),
+                ..Settings::default()
+            })
+            .expect("serialize"),
+        )
+        .expect("write legacy again");
+
+        let store = SettingsStore::load(open(&dir), &dir);
+        assert_eq!(
+            store.get().nickname,
+            "from-db",
+            "a stale settings.json overrode the database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_legacy_file_is_left_on_disk_and_does_not_break_the_load() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join(LEGACY_SETTINGS_FILE_NAME);
+        std::fs::write(&path, "{ not json !!!").expect("write junk");
+
+        let store = SettingsStore::load(open(&dir), &dir);
+        assert_eq!(store.get(), Settings::default());
+        // Not renamed: the user's file is preserved for inspection.
+        assert!(path.exists(), "the corrupt file was renamed or deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_legacy_peer_id_becomes_the_persistent_user_id() {
+        let dir = temp_dir("peer-id");
+        // `peer_id` is no longer part of `Settings`, so build the JSON by hand —
+        // exactly the shape the old build wrote.
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            r#"{"nickname":"Mahan","peer_id":"6cd0d574-0ac9-45db-8837-d096800f0226"}"#,
+        )
+        .expect("write legacy");
+
+        let db = open(&dir);
+        let _store = SettingsStore::load(db.clone(), &dir);
+        assert_eq!(
+            db.user_id().expect("user id"),
+            "6cd0d574-0ac9-45db-8837-d096800f0226",
+            "the persistent identity was replaced instead of carried over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nickname_survives_a_restart() {
+        let dir = temp_dir("restart");
+        {
+            let store = SettingsStore::load(open(&dir), &dir);
             store.update(|s| s.nickname = "Mahan".into());
             store.flush();
         }
         // Reload exactly as the app does at launch.
-        let reloaded = SettingsStore::load(&dir);
+        let reloaded = SettingsStore::load(open(&dir), &dir);
         assert_eq!(reloaded.get().nickname, "Mahan");
-        // And the on-disk JSON really contains it.
-        let (from_disk, corrupt) = read_settings(&dir.join(SETTINGS_FILE_NAME));
-        assert!(!corrupt);
-        assert_eq!(from_disk.nickname, "Mahan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_stored_blob_falls_back_instead_of_failing() {
+        let dir = temp_dir("bad-blob");
+        let db = open(&dir);
+        db.save_settings_json("{ this is not a Settings }")
+            .expect("plant a bad blob");
+
+        let store = SettingsStore::load(db, &dir);
+        assert_eq!(store.get(), Settings::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

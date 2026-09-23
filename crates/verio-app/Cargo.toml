@@ -9,6 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 tracing = { workspace = true }
+rusqlite = { workspace = true }
 verio-audio = { path = "../verio-audio" }
 verio-dsp = { path = "../verio-dsp" }
 verio-transport = { path = "../verio-transport" }

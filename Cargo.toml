@@ -39,4 +39,8 @@ rfd = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
+# Session 28: the local store. `bundled` compiles the SQLite amalgamation with
+# the host C toolchain (the MSVC one Tauri already requires) instead of linking
+# a system sqlite3 — so there is no DLL to ship and no version to match.
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Keep default settings for now (build machine: 4C/8T, 8 GB RAM).

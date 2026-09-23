@@ -4424,4 +4424,140 @@ status *message* on `arrived !== false` (the peer still joins the list either wa
 - **Still needs a human listening test** with two instances. The wiring and the decode are verified;
   that the room *sounds* right is not something a test can assert here. Flagging rather than claiming.
 
+---
+
+## Session 28 (2026-09-23) — local SQLite, and the identity that was never read
+
+The session had one job on paper — add a local store — and one real job in practice: `Settings` had
+a `peer_id` field that **nothing read**. Not the Rust, not the frontend. It was generated on every
+load, written to `settings.json`, and ignored. The wire identity has come from a per-process
+`Uuid::new_v4()` since two-instance testing needed two instances on one PC to not collide.
+
+So the "two-tier identity" the plan asked for was not a new idea to introduce, it was an existing
+accident to make explicit and correct.
+
+### 1. The local store
+
+`rusqlite` 0.40 with `features = ["bundled"]` — added to `[workspace.dependencies]`, so the SQLite
+amalgamation is compiled by the same MSVC toolchain Tauri already requires. No system `sqlite3`, no
+DLL to ship, no version to match. Verified before writing a line of the module: `libsqlite3-sys
+v0.38.2` compiled clean.
+
+New module `crates/verio-app/src/db.rs`:
+
+- `Db::open(dir)` → `<dir>/verio.db`, `create_dir_all` first. `PRAGMA journal_mode = WAL`
+  (an interrupted write cannot half-update the file), `synchronous = NORMAL`, `foreign_keys = ON`,
+  `busy_timeout = 5000` (a second instance on the same profile waits rather than dies).
+- `MIGRATIONS: &[&str]` — ordered, append-only, and documented as such. The index plus one **is** the
+  version that entry brings the database to. Each migration runs in its own transaction and records
+  itself in `schema_version`; the guard is `if version <= current { continue; }`.
+- **A newer database is refused, not migrated down.** If `schema_version` exceeds what the build
+  knows, `open` returns an error naming both versions. "Migrating down" would mean destroying
+  columns the file actually has.
+- Schema v1, exactly the five tables the plan named: `schema_version`, `identity`, `settings`,
+  `mute_list`, `volume_prefs`. Timestamps are Unix seconds as `INTEGER` — formatting them would need
+  a date library for values no user ever sees.
+
+### 2. Two-tier identity, both halves actually used
+
+- `Db::user_id()` — persistent, generated once, read from `identity` on every later call.
+- `Db::session_id()` — `Uuid::new_v4()` **in memory only**, never written. This is the wire identity
+  (`lib.rs` line 1159), replacing the bare `Uuid::new_v4()` that used to sit there. The comment now
+  says *why* the persistent half must not go on the wire: it identifies the user, not this run.
+- `Db::adopt_user_id(candidate)` seeds the identity from the legacy `settings.json` `peer_id`, and
+  **refuses to overwrite an existing identity** — a stale file must not be able to re-key a user.
+
+`Settings::peer_id` and `Settings::ensure_peer_id()` are **deleted**. Keeping a second, unread
+authority for the persistent id is how the original bug happened.
+
+### 3. `settings.json` → the database
+
+`SettingsStore::load(db, legacy_dir)` imports the old file exactly once:
+
+1. **Identity first** — adopt the legacy `peer_id` before anything can generate a replacement.
+2. If the database already holds a settings blob, **it wins** and the file is not consulted.
+3. Otherwise take the file, write it to the database, then **rename it to
+   `settings.json.imported`** — so nobody edits a file that has stopped doing anything. The database
+   already holds the values, so a failed rename is a warning, not an error.
+4. A **corrupt** legacy file is left on disk untouched, and the app runs on defaults. Deleting or
+   renaming the user's unparseable file would destroy the only copy of whatever they had.
+
+`write_settings`/`read_settings` (the JSON pair) are gone; persistence is `save_settings_json` /
+`load_settings_json` on `Db`. `SettingsStore::flush` and the 500 ms debounced persister now write to
+the database.
+
+Two things this fixed in passing, both mine: the module doc claimed the file lived at
+`<app_config_dir>/verio/settings.json` when it has always been `<config_dir>/settings.json`, and the
+now-unused `uuid` dependency was removed from `ui/src-tauri/Cargo.toml`.
+
+### 4. Verification
+
+| Check | Result |
+|---|---|
+| `cargo test -p verio-app --lib` | **38 passed, 0 failed** (was 27; +8 `db`, +3 net `settings`) |
+| `cargo test --workspace --exclude verio` | **88 passed, 0 failed** (was 77) |
+| `cargo test -p verio --lib` | 4 passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `pnpm tsc --noEmit` | exit 0 |
+| `pnpm tauri build --no-bundle` | exit 0 → `target/release/verio.exe`, **20 298 240 bytes** |
+| `verify-embedded-assets.mjs` | 6/6 cues embedded, both controls correct |
+| `check-phantom-classes.mjs` | PHANTOM none, 235 tokens, 0 interpolation |
+| `check-collisions.mjs` | LEAK clean, MIX clean |
+| `dead-css.mjs` | DEAD none, ORPHAN KEYFRAMES none |
+| `dead-modules.mjs C:/dev/verio/ui/src` | 33/33 reachable, 0 unreachable |
+| `verify-room` / `verify-settings` / `verify-music` / `verify-contents-wrapper` / `verify-harness` | all pass |
+| 8s boot smoke test | **NOT RUN** — see §6 |
+
+The binary grew 18 594 816 → 20 298 240 bytes (+1.6 MB). That is the observable evidence that SQLite
+is really linked into the shipped artefact, not just into a test build.
+
+**Four mutations, each reverted byte-exact** (`db.rs` `3b6d8534…`, `settings.rs` `a19f8b2c…`):
+
+| Mutation | Failed |
+|---|---|
+| `session_id: Uuid::new_v4()` → `Uuid::nil()` | `session_id_is_fresh_for_every_open` — `left: 0000…, right: 0000…` |
+| removed the "never overwrite" guard in `adopt_user_id` | `adopting_a_legacy_user_id_never_overwrites_a_real_one` — `UNIQUE constraint failed: identity.id` |
+| removed `if version <= current { continue; }` | `migrations_are_applied_once_not_reapplied` — `table schema_version already exists` |
+| removed `return stored;` in `import_legacy` | `the_database_wins_over_a_reintroduced_legacy_file` — `left: "stale", right: "from-db"` |
+
+Two clippy failures were caught and fixed rather than suppressed: `PathBuf` and `REQUIRED_TABLES` were
+used only by tests, so the lib target saw them as unused. `REQUIRED_TABLES` is now `#[cfg(test)]` and
+`PathBuf` moved into the test module.
+
+**`check-phantom-classes.mjs` exited 1 while printing `PHANTOM: none`.** That is its staleness guard,
+not a finding: `ui/src/dev/mock/invoke.ts` was newer than `dist/` (the join/leave fix touched it), and
+a class added since the build would be misreported as a phantom. Re-run after `vite build` → exit 0.
+Worth knowing: a green verdict line and a red exit code can both be true, and the exit code is right.
+
+### 5. Deliberate, and why
+
+- **`mute_list` and `volume_prefs` are created and never written.** They are the approved v1 schema;
+  Session 29's room-wide mute and its playlist work fill them. An empty table is a shape agreed in
+  advance, not a feature — and this is stated here rather than left for someone to discover.
+- **`user_id` is stored, logged at startup, and adopted from the legacy file, but nothing consumes
+  it yet.** Session 29's `MuteUser { target_user_id }` is the consumer. It is not a working feature
+  today and is not described as one.
+- Timestamps as Unix seconds rather than ISO text: no date dependency for values only a debugger sees.
+
+### 6. Found but not fixed
+
+- **The end-to-end claim "the app creates `verio.db` on first launch" is inferred, not observed.**
+  `target/release/verio.exe` still cannot be launched from a non-elevated shell —
+  `timeout 10 ./verio.exe --profile smoketest` → `Permission denied`, exit **126**, unchanged from
+  Session 27, caused by `build.rs` setting `requireAdministrator`. What *is* observed: `Db::open`
+  creates and migrates the file (8 tests), the app calls it with no fallback path, and the binary
+  contains SQLite. The join is not directly measured.
+- The startup ordering constraint is real and now commented: `SettingsStore::load` (line 1126) adopts
+  the legacy `peer_id`, so `db.user_id()` (line 1131) must come **after** it. Reading the id first
+  would generate a fresh one and silently discard the user's existing identity.
+- `probe-room-contrast.mjs` reports the same pre-existing sub-AA pairs as Session 27 — avatar initials
+  3.9, volume percent 3.56 (`rgb(125, 113, 102)` on `rgb(33, 28, 24)`). Unchanged by this session; it
+  is a palette decision, still a probe rather than a gate.
+- Everything from Session 27 §11 still stands: `identifier: "ir.verio.app"` warns on macOS,
+  `prepare_hotkey_capture` has no caller, the `too_many_arguments` suppression in `verio-transport`,
+  and the untracked `.workbuddy-ai/` + `stitch_verio_desktop_interface_suite.zip`.
+- **An orphaned dev server was holding port 1420** when this session started (PID 12996). Killed
+  before the suite ran, so the checks did not run against stale code — but it means a check run
+  without that step could have been measuring the previous build.
+
 

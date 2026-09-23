@@ -20,8 +20,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use uuid::Uuid;
 
+use verio_app::db::Db;
 use verio_app::hotkeys::{HotkeyAction, TxState};
 use verio_app::pipeline::{LiveControls, PipelineConfig, PipelineEvent, PipelineHandle};
 use verio_app::room::{RoomEvent, RoomManager, RoomState};
@@ -1117,10 +1117,28 @@ pub fn run() {
                 .init();
             tracing::info!(log_dir = %log_dir.display(), "logging initialised");
 
-            // --- settings (corrupt file → defaults + warning, inside load) ---
-            let settings = SettingsStore::load(&config_dir);
+            // --- local store (Session 28) ---
+            // SQLite at <config_dir>/verio.db, profile-aware because config_dir
+            // already is. The legacy settings.json is imported once and renamed
+            // inside SettingsStore::load, so this is the only place that knows
+            // about either file.
+            let db = Db::open(&config_dir)?;
+            let settings = SettingsStore::load(db.clone(), &config_dir);
             let settings_snapshot = settings.get();
-            tracing::info!(settings = ?settings_snapshot, "settings loaded");
+            // The two halves of the identity, named at the one place they exist.
+            // `user_id` is persistent and belongs to this profile; `session_id`
+            // is minted per process so two instances on one PC never collide.
+            // Order matters: `SettingsStore::load` above adopts the legacy
+            // `peer_id` into `identity`, so reading the id before that call would
+            // generate a fresh one and silently discard the user's existing id.
+            let user_id = db
+                .user_id()
+                .map_err(|e| format!("read persistent user id: {e}"))?;
+            tracing::info!(
+                user_id = %user_id,
+                session_id = %db.session_id(),
+                "persistent identity and session identity"
+            );
             tracing::info!(
                 "relay packet log is {} (launch with RUST_LOG=debug to capture per-packet relay lines)",
                 if std::env::var("RUST_LOG")
@@ -1136,10 +1154,12 @@ pub fn run() {
                 }
             );
 
-            // Peer identity: generate a fresh UUID v4 for each running process
-            // so that multiple instances launched on the same PC (e.g. for testing)
-            // never collide with each other in signaling rooms or UDP relays.
-            let peer_uuid = Uuid::new_v4();
+            // Wire identity is the *session* half of the identity: fresh per
+            // process, so multiple instances launched on the same PC (e.g. for
+            // testing) never collide with each other in signaling rooms or UDP
+            // relays. The persistent half (`user_id`, above) is deliberately not
+            // put on the wire — it identifies the user, not this run.
+            let peer_uuid = db.session_id();
             let identity = Identity {
                 uuid: peer_uuid,
                 name: if settings_snapshot.nickname.is_empty() {

@@ -8,6 +8,7 @@
 //! Architecture rule: audio NEVER crosses the Tauri IPC boundary. The frontend is a
 //! control panel only — Tauri commands in, Tauri events out.
 
+pub mod db;
 pub mod hotkeys;
 pub mod pipeline;
 pub mod room;
