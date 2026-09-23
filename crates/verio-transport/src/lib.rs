@@ -1814,7 +1814,6 @@ pub fn spawn_relay_session_with_candidates(
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 
@@ -1975,13 +1974,13 @@ mod tests {
         let mut got_audio = false;
         while Instant::now() < deadline {
             handle_a.send_audio(1234567, vec![10, 20, 30, 40]);
-            if let Ok(ev) = rx_b.recv_timeout(Duration::from_millis(50)) {
-                if let TransportEvent::Audio { capture_ts_ms, opus, .. } = ev {
-                    assert_eq!(capture_ts_ms, 1234567);
-                    assert_eq!(opus, vec![10, 20, 30, 40]);
-                    got_audio = true;
-                    break;
-                }
+            if let Ok(TransportEvent::Audio { capture_ts_ms, opus, .. }) =
+                rx_b.recv_timeout(Duration::from_millis(50))
+            {
+                assert_eq!(capture_ts_ms, 1234567);
+                assert_eq!(opus, vec![10, 20, 30, 40]);
+                got_audio = true;
+                break;
             }
         }
         assert!(got_audio, "Bob should receive audio from Alice via relay");

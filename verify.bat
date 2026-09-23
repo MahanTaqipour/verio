@@ -3,8 +3,11 @@ setlocal
 cd /d C:\dev\verio
 set FAIL=0
 
-echo === cargo clippy --workspace -- -D warnings ===
-cargo clippy --workspace -- -D warnings
+rem --all-targets also lints test and bench code. That matters here specifically because clippy
+rem only *checks* targets, it never launches them, so it can cover the `verio` bin that
+rem `cargo test` cannot run (see the note below).
+echo === cargo clippy --workspace --all-targets -- -D warnings ===
+cargo clippy --workspace --all-targets -- -D warnings
 if errorlevel 1 set FAIL=1
 
 rem The `verio` bin target carries a requireAdministrator manifest (needed for global hotkeys),
