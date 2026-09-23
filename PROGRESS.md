@@ -3994,12 +3994,121 @@ too soon after a restart fails with `ERR_CONNECTION_REFUSED` rather than a real 
 
 ### 8. Still open
 
-- **`sounds/*.wav` is untracked *and* gitignored.** `.gitignore` has `*.wav` with only
-  `!ui/public/**/*.wav` excepted, so the shipping sound assets are in no commit.
-- **`LICENSE` reads `Mahan [Mahan Taqipour]`** — the brackets were part of the placeholder.
-- **`identifier: "ir.verio.app"`** ends in `.app`, which `tauri build` warns conflicts with the
+- **`sounds/` holds orphaned earcon prototypes, not shipping assets.** Correcting this file's
+  own earlier wording, which called them "the shipping sound assets in no commit": they are in no
+  commit because **nothing uses them**. Six files (496 KB) — `mute`, `unmute`, `deafen`,
+  `undeafen`, `join`, `leave` — and a grep for each filename across `.rs`/`.ts`/`.tsx`/`.json`/
+  `.toml`/`.md` returns **zero hits**. The only `.wav` paths in the Rust source are debug dumps
+  (`capture_raw.wav`, `loopback_out.wav`) and test fixtures written to `temp_dir`.
+
+  What they actually are: `PROJECT.md` line 11 specifies "synthesized in-ear audio cues
+  (earcons)" and line 127 lists "audible earcon tones" for mute/deafen/PTT — so this is a
+  **specified but unimplemented feature**, and the spec says *synthesized*, i.e. generated in
+  code rather than loaded from files. These look like prototypes for it. Two consequences worth
+  knowing before anyone implements it: **`defean.wav` is misspelled** (there is no
+  `deafen.wav`), so a filename-convention loader would silently fail for that one cue; and
+  `.gitignore` ignores `*.wav`, so if they are meant to ship, the ignore rule needs an exception
+  first.
+- **`identifier: "ir.verio.app"`** ends in `.app`; `tauri build` warns it conflicts with the
   macOS bundle extension. Changing it moves the Windows app-data path, so it needs a deliberate
   decision.
+- **The clippy gate lints lib and bin targets only.** `verify.bat` runs
+  `cargo clippy --workspace -- -D warnings`, which does **not** include `--all-targets`, so test
+  and bench code is unlinted. Whether `--all-targets` is clean has **not been measured**. Adding
+  it is a one-word change but may surface a new chain of findings in test code.
 - Carried: **`prepare_hotkey_capture`** (live command, no caller, contract is a pair).
 
 
+
+## Session 26 (2026-09-23) — the gate that had never passed
+
+### 1. What was found
+
+Phase 8 was declared closed last session. The one item left over was a `cargo clippy` failure I
+had run but not yet reported. Chasing it produced a larger finding than expected.
+
+**`verify.bat` is the project's declared gate, and it had never passed.** Two independent
+reasons:
+
+1. It ran `cargo test --workspace`, which can never succeed here (§ Session 24): the `verio` bin
+   target carries a `requireAdministrator` manifest, so its test harness dies with `os error 740`
+   and cargo aborts before the later crates are reached.
+2. It ran `cargo clippy --workspace -- -D warnings`, which was red on a clean checkout.
+
+The evidence that it had never been *run* either: it writes three artifacts
+(`clippy7.log`, `test7.log`, `verify_done.flag`) and **none of the three exist**. It also
+discarded both exit codes and wrote `ALLDONE` unconditionally, so the flag meant "the script
+reached its last line" — a check that cannot fail, in the exact sense this project keeps
+re-learning.
+
+### 2. The clippy failures were a chain, not a set
+
+Cargo fails fast at the first crate that fails to compile, so each run reveals exactly one more
+problem than the last. Five runs, five findings, each previously invisible because an earlier
+crate aborted the build:
+
+| # | Crate | Lint | Location |
+| --- | --- | --- | --- |
+| 1 | `verio-transport` | `too_many_arguments` (8/7) | `lib.rs:1434` |
+| 2 | `verio-transport` | `op_ref` | `lib.rs:1680` |
+| 3 | `verio-transport` | `op_ref` | `lib.rs:1684` |
+| 4 | `verio-server` | `type_complexity` | `main.rs:533` |
+| 5 | `verio` | `manual_is_multiple_of` | `ui/src-tauri/src/lib.rs:1254` |
+
+**This is the lesson worth keeping: "the build is clean" measured by a fail-fast tool means
+"the first failing crate is clean."** A single `cargo clippy` run cannot enumerate a workspace's
+lint debt. Anything counting findings has to iterate.
+
+All five are from the initial commit (`5ef756c`, 2026-09-17) — `git blame` confirms the migration
+never touched these lines. None affect the shipping binary: a lint denied by `-D warnings` fails
+`clippy`, not `cargo build`.
+
+### 3. What was changed
+
+- `verio-transport/src/lib.rs:1680,1684` — dropped the needless references
+  (`buf[0..4] != room_bytes`). Clippy's own suggested replacement, semantics unchanged: both
+  bindings are fixed-size arrays (`[u8; 4]`, `[u8; 16]`) and `[u8]` has the
+  `PartialEq<[u8; N]>` impl, so the comparison is the same one.
+- `verio-transport/src/lib.rs:1434` — `#[allow(clippy::too_many_arguments)]` with a comment.
+  **This is a documented suppression, not a fix.** Two of the eight parameters
+  (`_remote_identity`, `_silence_frame`) are genuinely unused here — this path reads each
+  datagram's sender from its UUID prefix and runs its own ping keepalive — but they are kept so
+  the signature stays interchangeable with `spawn_relay_session_with_mode`, which forwards to
+  it. Removing them cascades into `spawn_relay_session_with_mode` and the `verio-app` call site
+  at `room.rs:454`; a params struct would change a public API. Both are backend refactors, which
+  this project's scope excludes. **Flagged, not hidden: the two unused parameters are a real
+  smell and remain.**
+- `verio-server/src/main.rs:533` — extracted `RoomClients` and `Rooms` type aliases. A genuine
+  readability fix, not a suppression.
+- `ui/src-tauri/src/lib.rs:1254` — `tick % 5 == 0` → `tick.is_multiple_of(5)`. `tick` is `u32`,
+  so the unsigned `is_multiple_of` is exact, including the `wrapping_add` rollover to 0.
+- `verify.bat` — rewritten. It now runs the three achievable invocations
+  (`clippy --workspace`, `test --workspace --exclude verio`, `test -p verio --lib`), prints each
+  one, tracks failures across all three, and **exits 1 with `VERIFY FAILED` if any step fails**.
+  The unconditional flag file is gone.
+
+### 4. Verification
+
+- `cargo clippy --workspace -- -D warnings` → **exit 0**, `Finished dev profile`. First green
+  run in the project's history as far as any available evidence shows.
+- `cargo test --workspace --exclude verio` → 22 + 8 + 25 + 6 + 8 = **69 passed, 0 failed**.
+- `cargo test -p verio --lib` → **2 passed, 0 failed**. Total **71, 0 failed**.
+- **The gate was made to fail on purpose.** The `op_ref` reference was re-injected at
+  `lib.rs:1680`, `verify.bat` was run, and it printed `VERIFY FAILED` with `EXITCODE=1`. The
+  useful part: **all 71 tests still passed during that run** — so the verdict came from the
+  clippy step alone, proving a green test suite cannot mask a red lint step. The mutation was
+  reverted and confirmed byte-exact: `git hash-object crates/verio-transport/src/lib.rs`
+  returned `e030aabd8c6d8fa65f9e7402c567bba5d9896c3a` before and after.
+- The clean run then printed `VERIFY OK` with `EXITCODE=0`.
+
+### 5. Also closed
+
+- **`LICENSE`** — `Copyright (c) 2026 Mahan [Mahan Taqipour]` → `Copyright (c) 2026 Mahan
+  Taqipour`. The brackets were the placeholder's delimiters.
+- **`sounds/`** — the wording correction written last session stands (§ Session 25 §8): orphaned
+  earcon prototypes for a specified-but-unimplemented feature, not shipping assets.
+
+### 6. Still open
+
+See §8 of Session 25. Two additions this session: the `too_many_arguments` suppression above,
+and the unmeasured `--all-targets` gap now recorded there.
