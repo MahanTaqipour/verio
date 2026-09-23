@@ -181,7 +181,19 @@ pub fn parse_audio_packet(buf: &[u8]) -> Result<(u32, u64, &[u8]), TransportErro
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    Hello { name: String, version: String },
+    Hello {
+        name: String,
+        version: String,
+        /// Session 29: the sender's PERSISTENT identity (`identity.user_id`), so a
+        /// peer can be addressed by something that survives a restart. The wire id
+        /// — the relay prefix, surfaced as `TransportEvent::Control::peer` — is the
+        /// per-process session id and changes on every launch, so a room-wide mute,
+        /// which is persisted and must match the same person next time, cannot be
+        /// keyed on it. `#[serde(default)]` so a peer that predates this field is
+        /// still understood, just not addressable by id.
+        #[serde(default)]
+        user_id: String,
+    },
     State {
         speaking: bool,
         mute: bool,
@@ -196,6 +208,14 @@ pub enum ControlMessage {
     },
     Ping { t: u64 },
     Pong { t: u64 },
+    /// Session 29: room-wide mute. Anyone may set it for anyone; it silences
+    /// `target_user_id` for every listener except the target themselves, and any
+    /// peer — including the target — may clear it. Last writer wins: there is no
+    /// ordering and no host, which is a deliberate friend-group tradeoff.
+    MuteUser {
+        target_user_id: String,
+        muted: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,9 +1192,12 @@ impl Driver {
                         tracing::info!(?cid, "control channel open (reliable)");
                         self.control_cid = Some(cid);
                         // Spec: hello{name,version} on the control channel.
+                        // Session 29 adds user_id so peers can be addressed by a
+                        // persistent id rather than this process's session uuid.
                         self.queue_control(ControlMessage::Hello {
                             name: self.identity.name.clone(),
                             version: self.identity.version.clone(),
+                            user_id: self.identity.user_id.clone(),
                         });
                     }
                     other => tracing::debug!(label = other, "unexpected channel open"),
@@ -1507,6 +1530,7 @@ pub fn spawn_relay_session_with_candidates(
     let hello = ControlMessage::Hello {
         name: local_identity.name.clone(),
         version: local_identity.version.clone(),
+        user_id: local_identity.user_id.clone(),
     };
     if let Ok(json) = serde_json::to_string(&hello) {
         let mut pkt = Vec::with_capacity(21 + json.len());
@@ -1817,6 +1841,66 @@ pub fn spawn_relay_session_with_candidates(
 mod tests {
     use super::*;
 
+    /// The exhaustive loop above proves the mute survives a round trip; this
+    /// proves it is *distinguishable* on the wire. A peer dispatches on `type`, so
+    /// a tag that collapsed into another variant would be silently mishandled, and
+    /// `muted` has to reach the wire as a real boolean — otherwise muting and
+    /// clearing would look identical to the receiver and a mute could never be
+    /// lifted.
+    #[test]
+    fn mute_user_is_distinguishable_on_the_wire() {
+        let on = serde_json::to_string(&ControlMessage::MuteUser {
+            target_user_id: "user-bob".into(),
+            muted: true,
+        })
+        .expect("serialize");
+        assert!(on.contains(r#""type":"mute_user""#), "tag missing: {on}");
+        assert!(on.contains(r#""muted":true"#), "state missing: {on}");
+
+        let off = serde_json::to_string(&ControlMessage::MuteUser {
+            target_user_id: "user-bob".into(),
+            muted: false,
+        })
+        .expect("serialize");
+        assert_ne!(on, off, "muting and clearing serialize identically");
+    }
+
+    /// The persistent id is what a mute targets, so it has to survive the trip.
+    #[test]
+    fn hello_carries_the_persistent_user_id() {
+        let msg = ControlMessage::Hello {
+            name: "Alice".into(),
+            version: "0.1.0".into(),
+            user_id: "user-alice".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            json.contains(r#""user_id":"user-alice""#),
+            "the persistent id must be on the wire or no peer can be muted, got: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&json).expect("parse"),
+            msg
+        );
+    }
+
+    /// A peer built before Session 29 sends no `user_id`. It must still parse —
+    /// it simply is not addressable by id, which the roster represents as empty.
+    #[test]
+    fn hello_without_a_user_id_still_parses() {
+        let json = r#"{"type":"hello","name":"Old","version":"0.1.0"}"#;
+        match serde_json::from_str::<ControlMessage>(json).expect("parse") {
+            ControlMessage::Hello { name, user_id, .. } => {
+                assert_eq!(name, "Old");
+                assert!(
+                    user_id.is_empty(),
+                    "a missing user_id must default to empty, not to something invented"
+                );
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
     #[test]
     fn audio_packet_roundtrip() {
         let opus = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -1856,7 +1940,11 @@ mod tests {
     #[test]
     fn control_message_serde_roundtrip() {
         for msg in [
-            ControlMessage::Hello { name: "Mahan".into(), version: "0.1.0".into() },
+            ControlMessage::Hello {
+                name: "Mahan".into(),
+                version: "0.1.0".into(),
+                user_id: "user-mahan".into(),
+            },
             ControlMessage::State {
                 speaking: true,
                 mute: false,
@@ -1866,6 +1954,17 @@ mod tests {
             },
             ControlMessage::Ping { t: 123_456 },
             ControlMessage::Pong { t: 123_456 },
+            // Session 29: both directions of the room-wide mute. A dropped `false`
+            // would leave a target muted with no way back, so it is covered here
+            // rather than only the `true` case.
+            ControlMessage::MuteUser {
+                target_user_id: "user-bob".into(),
+                muted: true,
+            },
+            ControlMessage::MuteUser {
+                target_user_id: "user-bob".into(),
+                muted: false,
+            },
         ] {
             let json = serde_json::to_string(&msg).expect("serialize");
             let back: ControlMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1950,11 +2049,13 @@ mod tests {
 
         let id_a = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(1),
+            user_id: "user-alice".into(),
             name: "Alice".into(),
             version: "0.1.0".into(),
         };
         let id_b = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(2),
+            user_id: "user-bob".into(),
             name: "Bob".into(),
             version: "0.1.0".into(),
         };
@@ -2000,11 +2101,13 @@ mod tests {
 
         let id_a = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(10),
+            user_id: "user-host".into(),
             name: "HostUser".into(),
             version: "0.1.0".into(),
         };
         let id_b = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(20),
+            user_id: "user-guest".into(),
             name: "GuestUser".into(),
             version: "0.1.0".into(),
         };

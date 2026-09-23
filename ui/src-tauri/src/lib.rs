@@ -163,7 +163,7 @@ fn restart_pipeline(app: &AppHandle, bridge: &Bridge) {
     // through the room manager's permanent sender.
     let (net_in_tx, net_in_rx) = std::sync::mpsc::channel();
     {
-        let room = bridge.room.lock().expect("room lock");
+        let mut room = bridge.room.lock().expect("room lock");
         room.set_net_in(Some(net_in_tx));
         let net_out_tx = room.pipeline_endpoints();
         let cfg = PipelineConfig {
@@ -199,6 +199,11 @@ fn restart_pipeline(app: &AppHandle, bridge: &Bridge) {
                 if let Err(e) = spawned {
                     tracing::error!("spawn event forwarder failed: {e}");
                 }
+                // Session 29: hand the room the new mixer's mute gate. This is the
+                // only moment the room and a pipeline exist at once, and it is why
+                // the room takes a sink rather than holding a `PipelineHandle`: the
+                // room is built first, before any pipeline does.
+                room.set_mute_sink(handle.peer_mutes_handle());
                 *guard = Some(handle);
             }
             Err(e) => {
@@ -747,6 +752,13 @@ struct RoomSnapshot {
     vps_address: String,
     transport_mode: Option<String>,
     diagnostics: Option<verio_transport::TransportDiagnostics>,
+    /// Session 29: the room-wide mutes, so a webview reload does not lose them.
+    /// Kept beside `peers` rather than inside it — see [`MuteInfo`].
+    mutes: Vec<verio_app::room::MuteInfo>,
+    /// Session 29: this user's own persistent id, so the UI can tell whether one
+    /// of `mutes` names them — which is the only case where it owes an
+    /// explanation for being silent.
+    self_user_id: String,
 }
 
 #[tauri::command]
@@ -767,6 +779,10 @@ fn get_room_state(bridge: State<Bridge>) -> RoomSnapshot {
         vps_address: settings.vps_address,
         transport_mode: room.transport_mode().map(str::to_string),
         diagnostics: room.diagnostics(),
+        mutes: room.mutes(),
+        // The room holds the identity it was built with, so this needs no second
+        // copy of the id anywhere in the bridge.
+        self_user_id: room.identity().user_id.clone(),
     }
 }
 
@@ -814,6 +830,27 @@ fn set_peer_volume(peer_id: String, volume: f32, bridge: State<Bridge>) -> Resul
         pipe.set_peer_volume(peer_id, volume);
     }
     Ok(())
+}
+
+/// Session 29: silence a peer for everyone in the room, or lift it.
+///
+/// Not the same thing as `set_peer_volume(.., 0.0)`, which is this user's own
+/// listening level and nobody else's business. This one is room state: it is
+/// broadcast, and it silences that peer for every other listener too.
+///
+/// `target_user_id` is the peer's *persistent* id, because the mute has to still
+/// name them after they relaunch.
+#[tauri::command]
+fn set_peer_muted(
+    target_user_id: String,
+    muted: bool,
+    bridge: State<Bridge>,
+) -> Result<(), String> {
+    bridge
+        .room
+        .lock()
+        .expect("room lock")
+        .set_room_mute(&target_user_id, muted)
 }
 
 #[tauri::command]
@@ -1033,6 +1070,7 @@ pub fn run() {
             join_room,
             leave_room,
             set_peer_volume,
+            set_peer_muted,
             set_vps_address,
             connect_direct,
             create_invite,
@@ -1157,11 +1195,17 @@ pub fn run() {
             // Wire identity is the *session* half of the identity: fresh per
             // process, so multiple instances launched on the same PC (e.g. for
             // testing) never collide with each other in signaling rooms or UDP
-            // relays. The persistent half (`user_id`, above) is deliberately not
-            // put on the wire — it identifies the user, not this run.
+            // relays. It stays the transport prefix, because the relay has to see
+            // two instances as two peers.
+            //
+            // Session 29 also announces `user_id` here, and this is the one place
+            // the persistent id goes on the wire. It has to: a room-wide mute is
+            // keyed on the person, so a peer must be able to name the person
+            // rather than this particular run of the app.
             let peer_uuid = db.session_id();
             let identity = Identity {
                 uuid: peer_uuid,
+                user_id: user_id.clone(),
                 name: if settings_snapshot.nickname.is_empty() {
                     "Player".to_string()
                 } else {
@@ -1171,7 +1215,11 @@ pub fn run() {
             };
             tracing::info!(peer_uuid = %peer_uuid, name = %identity.name, "peer identity");
             let (room_tx, room_rx) = std::sync::mpsc::channel::<RoomEvent>();
-            let room = Arc::new(Mutex::new(RoomManager::new(identity.clone(), room_tx)));
+            let room = Arc::new(Mutex::new(RoomManager::new(
+                identity.clone(),
+                room_tx,
+                db.clone(),
+            )));
             room.lock().expect("room lock").spawn_audio_pump();
 
             // Signaling listener. Best-effort: on one PC the SECOND instance
@@ -1310,7 +1358,12 @@ pub fn run() {
                                 RoomEvent::RoomJoined { code } => {
                                     let _ = fwd_app.emit("room_joined", serde_json::json!({ "code": code }));
                                 }
-                                RoomEvent::PeerConnected { name, uuid, arrived } => {
+                                RoomEvent::PeerConnected {
+                                    name,
+                                    uuid,
+                                    user_id,
+                                    arrived,
+                                } => {
                                     // Only a genuine arrival is audible. The
                                     // roster adopted when we join a populated room
                                     // and a peer renaming themselves both arrive
@@ -1324,6 +1377,7 @@ pub fn run() {
                                         serde_json::json!({
                                             "name": name,
                                             "uuid": uuid,
+                                            "user_id": user_id,
                                             "arrived": arrived,
                                         }),
                                     );
@@ -1352,6 +1406,24 @@ pub fn run() {
                                             "deafen": deafen,
                                             "music": music,
                                             "music_title": music_title,
+                                        }),
+                                    );
+                                }
+                                RoomEvent::PeerMuted {
+                                    target_user_id,
+                                    muted,
+                                    by,
+                                } => {
+                                    // No cue here. A mute is not an arrival or a
+                                    // departure, and sounding one would be
+                                    // indistinguishable from somebody actually
+                                    // leaving the call.
+                                    let _ = fwd_app.emit(
+                                        "peer_muted",
+                                        serde_json::json!({
+                                            "target_user_id": target_user_id,
+                                            "muted": muted,
+                                            "by": by,
                                         }),
                                     );
                                 }

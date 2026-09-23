@@ -4560,4 +4560,263 @@ Worth knowing: a green verdict line and a red exit code can both be true, and th
   before the suite ran, so the checks did not run against stale code — but it means a check run
   without that step could have been measuring the previous build.
 
+## Session 29, Part A (2026-09-23) — the room-wide mute, and the second mute that is not the first
+
+Part A of the plan: anyone may silence anyone, one boolean per peer keyed by `user_id`, broadcast on
+change, and the target told *why* they are silent. **Parts B and C are not started** — the plan says
+"stop and wait for approval before Part B", and that is where this session stops.
+
+### 1. The question that was asked before any code was written
+
+`ControlMessage` had no `MuteUser`, and the relay already fans control frames out to the whole room
+(`RELAY_TAG_CONTROL` → relay → every peer), so the transport needed no change. What was genuinely
+undecided was the *policy*: who may mute whom, whether the target is silenced on their own client,
+and whether a host exists. The plan's own rule is "if something is ambiguous, stop and ask", so it
+was asked first. The answer — anyone mutes anyone, shared room state, the target sees who did it, no
+host, griefing accepted as a friend-group tradeoff — is what is implemented here, verbatim.
+
+One thing already existed and had to be kept distinct: the tile's ear button, which calls
+`set_peer_volume(id, 0.0)` and only changes what *this* user hears. It is a private preference with
+one owner. The new mute is room state with many owners. Conflating them was the main risk of the
+session.
+
+### 2. The mute is keyed on the person, which forces `user_id` onto the wire
+
+Session 28 deliberately kept the persistent id *off* the wire: `Identity.user_id` existed and was
+logged, but only the session uuid went out. A persisted mute breaks that. A mute stored against a
+wire uuid stops matching the same person the next time they launch — which is exactly the moment a
+persisted mute is supposed to still apply.
+
+So `Identity` now carries `user_id`, `ControlMessage::Hello` announces it (`#[serde(default)]`, so a
+peer built before this field sends an empty string rather than failing to parse), and
+`RoomEvent::PeerConnected` forwards it to the UI. `Identity` was used as the carrier rather than a
+parallel parameter because it is already threaded through the whole transport — only two construction
+sites needed it.
+
+An empty id means "unknown", and it must never overwrite an id already learned: a peer that renames
+itself sends another `Hello`, and if that carried no id, an unconditional write would erase what we
+knew and silently remove the tile's room-mute control. `upsert_peer` guards this, and the guard has
+its own test (`an_empty_id_never_erases_one_we_already_learned`) — it had none until mutation testing
+pointed at it.
+
+### 3. The gate is a gate, not a volume
+
+`crates/verio-app/src/pipeline.rs`:
+
+- `PipelineHandle.peer_mutes: Arc<Mutex<HashSet<String>>>` — deliberately a **separate set** from
+  `peer_volumes`, keyed the same way (the peer's wire id). Folding the mute into the volume as `0.0`
+  would mean unmuting had to guess a level back, which is two authorities for one element — the
+  failure this project keeps paying for. Kept separate, "unmute restores my level" is true by
+  construction.
+- `fn peer_mix_gain(volume: f32, muted: bool, deafened: bool) -> f32` — pure, and extracted so the
+  arithmetic can be measured without a sound device. The mixer calls it in the per-sample loop.
+- That the mixer *calls* it is enforced by clippy rather than by a test: the function has exactly one
+  caller, so deleting the call makes it dead code and `cargo clippy --all-targets -- -D warnings`
+  fails. A test asserting "the mixer applies the gate" would need a sound device and would be a
+  weaker check than the one already in the gate.
+
+### 4. The room is the authority; the gate is a derived projection
+
+`RoomManager` holds `room_mutes: HashMap<String /*target user_id*/, String /*who set it*/>` —
+presence means muted. That map is the single authority.
+
+`project_mutes()` derives the mixer's set from it plus the roster, and it **recomputes the whole set
+rather than patching it**. The set is a handful of entries, and a full derivation cannot drift out of
+step with its source the way an add/remove pair can when a peer joins, leaves, or is muted while
+away. It runs on every roster change (`upsert_peer`, `remove_peer`), so a peer who arrives already
+muted is gated from their first packet.
+
+The room cannot hold a `PipelineHandle`: it is constructed first, before any pipeline exists. So it
+takes the gate through `set_mute_sink()`, mirroring the existing `set_net_in()` — and re-projects
+when it does, because a pipeline restart hands it a brand-new empty set. Without that re-derive,
+changing your output device would silently lift every mute in the room with nothing in the UI to say
+so. `a_pipeline_restart_re_applies_the_mutes_it_already_held` is that guard.
+
+There is deliberately **no "is this me?" check** in the projection. The mixer only gates the peers in
+its remote-audio map and a client never receives its own audio back, so a self-mute cannot silence
+the muter. That is true by construction, and a guard for it could never fire.
+
+### 5. Persistence, and the concern with it
+
+Every mute — ours and one received from the wire — goes through one private `apply_mute(.., broadcast)`
+and is written to `mute_list` via `Db::set_muted`. `broadcast: false` on the receive path, because
+echoing a mute back would have it circulate for the life of the room.
+
+Two things about that are worth stating rather than glossing:
+
+- Persisting a mute *somebody else set* writes room state into what is nominally the local user's
+  mute list. That is a conflation. It was kept because the alternative is worse: the same peer would
+  then be muted or not depending on who muted them and whether you had restarted, which is harder to
+  reason about than the staleness it avoids.
+- The staleness is real: if A mutes C and A lifts it while you are offline, your copy still silences
+  C on the next launch. With no server and no state-sync message there is nothing to reconcile
+  against. Recorded under "found but not fixed".
+
+### 6. The frontend: two controls, and a banner
+
+- `RoomEvent::PeerMuted { target_user_id, muted, by }` → the `peer_muted` Tauri event. The actor comes
+  from the **transport envelope**, not the payload: the relay stamps every control frame with its
+  sender, so the message neither has to repeat it nor gets to lie about it.
+- `RoomSnapshot` gained `mutes` and `self_user_id`, so a webview reload does not lose the mute set —
+  the snapshot is taken as-is rather than merged, since a merge would let a stale local entry survive
+  a mute that was lifted while the page was reloading.
+- The tile has **two** mute buttons: the ear (`IconEarOff`, "Mute X locally") and a muted speaker
+  (`IconVolumeOff`, "Mute X for everyone"). Separate buttons because somebody who wants to stop
+  hearing a person must not be able to silence them for the room by accident. The room-mute button is
+  *withheld*, not disabled, when the peer's persistent id has not arrived — there is nothing a click
+  could send yet.
+- The target gets a banner: `Muted by <name>`, or a bare `Muted` when the actor is unknown (restored
+  from disk), plus an `Unmute me` control. The policy is that the target can always lift their own
+  mute, so the way out has to be on the screen that explains the problem.
+
+### 7. The finding: the banner was unreadable, and the probe that hid it
+
+The first version of the banner used `text-danger` on its `bg-danger/8` wash. `probe-room-contrast.mjs`
+reported **2.38:1** — below even the 3:1 a non-text graphic needs, let alone AA's 4.5 for body text.
+
+That number was wrong in the app's favour, and finding out why was the more useful half of the work.
+Tailwind v4 compiles `/opacity` to `color-mix(in oklab, …)`, so the computed background comes back as
+`oklab(L a b / alpha)` — and the probe's parser matched only `rgba()`. It returned `null` for the wash,
+`compositeBg` silently dropped the layer, and the ratio was computed against the *plain app
+background* instead of the tinted one it claimed to measure. The real value was **2.29:1**.
+
+Two fixes, both of them:
+
+1. `probe-room-contrast.mjs` now converts `oklab` → sRGB. A measurement tool that quietly measures
+   something else is worse than no tool.
+2. The banner's colours are now chosen by measurement. On the composited wash (`rgb(32, 23, 20)`) the
+   theme's tokens measure:
+
+   | token | vs wash | vs surface | vs app bg |
+   |---|---|---|---|
+   | `--danger` rgb(138, 58, 48) | 2.29 | 2.19 | 2.38 |
+   | `--warn` rgb(184, 106, 74) | 4.35 | 4.18 | 4.54 |
+   | `--accent` rgb(201, 135, 63) | 5.88 | 5.64 | 6.13 |
+   | `--text` rgb(232, 223, 209) | 13.32 | 12.79 | 13.89 |
+   | `--text-dim` rgb(125, 113, 102) | 3.71 | 3.56 | 3.86 |
+   | `--text-faint` rgb(87, 80, 74) | 2.22 | 2.13 | 2.32 |
+
+   So the *message* — the one thing that must be read — is `--text` at 13.32:1, and the icon is
+   `--warn` at 4.35:1, above the 3:1 a graphic needs. `--danger` is left to the border and wash, which
+   are decoration: the state is carried by the words. `probe-room-contrast.mjs` now **asserts** the
+   banner pair and exits non-zero below 4.5, so this cannot regress silently. It measured 13.32:1
+   after the fix, and 2.29:1 with exit 1 when the mutation was put back.
+
+`probe-token-contrast.mjs` is new and is the tool that produced the table. It answers a recurring
+question — which token is legible on which surface — and reports only.
+
+### 8. Verification
+
+Rust gate, all run directly (see the note about `verify.bat` below):
+
+| command | result |
+|---|---|
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --exclude verio` | **110** passed, 0 failed |
+| `cargo test -p verio --lib` | 4 passed |
+| `cargo test -p verio-app --lib` | **57** passed (was 38) |
+
+Workspace breakdown: `verio_app` 57, `verio_dsp` 28, `verio_transport` 11, `verio_discovery` 8,
+`verio_server` 6, `verio_audio` 0, `room_soak` 0. The +22 over Session 28's 88 is 5 new `db` tests,
+4 pipeline gate tests, 10 room tests and 3 transport tests.
+
+*(Corrected at the commit boundary: this table first read 108 / 55 / "8 room tests". That was
+recorded before the last two room tests were written — `an_empty_id_never_erases_one_we_already_learned`
+and `a_peer_event_carries_the_persistent_id_a_room_mute_needs` — so it undercounted by two. Re-derived
+two independent ways: per-crate `test result` lines, and `#[test]` counts against `ecf8cff`
+(room 5→15, db 8→13, pipeline 11→15, transport 8→11). The stale number had already been copied into
+the memory files and the skill, which is why the fix is recorded here rather than made quietly.)*
+
+Frontend: `tsc --noEmit` exit 0; `pnpm test` 12/12; `pnpm build` exit 0; `assert-fresh` 37/37 served
+files match disk.
+
+Browser checks, all from the managed Node workspace with absolute repo paths:
+
+| check | result |
+|---|---|
+| `verify-room.mjs` | ALL ROOM CHECKS PASSED, exit 0 — including the new D2/D3 sections |
+| `verify-harness.mjs` | 8 passed, 0 failed |
+| `probe-volume-display.mjs` | ALL VOLUME-DISPLAY CHECKS PASSED |
+| `probe-room-contrast.mjs` | banner 13.32:1, exit 0 |
+| `check-phantom-classes.mjs` | `PHANTOM: none`, exit 0 |
+| `check-collisions.mjs` | LEAK clean, MIX clean, exit 0 |
+| `dead-css.mjs` | `DEAD: none`, orphan keyframes none, exit 0 |
+| `dead-modules.mjs` | 33/33 reachable, 0 unreachable |
+
+`verify-room.mjs` grew 15 checks in two new sections: D2 (the second control — two buttons, distinct
+accessible names, distinct glyphs, `set_peer_muted` and never `set_peer_volume`, the persistent id
+rather than the session uuid, the chip arriving through the `peer_muted` event, the toggle back) and
+D3 (the banner names the actor, `Unmute me` lifts it against the user's own id, and muting *somebody
+else* shows no banner to us).
+
+One of those checks was wrong when first written: it searched the tile's `innerText` for
+"Muted for everyone", but the chips are icon-only by design — section B already asserts their text is
+empty — so it could never pass. It queries `aria-label` now. A check that cannot pass is the same
+class of defect as a check that cannot fail.
+
+### 9. Mutation testing — seven guards, each made to fail once
+
+| # | mutation | caught by |
+|---|---|---|
+| A | `peer_mix_gain` ignores `muted` | `a_mute_gates_the_peer_to_exact_silence`, `lifting_a_mute_restores_the_chosen_volume_exactly` |
+| B | projection keyed on the wire uuid instead of `user_id` | 4 room tests |
+| C | `set_mute_sink` does not re-project | `a_pipeline_restart_re_applies_the_mutes_it_already_held` |
+| D | `apply_mute`'s empty-target guard removed | `a_wire_mute_with_no_target_is_dropped_rather_than_stored` |
+| E | `upsert_peer` lets an empty id overwrite a known one | `an_empty_id_never_erases_one_we_already_learned` |
+| F | the tile sends `p.uuid` instead of `p.user_id` | 4 checks in D2, exit 1 |
+| G | the room-mute button calls `set_peer_volume` | 4 checks in D2, exit 1 |
+
+Reverted byte-exact: `pipeline.rs` `2687c6aff6ee64794a6520b74440d2637a1a4a4a`, `room.rs`
+`73ab014b74ce438c633c5912802bbeb3b3931905`.
+
+Mutation E is why the session has one more test than it started with. The "an empty id must not erase
+a known one" guard had no test at all; it was found by asking, for each new guard, which test would
+catch it — and getting no answer.
+
+Mutation F also showed a weakness worth recording: with the wrong id sent, `…and the chip goes with
+it` **passed** — vacuously, because the chip never appeared in the first place. On its own it is a
+check that cannot fail. It is only sound as the second half of a pair whose first half asserts the
+chip arrived, which is how it is written.
+
+### 10. Found but not fixed
+
+- **A peer who joins after a mute was set never learns about it.** There is no state-sync message:
+  `Hello` is one-directional and carries no mute list. So a newcomer hears a peer the room has
+  silenced. Adding a sync means a new protocol variant and a last-write-wins rule for peers who
+  disagree, which is a decision rather than a bug fix — and with no server, "the current room state"
+  is already only ever what each client has heard. The plan's rule is to ask rather than invent, so it
+  is raised rather than chosen.
+- **The mute list conflates two things.** `mute_list` now holds mutes this user set *and* mutes
+  others set, so a mute that was lifted while this client was offline is still in force on the next
+  launch. Stated in §5; the alternative asymmetry looked worse.
+- **`--danger` used as text fails contrast across the app**, not just in the banner that was fixed
+  here. Measured: 2.19:1 on `--surface`, 2.29:1 on the 8 % danger wash, 2.38:1 on the app background.
+  Live instances: `App.tsx:931` (`text-13 text-danger` for the diagnostics `last_error`, on the same
+  `bg-danger/8` pattern) and the Deafened chip's icon in `state-chip.tsx` (`text-danger` on
+  `bg-danger/8` — a graphic, so its threshold is 3:1, and 2.29 fails that too). Fixing it means
+  lightening `--danger` or introducing a separate text-safe danger token, which changes every surface
+  that uses the token. That is a palette decision with a blast radius well beyond Part A, so it is
+  reported with numbers rather than taken unilaterally.
+- **`spawn_audio_pump` is called twice.** `RoomManager::new` (room.rs:224) calls it, and
+  `lib.rs:1223` calls it again on the same manager. Two pump threads then contend for `net_out`'s lock
+  and alternate taking packets off one receiver. Not a correctness bug — an mpsc queue hands each
+  packet to exactly one `recv`, so nothing is lost or duplicated — but it is one thread's worth of
+  redundant work on the audio path and a latent hazard for anyone who later adds state to the pump.
+  Pre-existing, unrelated to Part A, so not touched.
+- The pre-existing sub-AA tile pairs are unchanged and still reported rather than asserted: avatar
+  initials 3.9, volume percent 3.56.
+- **`verify.bat` still cannot be run** from this shell (cmd.exe is blocked from Git Bash; PowerShell
+  refuses both invocation forms), so the gate's commands were run directly, as in every session since
+  27. The counts above are from those runs.
+- **`verio.exe` still cannot be launched from a non-elevated shell** (`requireAdministrator` in
+  `build.rs`), so the 8-second boot smoke test still needs an elevated shell. Unchanged.
+- Everything from Session 28 §6 and Session 27 §11 still stands: `identifier: "ir.verio.app"` warns on
+  macOS, `prepare_hotkey_capture` has no caller, the `too_many_arguments` suppression in
+  `verio-transport`, and the untracked `.workbuddy-ai/` + `stitch_verio_desktop_interface_suite.zip`.
+
+### 11. Status
+
+Part A is complete, verified and committed. Parts B (`verio-bot` as a separate peer process) and C
+(the playlist UI) are **not started** — the plan says stop and wait for approval before Part B.
+
 

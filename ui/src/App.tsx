@@ -92,6 +92,12 @@ interface AudioState {
 type RoomState = "idle" | "connecting" | "connected" | "closed";/** Session 12: one remote participant (relay fans out, so there can be several). */
 interface PeerInfo {
   uuid: string;
+  /**
+   * Session 29: the peer's PERSISTENT id, which is what a room-wide mute is
+   * keyed on. Never match a mute against `uuid` — that is the session id and
+   * changes every time the peer relaunches. Empty until their `Hello` arrives.
+   */
+  user_id: string;
   name: string;
   speaking: boolean;
   mute: boolean;
@@ -101,7 +107,19 @@ interface PeerInfo {
   music_title: string;
 }
 
-
+/**
+ * Session 29: one room-wide mute. Mirrors `verio_app::room::MuteInfo`.
+ *
+ * Kept separate from `PeerInfo` on purpose. A tile already carries `mute`, which
+ * is the peer's *own* mic state, and a volume of 0, which is this user's private
+ * choice not to listen. This is a third, different thing: room state, owned by
+ * everyone, that silences that peer for all of us.
+ */
+interface MuteInfo {
+  target_user_id: string;
+  /** Who set it. Empty when unknown, e.g. restored from disk. */
+  by: string;
+}
 
 // MusicStatus moved to src/lib/use-music.ts during the Phase 4 rebuild. It now
 // carries the queue shape (queue_index / queue_len / queue_looping) and the hook
@@ -117,6 +135,10 @@ interface RoomSnapshot {
   transport_mode?: string | null;
   diagnostics?: TransportDiagnostics | null;
   peers?: PeerInfo[];
+  /** Session 29: the room-wide mutes, so a reload does not lose them. */
+  mutes?: MuteInfo[];
+  /** Session 29: this user's own persistent id. */
+  self_user_id?: string;
 }
 
 // `HotkeyAction` now comes from components/verio/settings.tsx — the capture
@@ -129,6 +151,13 @@ export default function App() {
   const [roomState, setRoomState] = useState<RoomState>("idle");
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [peers, setPeers] = useState<PeerInfo[]>([]);
+  /**
+   * Session 29: room-wide mutes, keyed by the silenced peer's persistent id.
+   * The value is whoever set it, for the "Muted by <name>" banner.
+   */
+  const [roomMutes, setRoomMutes] = useState<Record<string, string>>({});
+  /** Session 29: this user's own persistent id, to tell whether a mute names us. */
+  const [selfUserId, setSelfUserId] = useState("");
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [rttMs, setRttMs] = useState<number | null>(null);
   const [diagnostics, setDiagnostics] = useState<TransportDiagnostics | null>(null);
@@ -193,6 +222,13 @@ export default function App() {
         setRoomState(snap.state);
         setPeers(snap.peers ?? []);
         setRoomCode(snap.room_code);
+        setSelfUserId(snap.self_user_id ?? "");
+        // The snapshot's list is the room's authority, so it is taken as-is
+        // rather than merged — a merge would let a stale local entry survive a
+        // mute that was lifted while this webview was reloading.
+        const mutes: Record<string, string> = {};
+        for (const m of snap.mutes ?? []) mutes[m.target_user_id] = m.by;
+        setRoomMutes(mutes);
 
         if (snap.diagnostics) setDiagnostics(snap.diagnostics);
       })
@@ -230,32 +266,41 @@ export default function App() {
       setStatusMsg({ text: `Connected to room #${ev.payload.code}.` });
     }).then((u) => unlistens.push(u));
 
-    listen<{ name: string; uuid?: string; arrived?: boolean }>("peer_connected", (ev) => {
-      const uuid = ev.payload.uuid || ev.payload.name;
-      setPeers((prev) => {
-        const rest = prev.filter((p) => p.uuid !== uuid);
-        const existing = prev.find((p) => p.uuid === uuid);
-        return [
-          ...rest,
-          {
-            uuid,
-            name: ev.payload.name,
-            speaking: existing?.speaking ?? false,
-            mute: existing?.mute ?? false,
-            deafen: existing?.deafen ?? false,
-            music: existing?.music ?? false,
-            music_title: existing?.music_title ?? "",
-          },
-        ].sort((a, b) => a.uuid.localeCompare(b.uuid));
-      });
-      // `arrived === false` means the roster is telling us who is *already*
-      // here — the peers listed when we join a populated room, or a peer
-      // renaming themselves. The peer belongs in the list either way, but
-      // saying they "joined the call" would be a claim the app cannot support.
-      if (ev.payload.arrived !== false) {
-        setStatusMsg({ text: `${ev.payload.name} joined the call.` });
+    listen<{ name: string; uuid?: string; user_id?: string; arrived?: boolean }>(
+      "peer_connected",
+      (ev) => {
+        const uuid = ev.payload.uuid || ev.payload.name;
+        setPeers((prev) => {
+          const rest = prev.filter((p) => p.uuid !== uuid);
+          const existing = prev.find((p) => p.uuid === uuid);
+          return [
+            ...rest,
+            {
+              uuid,
+              // Session 29: the persistent id, which the tile needs to offer a
+              // room-wide mute. A peer whose `Hello` has not arrived yet sends
+              // none — `|| existing?.user_id` keeps an id we already learned
+              // rather than letting an empty one erase it, the same rule the
+              // Rust roster follows.
+              user_id: ev.payload.user_id || existing?.user_id || "",
+              name: ev.payload.name,
+              speaking: existing?.speaking ?? false,
+              mute: existing?.mute ?? false,
+              deafen: existing?.deafen ?? false,
+              music: existing?.music ?? false,
+              music_title: existing?.music_title ?? "",
+            },
+          ].sort((a, b) => a.uuid.localeCompare(b.uuid));
+        });
+        // `arrived === false` means the roster is telling us who is *already*
+        // here — the peers listed when we join a populated room, or a peer
+        // renaming themselves. The peer belongs in the list either way, but
+        // saying they "joined the call" would be a claim the app cannot support.
+        if (ev.payload.arrived !== false) {
+          setStatusMsg({ text: `${ev.payload.name} joined the call.` });
+        }
       }
-    }).then((u) => unlistens.push(u));
+    ).then((u) => unlistens.push(u));
 
     listen<{ reason: string; peer_id?: string | null }>("peer_disconnected", (ev) => {
       const gone = ev.payload.peer_id;
@@ -290,6 +335,22 @@ export default function App() {
         )
       );
     }).then((u) => unlistens.push(u));
+
+    listen<{ target_user_id: string; muted: boolean; by: string }>(
+      "peer_muted",
+      (ev) => {
+        const { target_user_id, muted, by } = ev.payload;
+        setRoomMutes((prev) => {
+          const next = { ...prev };
+          if (muted) next[target_user_id] = by;
+          else delete next[target_user_id];
+          return next;
+        });
+        // Deliberately no status message. The *target* gets a banner explaining
+        // why they are silent; announcing to the room who muted whom would turn
+        // a friend-group control into a public event.
+      }
+    ).then((u) => unlistens.push(u));
 
     listen<{ ms: number }>("rtt_updated", (ev) => {
       setRttMs(Math.round(ev.payload.ms));
@@ -544,6 +605,24 @@ export default function App() {
     }
   };
 
+  /**
+   * Session 29: silence a peer for the whole room, or lift it.
+   *
+   * A different control from `handleTogglePeerMute` above, which only changes
+   * what *this* user hears. This one is broadcast and changes what everyone
+   * hears, so it gets its own button and its own label rather than a second
+   * meaning folded into the volume slider.
+   *
+   * The persistent id is what is sent. A peer whose `Hello` has not arrived yet
+   * has none, and the button is not offered for them — muting a session id would
+   * work until they relaunched and then quietly stop.
+   */
+  const handleToggleRoomMute = (userId: string, muted: boolean) => {
+    invoke("set_peer_muted", { targetUserId: userId, muted }).catch((e) =>
+      setStatusMsg({ text: `Could not change the room mute: ${e}`, isError: true })
+    );
+  };
+
   const handleSaveNickname = async () => {
     if (!nicknameInput.trim()) return;
     try {
@@ -750,6 +829,9 @@ export default function App() {
                 peerVolumes={peerVolumes}
                 onPeerVolume={handlePeerVolumeChange}
                 onTogglePeerMute={handleTogglePeerMute}
+                roomMutes={roomMutes}
+                onToggleRoomMute={handleToggleRoomMute}
+                selfUserId={selfUserId}
               />
 
               {/* Live network diagnostics — opened from the header's status chip,

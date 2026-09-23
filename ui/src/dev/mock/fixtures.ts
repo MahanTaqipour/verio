@@ -61,6 +61,10 @@ function peerUuid(index: number): string {
 function peer(index: number, over: Partial<PeerInfo> = {}): PeerInfo {
   return {
     uuid: peerUuid(index),
+    // Session 29: a persistent id per roster member. Distinct from the uuid, as
+    // in the real app — a fixture that reused the uuid would make the mute tests
+    // pass for the wrong reason.
+    user_id: `user-${(ROSTER_NAMES[index] ?? `peer${index + 1}`).toLowerCase()}`,
     name: ROSTER_NAMES[index] ?? `Peer ${index + 1}`,
     speaking: false,
     mute: false,
@@ -184,6 +188,13 @@ function audio(over: Partial<AudioState> = {}): AudioState {
   };
 }
 
+/**
+ * Session 29: the local user's persistent id, matching `LOCAL_NICKNAME`. It is
+ * what the UI compares a room mute's `target_user_id` against to decide whether
+ * it owes an explanation for being silent.
+ */
+const SELF_USER_ID = "user-kaveh";
+
 function room(over: Partial<RoomSnapshot> = {}): RoomSnapshot {
   return {
     state: "idle",
@@ -195,6 +206,8 @@ function room(over: Partial<RoomSnapshot> = {}): RoomSnapshot {
     vps_address: DEFAULT_VPS,
     transport_mode: "auto",
     diagnostics: null,
+    mutes: [],
+    self_user_id: SELF_USER_ID,
     ...over,
   };
 }
@@ -568,6 +581,33 @@ export const SCENARIOS: Scenario[] = [
         state: "connected",
         room_code: ROOM_CODE,
         peers: roster(3, { 1: { speaking: true } }),
+        diagnostics: diag(),
+      }),
+      music: music(),
+    },
+    behavior: {
+      latency: { read: 20, write: 30 },
+      failures: {},
+      micLevel: { enabled: false, db: -60 },
+    },
+  },
+  {
+    id: "room-room-muted-self",
+    label: "Room — the room silenced you",
+    note:
+      "Session 29: a room-wide mute whose target is the local user. This is the one " +
+      "combination that renders the banner, and it has to name the actor — the " +
+      "user's own mic still works, so nothing else in the UI would explain the " +
+      "silence.",
+    state: {
+      settings: settings(),
+      devices: DEVICES,
+      audio: audio(),
+      room: room({
+        state: "connected",
+        room_code: ROOM_CODE,
+        peers: roster(3),
+        mutes: [{ target_user_id: SELF_USER_ID, by: "Dan" }],
         diagnostics: diag(),
       }),
       music: music(),

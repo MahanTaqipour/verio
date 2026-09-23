@@ -65,6 +65,13 @@ export type RoomState = "idle" | "connecting" | "connected" | "closed";
 
 export interface PeerInfo {
   uuid: string;
+  /**
+   * Session 29: the peer's PERSISTENT id. A room-wide mute is keyed on this, not
+   * on `uuid` — a uuid is minted per process, so a mute against it would stop
+   * matching the same person the next time they launched. Empty until their
+   * `Hello` reaches us.
+   */
+  user_id: string;
   name: string;
   speaking: boolean;
   mute: boolean;
@@ -117,6 +124,14 @@ export interface TransportDiagnostics {
   relay_mode: string;
 }
 
+/** Session 29: one room-wide mute. Mirrors `verio_app::room::MuteInfo`. */
+export interface MuteInfo {
+  /** Match against `PeerInfo.user_id`, never against `PeerInfo.uuid`. */
+  target_user_id: string;
+  /** Who set it. Empty when unknown, e.g. restored from disk. */
+  by: string;
+}
+
 export interface RoomSnapshot {
   state: RoomState;
   peer_name: string | null;
@@ -127,4 +142,8 @@ export interface RoomSnapshot {
   vps_address: string;
   transport_mode: string | null;
   diagnostics: TransportDiagnostics | null;
+  /** Session 29: the room-wide mutes, so a reload does not lose them. */
+  mutes: MuteInfo[];
+  /** Session 29: this user's own persistent id. */
+  self_user_id: string;
 }

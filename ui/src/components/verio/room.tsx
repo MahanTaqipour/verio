@@ -78,12 +78,19 @@ import {
   IconMicOff,
   IconMusic,
   IconUsers,
+  IconVolumeOff,
 } from "@/components/verio/icons";
 import { cn } from "@/lib/utils";
 
-/** The seven fields `PeerInfo` actually carries. Nothing is added here. */
+/** The fields `PeerInfo` actually carries. Nothing is added here. */
 export interface RoomPeer {
   uuid: string;
+  /**
+   * Session 29: the peer's PERSISTENT id. A room-wide mute is keyed on this, and
+   * it is empty until their `Hello` reaches us — which is why the room-mute
+   * control is withheld rather than guessed at.
+   */
+  user_id: string;
   name: string;
   speaking: boolean;
   mute: boolean;
@@ -107,6 +114,15 @@ export interface RoomProps {
   onPeerVolume: (uuid: string, volume: number) => void;
   /** Toggles local mute for one peer: 0 ↔ the remembered level. */
   onTogglePeerMute: (uuid: string) => void;
+  /**
+   * Session 29: room-wide mutes, keyed by the silenced peer's persistent id.
+   * The value is whoever set it — empty when unknown, which happens when the
+   * mute was restored from disk and the actor was never on the wire for us.
+   */
+  roomMutes: Record<string, string>;
+  onToggleRoomMute: (userId: string, muted: boolean) => void;
+  /** This user's own persistent id, to tell whether a mute names them. */
+  selfUserId: string;
   className?: string;
 }
 
@@ -205,6 +221,8 @@ function PeerTile({
   volume,
   onVolume,
   onToggleMute,
+  roomMuted,
+  onToggleRoomMute,
   children,
 }: {
   name: string;
@@ -217,9 +235,17 @@ function PeerTile({
   volume?: number;
   onVolume?: (next: number) => void;
   onToggleMute?: () => void;
+  /**
+   * Session 29: this peer is silenced for the whole room. Absent (not `false`)
+   * for a peer whose persistent id we do not know yet — there is nothing to
+   * toggle in that case, so the control is withheld rather than shown disabled.
+   */
+  roomMuted?: boolean;
+  onToggleRoomMute?: () => void;
   children?: ReactNode;
 }) {
   const locallyMuted = volume === 0;
+  const canRoomMute = onToggleRoomMute !== undefined;
 
   return (
     <Panel
@@ -257,6 +283,19 @@ function PeerTile({
             {deafened && (
               <Chip tone="danger" title="Deafened" ariaLabel="Deafened">
                 <IconHeadphoneOff size={14} />
+              </Chip>
+            )}
+            {/* Session 29: silenced for everyone — a different claim from the
+                mic-off chip above, which is the peer's own doing. The glyph is a
+                muted speaker rather than an ear, because this says nothing about
+                anyone's listening habits: the room has stopped their audio. */}
+            {roomMuted && (
+              <Chip
+                tone="danger"
+                title="Muted for everyone"
+                ariaLabel="Muted for everyone"
+              >
+                <IconVolumeOff size={14} />
               </Chip>
             )}
             {music && (
@@ -323,6 +362,32 @@ function PeerTile({
           >
             <IconEarOff size={14} />
           </button>
+          {/* Session 29: the room-wide mute, beside — not merged with — the local
+              one. They are two owners of one verb: the ear button changes what
+              *this* user hears, this one silences the peer for everyone. They
+              are separate buttons because someone who wants to stop hearing a
+              person must not be able to silence them for the room by accident. */}
+          {canRoomMute && (
+            <button
+              type="button"
+              onClick={onToggleRoomMute}
+              aria-pressed={roomMuted}
+              aria-label={
+                roomMuted
+                  ? `Unmute ${name} for everyone`
+                  : `Mute ${name} for everyone`
+              }
+              title={roomMuted ? "Unmute for everyone" : "Mute for everyone"}
+              className={cn(
+                "grid size-5 shrink-0 place-items-center rounded-sm",
+                "transition-colors ease-verio",
+                "hover:bg-surface-3",
+                roomMuted ? "text-danger" : "text-text-faint hover:text-text-dim",
+              )}
+            >
+              <IconVolumeOff size={14} />
+            </button>
+          )}
         </div>
       )}
     </Panel>
@@ -341,6 +406,9 @@ export function Room({
   peerVolumes,
   onPeerVolume,
   onTogglePeerMute,
+  roomMutes,
+  onToggleRoomMute,
+  selfUserId,
   className,
 }: RoomProps) {
   // `peers` is remote only, so the participant count is peers + you. The legacy
@@ -349,6 +417,18 @@ export function Room({
   // have produced "11 of 10". PROJECT.md documents 2–10 as the design target,
   // which is not the same as a limit the client can report.
   const count = peers.length + 1;
+
+  /**
+   * Session 29: presence, not truthiness. `by` is legitimately the empty string
+   * for a mute restored from disk, and `roomMutes[id] !== undefined` is the test
+   * that survives that — `id in roomMutes` would also be true for `"constructor"`.
+   */
+  const isRoomMutedId = (userId: string) =>
+    userId !== "" && roomMutes[userId] !== undefined;
+
+  /** True when the room has silenced *this* user. */
+  const selfRoomMuted = isRoomMutedId(selfUserId);
+  const selfRoomMutedBy = selfUserId ? roomMutes[selfUserId] ?? "" : "";
 
   return (
     <div className={cn("flex min-h-0 flex-1 flex-col gap-4", className)}>
@@ -386,6 +466,41 @@ export function Room({
           Leave call
         </Button>
       </header>
+
+      {/* Session 29: if the room has silenced us, say so — and say who did it.
+          Without this the user hears their own mic working and concludes the app
+          is broken. The way out is here too, because the policy is that the
+          target can always lift their own mute.
+
+          The colours are measured, not chosen by eye. On this 8 % danger wash
+          (`oklab(0.4549 … / 0.08)` over `--bg`, i.e. rgb(32, 23, 20)) the theme's
+          tokens measure: `--danger` 2.29:1, `--warn` 4.35:1, `--text` 13.32:1.
+          So the *message* — the one thing that must be read — is `--text`, and
+          the icon is `--warn` (above the 3:1 a graphic needs). `--danger` is left
+          to the border and wash, which are decoration: the state is carried by
+          the words. The first version of this banner used `text-danger` for the
+          message and measured 2.29:1, below even the 3:1 threshold. */}
+      {selfRoomMuted && (
+        <Panel
+          padding="sm"
+          className="flex shrink-0 items-center justify-between gap-3 border-danger/35 bg-danger/8"
+        >
+          <span className="flex min-w-0 items-center gap-2 text-13 text-text">
+            <IconVolumeOff size={14} className="text-warn" />
+            <span className="truncate">
+              {selfRoomMutedBy ? `Muted by ${selfRoomMutedBy}` : "Muted"}
+            </span>
+          </span>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="shrink-0"
+            onClick={() => onToggleRoomMute(selfUserId, false)}
+          >
+            Unmute me
+          </Button>
+        </Panel>
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col gap-3">
         <SectionLabel level={2} className="shrink-0">
@@ -425,6 +540,15 @@ export function Room({
                   volume={peerVolumes[p.uuid] ?? 1}
                   onVolume={(v) => onPeerVolume(p.uuid, v)}
                   onToggleMute={() => onTogglePeerMute(p.uuid)}
+                  roomMuted={isRoomMutedId(p.user_id)}
+                  // Withheld, not disabled, when the persistent id has not
+                  // arrived: there is nothing a click could send yet.
+                  onToggleRoomMute={
+                    p.user_id
+                      ? () =>
+                          onToggleRoomMute(p.user_id, !isRoomMutedId(p.user_id))
+                      : undefined
+                  }
                 />
               </li>
             ))}

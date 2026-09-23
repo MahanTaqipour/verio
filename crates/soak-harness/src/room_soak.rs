@@ -93,19 +93,28 @@ fn main() {
     // Identities: B has the larger uuid → B is the deterministic offerer.
     let id_a = Identity {
         uuid: uuid::Uuid::from_u128(0xA000_0000_0000_0000_0000_0000_0000_0001),
+        user_id: "user-instance-a".into(),
         name: "InstanceA".into(),
         version: verio_app::APP_VERSION.into(),
     };
     let id_b = Identity {
         uuid: uuid::Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0002),
+        user_id: "user-instance-b".into(),
         name: "InstanceB".into(),
         version: verio_app::APP_VERSION.into(),
     };
 
     let (ev_a, ev_a_rx) = mpsc::channel::<RoomEvent>();
     let (ev_b, ev_b_rx) = mpsc::channel::<RoomEvent>();
-    let room_a = Arc::new(Mutex::new(RoomManager::new(id_a.clone(), ev_a)));
-    let room_b = Arc::new(Mutex::new(RoomManager::new(id_b.clone(), ev_b)));
+    // Session 29: the room persists its mutes through the local store, so each
+    // instance gets its own throwaway database — sharing one file would make the
+    // two peers contend for the same write lock.
+    let db_a = verio_app::db::Db::open(&std::env::temp_dir().join("verio-soak-room-a"))
+        .expect("open soak database A");
+    let db_b = verio_app::db::Db::open(&std::env::temp_dir().join("verio-soak-room-b"))
+        .expect("open soak database B");
+    let room_a = Arc::new(Mutex::new(RoomManager::new(id_a.clone(), ev_a, db_a)));
+    let room_b = Arc::new(Mutex::new(RoomManager::new(id_b.clone(), ev_b, db_b)));
     // RX slots: tap (arrival timestamp, blocking recv) → decode (counters),
     // both writing into one shared stats struct per side.
     let stats_a = Arc::new(Mutex::new(RxStats::default()));
@@ -309,9 +318,15 @@ fn spawn_event_collector(
                         .unwrap()
                         .push(format!("[{side}] disconnected: {reason}"));
                 }
+                // Session 29: the soak measures audio, not mutes. A mute is neither
+                // a connection event nor an error, so it belongs in none of the
+                // counters above — but it must be named here rather than waved
+                // through, so the next variant added to `RoomEvent` cannot slip in
+                // unconsidered.
                 RoomEvent::RoomCreated { .. }
                 | RoomEvent::RoomJoined { .. }
-                | RoomEvent::TransportModeChanged { .. } => {}
+                | RoomEvent::TransportModeChanged { .. }
+                | RoomEvent::PeerMuted { .. } => {}
             }
         }
     });

@@ -300,6 +300,8 @@ export function installMockTransport(scenarioId: string): MockTransport {
           diagnostics: state.room.diagnostics
             ? structuredClone(state.room.diagnostics)
             : null,
+          mutes: structuredClone(state.room.mutes),
+          self_user_id: state.room.self_user_id,
         };
       case "get_transport_diagnostics":
         return state.room.diagnostics
@@ -377,6 +379,34 @@ export function installMockTransport(scenarioId: string): MockTransport {
         // The pipeline keeps per-peer gain internally and exposes no getter, so
         // there is nothing to mirror into the snapshot. Accepted and ignored.
         return null;
+      case "set_peer_muted": {
+        // Session 29. Room state, keyed on the persistent id — and the change is
+        // echoed on `peer_muted` to everyone including the caller, which is what
+        // the real room does. A handler that only mutated `state.room.mutes`
+        // would leave the UI waiting for an event that never came.
+        // `targetUserId`, not `target_user_id`: Tauri v2 renames command arguments
+        // to camelCase on the JS side, which is why `set_input_gain(gain_db)` is
+        // invoked as `{ gainDb }` elsewhere in this app.
+        const target = String(args.targetUserId ?? "").trim();
+        if (!target) {
+          // The real command refuses this too (`set_room_mute`).
+          throw new Error("cannot mute a peer whose persistent id is unknown");
+        }
+        const muted = Boolean(args.muted);
+        const by = String(state.settings.nickname || "Player");
+        const at = state.room.mutes.findIndex((m) => m.target_user_id === target);
+        if (muted) {
+          if (at >= 0) {
+            state.room.mutes[at].by = by;
+          } else {
+            state.room.mutes.push({ target_user_id: target, by });
+          }
+        } else if (at >= 0) {
+          state.room.mutes.splice(at, 1);
+        }
+        void emit("peer_muted", { target_user_id: target, muted, by });
+        return null;
+      }
 
       // --- room ---
       case "create_room": {
@@ -678,6 +708,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
       const uuid = `${String(state.room.peers.length + 1).padStart(2, "0")}1a2b3c-4d5e-4f60-8a90-0000000000ff`;
       state.room.peers.push({
         uuid,
+        user_id: `user-${name.toLowerCase()}`,
         name,
         speaking: false,
         mute: false,
@@ -690,7 +721,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
       // scenario rosters are seeded into `state.room.peers` directly and emit
       // nothing, which is what the real app does for the peers already present
       // when you join.
-      void emit("peer_connected", { name, uuid, arrived: true });
+      void emit("peer_connected", { name, uuid, user_id: `user-${name.toLowerCase()}`, arrived: true });
     },
     removeLastPeer() {
       const last = state.room.peers.pop();

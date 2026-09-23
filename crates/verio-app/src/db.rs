@@ -32,9 +32,10 @@ pub const DB_FILE_NAME: &str = "verio.db";
 /// re-run it, so the edit would apply to fresh installs only and the two would
 /// silently diverge. Add a new entry instead.
 ///
-/// `mute_list` and `volume_prefs` are created here but not yet written: they are
-/// the approved v1 schema that Session 29 (room-wide mute) and its playlist work
-/// fill in. An empty table is not a feature; it is a shape agreed in advance.
+/// `mute_list` is written from Session 29 (the room-wide mute). `volume_prefs` is
+/// still created-but-unwritten: it belongs to the per-peer volume work, which has
+/// not landed. An empty table is not a feature; it is a shape agreed in advance,
+/// and it is named here so nobody has to guess which is which.
 pub const MIGRATIONS: &[&str] = &[
     // v1 — initial schema.
     r"
@@ -259,6 +260,50 @@ impl Db {
         .map_err(|e| format!("save settings: {e}"))?;
         Ok(())
     }
+
+    /// Record that the person `user_id` is muted, or no longer muted.
+    ///
+    /// Keyed on the PERSISTENT id, never on a session uuid: a mute is expected to
+    /// still name the same person after they relaunch, and their session id will
+    /// be different by then.
+    ///
+    /// Clearing keeps the row rather than deleting it, so `updated_at` records
+    /// when the last change happened. A mute that is silently absent and a mute
+    /// that was deliberately cleared are different facts.
+    ///
+    /// # Errors
+    /// `user_id` is empty, or the row cannot be written.
+    pub fn set_muted(&self, user_id: &str, muted: bool) -> Result<(), String> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Err("refusing to record a mute against an empty user id".into());
+        }
+        let conn = self.conn.lock().expect("db lock");
+        conn.execute(
+            "INSERT INTO mute_list (user_id, muted, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET muted = excluded.muted,
+                                                updated_at = excluded.updated_at",
+            params![user_id, muted as i64, now_unix()],
+        )
+        .map_err(|e| format!("record mute for {user_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// The persistent ids currently muted, for restoring the mute set at startup.
+    ///
+    /// # Errors
+    /// The rows cannot be read.
+    pub fn muted_users(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().expect("db lock");
+        let mut stmt = conn
+            .prepare("SELECT user_id FROM mute_list WHERE muted = 1 ORDER BY user_id")
+            .map_err(|e| format!("prepare mute read: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("read mutes: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read mute row: {e}"))
+    }
 }
 
 fn read_identity(conn: &Connection) -> Result<Option<String>, String> {
@@ -459,6 +504,77 @@ mod tests {
         assert!(
             err.contains("v99") && err.contains("newer Verio"),
             "the refusal should name the version and the reason, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_database_has_no_mutes() {
+        let dir = temp_dir("mute-fresh");
+        let db = Db::open(&dir).expect("open");
+        assert!(db.muted_users().expect("read").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mute_is_recorded_and_listed() {
+        let dir = temp_dir("mute-record");
+        let db = Db::open(&dir).expect("open");
+        db.set_muted("user-bob", true).expect("mute");
+        db.set_muted("user-carol", true).expect("mute");
+        assert_eq!(
+            db.muted_users().expect("read"),
+            vec!["user-bob".to_string(), "user-carol".to_string()]
+        );
+        // Idempotent: setting the same mute twice must not duplicate the row.
+        db.set_muted("user-bob", true).expect("mute again");
+        assert_eq!(db.muted_users().expect("read").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_mute_drops_it_from_the_list_but_keeps_the_row() {
+        let dir = temp_dir("mute-clear");
+        let db = Db::open(&dir).expect("open");
+        db.set_muted("user-bob", true).expect("mute");
+        db.set_muted("user-bob", false).expect("clear");
+        assert!(
+            db.muted_users().expect("read").is_empty(),
+            "a cleared mute must not still be listed"
+        );
+        // The row survives so `updated_at` records when it was cleared.
+        let conn = db.conn.lock().expect("db lock");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mute_list", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1, "clearing deleted the row instead of updating it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn muting_an_empty_user_id_is_refused() {
+        let dir = temp_dir("mute-empty");
+        let db = Db::open(&dir).expect("open");
+        assert!(
+            db.set_muted("   ", true).is_err(),
+            "an empty id must be refused, not stored as a row nothing can match"
+        );
+        assert!(db.muted_users().expect("read").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutes_survive_reopening_the_database() {
+        let dir = temp_dir("mute-persist");
+        {
+            let db = Db::open(&dir).expect("open");
+            db.set_muted("user-bob", true).expect("mute");
+        }
+        let db = Db::open(&dir).expect("reopen");
+        assert_eq!(
+            db.muted_users().expect("read"),
+            vec!["user-bob".to_string()],
+            "a mute did not survive the restart it exists to survive"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,7 +14,7 @@
 //! intentionally skipped here (DTX suppresses silent packets; the in-memory
 //! channel needs no keep-alive).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -165,6 +165,14 @@ pub struct PipelineHandle {
     streams: Option<std::thread::JoinHandle<()>>,
     earcon_tx: mpsc::Sender<EarconKind>,
     peer_volumes: Arc<Mutex<HashMap<String, f32>>>,
+    /// Session 29: the room-wide mute, keyed by the peer's WIRE id — the same key
+    /// `peer_volumes` uses.
+    ///
+    /// Deliberately a separate set rather than "volume 0": the volume is the level
+    /// this user chose and the mute is room state. Collapsing them would mean
+    /// unmuting had to guess a level back, which is two authorities for one
+    /// element — the failure this project keeps paying for.
+    peer_mutes: Arc<Mutex<HashSet<String>>>,
 }
 
 impl PipelineHandle {
@@ -178,6 +186,34 @@ impl PipelineHandle {
         if let Ok(mut guard) = self.peer_volumes.lock() {
             guard.insert(peer_id, volume.clamp(0.0, 2.0));
         }
+    }
+
+    /// Session 29: gate one peer in or out of the local mix.
+    ///
+    /// `peer_id` is the peer's wire id — the same key [`Self::set_peer_volume`]
+    /// takes. This never touches the stored volume, so lifting a mute restores
+    /// exactly the level the user had chosen rather than an approximation of it.
+    pub fn set_peer_muted(&self, peer_id: &str, muted: bool) {
+        if let Ok(mut guard) = self.peer_mutes.lock() {
+            if muted {
+                guard.insert(peer_id.to_string());
+            } else {
+                guard.remove(peer_id);
+            }
+        }
+    }
+
+    /// Session 29: the shared room-wide mute gate, so the room can silence a peer
+    /// without holding a [`PipelineHandle`] — the room is built first and cannot
+    /// have one.
+    ///
+    /// The room stays the authority for *who* is muted; this set is only the
+    /// projection it derives from that authority plus its own roster, keyed by the
+    /// peer's wire id. Nothing else may write it, or there would be two answers to
+    /// "is this peer muted" again.
+    #[must_use]
+    pub fn peer_mutes_handle(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.peer_mutes)
     }
 
     /// Signal stop and join all threads (streams joined last).
@@ -390,6 +426,9 @@ pub fn start(
     let (earcon_tx, earcon_rx) = mpsc::channel::<EarconKind>();
     let peer_volumes = Arc::new(Mutex::new(HashMap::<String, f32>::new()));
     let rx_peer_volumes = Arc::clone(&peer_volumes);
+    // Session 29: the room-wide mute gate, kept beside — not inside — the volumes.
+    let peer_mutes = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let rx_peer_mutes = Arc::clone(&peer_mutes);
     let loopback = cfg.loopback;
     let rx = std::thread::Builder::new()
         .name("verio-rx".into())
@@ -406,6 +445,7 @@ pub fn start(
                 earcon_rx,
                 music_monitor_rx,
                 rx_peer_volumes,
+                rx_peer_mutes,
                 loopback,
                 rx_tx_state,
             );
@@ -421,6 +461,7 @@ pub fn start(
             streams: Some(owner),
             earcon_tx,
             peer_volumes,
+            peer_mutes,
         },
     ))
 }
@@ -1350,6 +1391,23 @@ impl PeerRxStream {
     }
 }
 
+/// Session 29: the gain applied to one peer in the mix.
+///
+/// Extracted and pure so the two things that actually matter can be measured
+/// without a sound device: a mute produces *exactly* zero, and lifting it returns
+/// the stored volume rather than an approximation of it.
+///
+/// The mute is a gate, not a volume: `volume` is passed through untouched when
+/// unmuted, which is what makes "unmute restores my level" true by construction
+/// instead of by a remembered previous value.
+fn peer_mix_gain(volume: f32, muted: bool, deafened: bool) -> f32 {
+    if deafened || muted {
+        0.0
+    } else {
+        volume
+    }
+}
+
 /// The RX / Multi-Source Mixer thread: drains remote peers + local loopback +
 /// earcon cues, maintains 40 ms jitter pre-buffers, mixes with a soft-clipping
 /// limiter, and feeds the CPAL output stream ring buffer.
@@ -1366,6 +1424,7 @@ fn rx_loop(
     earcon_rx: mpsc::Receiver<EarconKind>,
     music_monitor_rx: mpsc::Receiver<Vec<f32>>,
     peer_volumes: Arc<Mutex<HashMap<String, f32>>>,
+    peer_mutes: Arc<Mutex<HashSet<String>>>,
     loopback: bool,
     tx_state: Arc<TxState>,
 ) {
@@ -1472,6 +1531,9 @@ fn rx_loop(
             let needed_48k_mono = needed_48k_mono.max(1);
 
             let vols = peer_volumes.lock().map(|g| g.clone()).unwrap_or_default();
+            // Session 29: the room-wide mute set, snapshotted once per mix block
+            // like the volumes, so a toggle cannot land halfway through one.
+            let mutes = peer_mutes.lock().map(|g| g.clone()).unwrap_or_default();
             // Deafened: buffers keep advancing so nothing stalls, but remote peers
             // contribute silence to the mix.
             let deafened = tx_state.is_deafened();
@@ -1484,8 +1546,11 @@ fn rx_loop(
                     }
                 }
                 for (pid, peer) in peers.iter_mut() {
-                    let v = vols.get(pid).copied().unwrap_or(1.0);
-                    let v = if deafened { 0.0 } else { v };
+                    let v = peer_mix_gain(
+                        vols.get(pid).copied().unwrap_or(1.0),
+                        mutes.contains(pid),
+                        deafened,
+                    );
                     sum += peer.pop_sample() * v;
                 }
                 if let Some(s) = monitor_buf.pop_front() {
@@ -1518,6 +1583,48 @@ fn rx_loop(
     tracing::info!("rx thread stopped");
 }
 
+
+/// Session 29: the room-wide mute gate, measured rather than assumed.
+///
+/// The arithmetic lives in [`peer_mix_gain`] and is pure, so these pin the
+/// behaviour without a sound device. That the mixer *calls* it is enforced
+/// elsewhere: the function has exactly one caller, so deleting the call makes it
+/// dead code and `cargo clippy --all-targets -- -D warnings` fails.
+#[cfg(test)]
+mod mute_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_mute_gates_the_peer_to_exact_silence() {
+        assert_eq!(peer_mix_gain(1.0, true, false), 0.0);
+        // Not merely "quiet": a boosted peer must not leak through either.
+        assert_eq!(peer_mix_gain(2.0, true, false), 0.0);
+    }
+
+    #[test]
+    fn lifting_a_mute_restores_the_chosen_volume_exactly() {
+        for v in [0.0_f32, 0.01, 0.37, 1.0, 1.75, 2.0] {
+            assert_eq!(peer_mix_gain(v, true, false), 0.0);
+            // Bit-for-bit, because the gate never wrote to the level.
+            assert_eq!(peer_mix_gain(v, false, false), v);
+        }
+    }
+
+    #[test]
+    fn an_unmuted_peer_is_passed_through_untouched() {
+        // No clamping, no curve, no surprise: this is only a gate.
+        assert_eq!(peer_mix_gain(1.0, false, false), 1.0);
+        assert_eq!(peer_mix_gain(0.0, false, false), 0.0);
+    }
+
+    #[test]
+    fn deafening_still_wins() {
+        // Regression guard: the pre-existing deafen gate must not be weakened by
+        // the new one.
+        assert_eq!(peer_mix_gain(1.0, false, true), 0.0);
+        assert_eq!(peer_mix_gain(1.0, true, true), 0.0);
+    }
+}
 
 #[cfg(test)]
 mod music_bus_tests {

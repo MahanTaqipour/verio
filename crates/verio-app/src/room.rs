@@ -28,6 +28,7 @@ use verio_transport::{
     TransportEvent,
 };
 
+use crate::db::Db;
 use crate::pipeline::{NetAudioIn, NetAudioOut};
 
 /// The remote identity learned at signaling time.
@@ -56,6 +57,10 @@ pub enum RoomEvent {
     PeerConnected {
         name: String,
         uuid: String,
+        /// Session 29: the peer's persistent id, so a tile can offer a room-wide
+        /// mute. Empty until their `Hello` reaches us, at which point the roster
+        /// refresh re-emits this event carrying it.
+        user_id: String,
         /// `true` only when this peer was not in the roster before — a genuine
         /// arrival. `false` covers the roster adopted when we join a populated
         /// room, and a peer renaming themselves: the roster changed, but nobody
@@ -78,6 +83,22 @@ pub enum RoomEvent {
     TransportModeChanged { mode: String },
     Rtt { ms: f64 },
     Error { message: String },
+    /// Session 29: a room-wide mute changed — either one this client set, or one
+    /// another peer broadcast.
+    ///
+    /// Emitted for every change, including the ones this client originated, so the
+    /// UI has one code path for "the mute set changed" rather than two that can
+    /// drift apart.
+    PeerMuted {
+        /// The *persistent* id of the silenced peer, not their wire id: that is
+        /// what the mute is keyed on.
+        target_user_id: String,
+        muted: bool,
+        /// Display name of whoever set it. Empty when unknown — after a restart we
+        /// know a peer is muted but no longer who muted them, and saying "Muted"
+        /// is honest where a remembered name would be a guess.
+        by: String,
+    },
 }
 
 /// Session 12: one remote participant. The relay fans out to every peer in the
@@ -86,6 +107,13 @@ pub enum RoomEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerInfo {
     pub uuid: String,
+    /// Session 29: the peer's PERSISTENT id, learned from their `Hello`. Empty
+    /// until that arrives, or for a peer whose build predates the field.
+    ///
+    /// This is what a room-wide mute targets. `uuid` cannot be: it is the session
+    /// id and changes on every relaunch, so a mute persisted against it would
+    /// never match the same person again.
+    pub user_id: String,
     pub name: String,
     pub speaking: bool,
     pub mute: bool,
@@ -93,6 +121,21 @@ pub struct PeerInfo {
     /// Session 14: this peer is playing music into the room.
     pub music: bool,
     pub music_title: String,
+}
+
+/// Session 29: one room-wide mute, as the UI sees it.
+///
+/// Kept out of [`PeerInfo`] on purpose. A tile already carries the *local* volume
+/// mute this user set for themselves; folding the room mute into the same field
+/// would leave the UI unable to say which of the two it is showing, and the two
+/// have different owners and different lifetimes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MuteInfo {
+    /// The silenced peer's persistent id — match it against
+    /// [`PeerInfo::user_id`], never against [`PeerInfo::uuid`].
+    pub target_user_id: String,
+    /// Who set it. Empty when unknown, e.g. restored from disk.
+    pub by: String,
 }
 
 /// A half-finished invite: the offer was created and serialized into a blob; the
@@ -128,6 +171,24 @@ pub struct RoomManager {
     /// Session 14: last time each peer was heard from on the relay, so peers that
     /// vanish without a signalling event are still pruned.
     peer_seen: std::collections::HashMap<String, std::time::Instant>,
+    /// Session 29: the room-wide mute — presence means "silenced in my mix", and
+    /// the value names whoever set it.
+    ///
+    /// Keyed by the target's PERSISTENT user id, never their wire uuid: a uuid is
+    /// minted per process, so a mute stored against it would fail to match the
+    /// same person on their next launch, which is exactly when a persisted mute is
+    /// supposed to still apply.
+    ///
+    /// This map is the single authority. [`Self::project_mutes`] derives the
+    /// mixer's view from it; nothing derives it from the mixer.
+    room_mutes: std::collections::HashMap<String, String>,
+    /// Session 29: where [`Self::project_mutes`] writes the wire-id projection the
+    /// audio mixer reads. `None` until a pipeline exists — the room is constructed
+    /// first — and replaced on every pipeline restart, at which point the room
+    /// re-derives the whole projection into the new set.
+    mute_sink: Option<Arc<Mutex<std::collections::HashSet<String>>>>,
+    /// Session 28: the local store, so a mute outlives the process.
+    db: Db,
 }
 
 struct ActiveSession {
@@ -135,11 +196,11 @@ struct ActiveSession {
 }
 
 impl RoomManager {
-    pub fn new(identity: Identity, room_events: Sender<RoomEvent>) -> Self {
+    pub fn new(identity: Identity, room_events: Sender<RoomEvent>, db: Db) -> Self {
         let silence_frame = Arc::new(encode_silence_frame());
         tracing::info!(bytes = silence_frame.len(), "cached Opus silence keep-alive frame");
         let (net_out_tx, net_out_rx) = mpsc::channel::<NetAudioOut>();
-        let room = Self {
+        let mut room = Self {
             identity,
             state: RoomState::Idle,
             peers: std::collections::HashMap::new(),
@@ -155,9 +216,30 @@ impl RoomManager {
             pending: None,
             signaling_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer_seen: std::collections::HashMap::new(),
+            room_mutes: std::collections::HashMap::new(),
+            mute_sink: None,
+            db,
         };
+        room.restore_mutes();
         room.spawn_audio_pump();
         room
+    }
+
+    /// Session 29: bring the persisted mutes back.
+    ///
+    /// Only the boolean is stored, so the actor is unknown here — recorded as an
+    /// empty name, which the UI renders as a plain "Muted" rather than attributing
+    /// the mute to somebody who never made it.
+    fn restore_mutes(&mut self) {
+        match self.db.muted_users() {
+            Ok(ids) => {
+                for id in ids {
+                    self.room_mutes.insert(id, String::new());
+                }
+            }
+            // Not fatal: the room still works, it just forgets mutes on restart.
+            Err(e) => tracing::error!("could not restore the mute list: {e}"),
+        }
     }
 
     // -- accessors -----------------------------------------------------------
@@ -193,6 +275,7 @@ impl RoomManager {
             active.handle.send_control(ControlMessage::Hello {
                 name: self.identity.name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                user_id: self.identity.user_id.clone(),
             });
         }
     }
@@ -247,6 +330,7 @@ impl RoomManager {
             .insert(uuid.clone(), std::time::Instant::now());
         let entry = self.peers.entry(uuid.clone()).or_insert_with(|| PeerInfo {
             uuid: uuid.clone(),
+            user_id: peer.user_id.clone(),
             name: peer.name.clone(),
             speaking: false,
             mute: false,
@@ -255,15 +339,25 @@ impl RoomManager {
             music_title: String::new(),
         });
         entry.name = peer.name.clone();
+        // An empty id means "unknown" (a peer built before Session 29), so it must
+        // never erase an id we already learned.
+        if !peer.user_id.is_empty() {
+            entry.user_id = peer.user_id.clone();
+        }
         // `!arrived` forces the event even for a peer we already know, because
         // an adopt is the only thing that tells the UI about a rename.
         if is_new || !arrived {
             self.emit(RoomEvent::PeerConnected {
                 name: peer.name,
                 uuid,
+                user_id: peer.user_id,
                 arrived,
             });
         }
+        // Session 29: a peer who arrives already silenced — because we muted them
+        // before, or before we restarted — must be gated from their very first
+        // packet, so the projection follows the roster.
+        self.project_mutes();
     }
 
     /// Session 12: drop a peer and tell the UI; the room idles when it empties.
@@ -278,6 +372,10 @@ impl RoomManager {
             self.teardown_session("all peers left");
             self.set_state(RoomState::Idle);
         }
+        // Session 29: the gate mirrors the roster, so it shrinks with it. The
+        // *mute* does not: it is keyed on the person and stays in the list, ready
+        // to apply again the moment they come back.
+        self.project_mutes();
     }
 
     pub fn transport_mode(&self) -> Option<&str> {
@@ -435,6 +533,118 @@ impl RoomManager {
     /// Returns the outgoing sender for the pipeline config while we're at it.
     pub fn pipeline_endpoints(&self) -> mpsc::Sender<NetAudioOut> {
         self.net_out_tx.clone()
+    }
+
+    // -- room-wide mute (Session 29) -----------------------------------------
+
+    /// Install the mixer's mute gate, then re-derive it from the current state.
+    ///
+    /// Called once per pipeline start. A restart hands us a brand-new empty set, so
+    /// re-projecting here is what stops an output-device change from silently
+    /// lifting every mute.
+    pub fn set_mute_sink(&mut self, sink: Arc<Mutex<std::collections::HashSet<String>>>) {
+        self.mute_sink = Some(sink);
+        self.project_mutes();
+    }
+
+    /// Session 29: the room-wide mutes, for the UI's initial snapshot.
+    #[must_use]
+    pub fn mutes(&self) -> Vec<MuteInfo> {
+        let mut v: Vec<MuteInfo> = self
+            .room_mutes
+            .iter()
+            .map(|(id, by)| MuteInfo {
+                target_user_id: id.clone(),
+                by: by.clone(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.target_user_id.cmp(&b.target_user_id));
+        v
+    }
+
+    /// Session 29: silence (or un-silence) a peer for the whole room, and tell
+    /// everyone else.
+    ///
+    /// # Errors
+    /// The target's persistent id is empty. A peer whose `Hello` we never saw has
+    /// nothing a mute can be keyed on, and muting their wire uuid instead would
+    /// quietly stop working the next time they launch.
+    pub fn set_room_mute(&mut self, target_user_id: &str, muted: bool) -> Result<(), String> {
+        if target_user_id.trim().is_empty() {
+            return Err("cannot mute a peer whose persistent id is unknown".into());
+        }
+        let by = self.identity.name.clone();
+        self.apply_mute(target_user_id, muted, &by, true);
+        Ok(())
+    }
+
+    /// The single path every mute takes, whoever it came from.
+    ///
+    /// `broadcast` is false for a mute we just received: echoing it back would
+    /// bounce it around the room for as long as the room exists.
+    fn apply_mute(&mut self, target_user_id: &str, muted: bool, by: &str, broadcast: bool) {
+        // Reachable from the wire, not just from our own command: a peer running a
+        // build without a persistent id, or a malformed frame, can name no target.
+        // Dropping it beats storing a mute that matches nobody and would be
+        // restored, uselessly, on every future launch.
+        if target_user_id.trim().is_empty() {
+            tracing::warn!(by, "ignoring a room mute that names no target");
+            return;
+        }
+        if muted {
+            self.room_mutes
+                .insert(target_user_id.to_string(), by.to_string());
+        } else {
+            self.room_mutes.remove(target_user_id);
+        }
+        self.project_mutes();
+        // A failed write costs the mute its survival across launches, not its
+        // effect now, so it is logged rather than propagated.
+        if let Err(e) = self.db.set_muted(target_user_id, muted) {
+            tracing::error!(target_user_id, "could not persist the mute: {e}");
+        }
+        if broadcast {
+            if let Some(active) = self.active.lock().expect("active lock").as_ref() {
+                active.handle.send_control(ControlMessage::MuteUser {
+                    target_user_id: target_user_id.to_string(),
+                    muted,
+                });
+            }
+        }
+        self.emit(RoomEvent::PeerMuted {
+            target_user_id: target_user_id.to_string(),
+            muted,
+            by: by.to_string(),
+        });
+    }
+
+    /// Derive the mixer's gate from the authoritative mute set plus the roster.
+    ///
+    /// Recomputed whole rather than patched: the set is a handful of entries, and a
+    /// full derivation cannot drift out of step with its source the way an
+    /// add/remove pair can when a peer joins, leaves, or is muted while away.
+    ///
+    /// Note what is deliberately absent — a check for "is this me?". The mixer only
+    /// gates the peers in its remote-audio map and a client never receives its own
+    /// audio back, so a self-mute cannot silence the muter. That is true by
+    /// construction, and a guard for it could never fire.
+    fn project_mutes(&self) {
+        let Some(sink) = self.mute_sink.as_ref() else {
+            return;
+        };
+        let Ok(mut gate) = sink.lock() else {
+            tracing::error!("mute gate poisoned — mutes not applied");
+            return;
+        };
+        gate.clear();
+        for (uuid, peer) in &self.peers {
+            if peer.user_id.is_empty() {
+                continue;
+            }
+            if self.room_mutes.contains_key(&peer.user_id) {
+                gate.insert(uuid.clone());
+            }
+        }
     }
 
     // -- session activation --------------------------------------------------
@@ -1077,21 +1287,27 @@ fn spawn_transport_pump(
                     }
                     TransportEvent::Control {
                         peer,
-                        message: ControlMessage::Hello { name, .. },
+                        message: ControlMessage::Hello { name, user_id, .. },
                     } => {
                         let mut m = room.lock().expect("room lock");
                         let uuid = resolve_peer(&peer, &peer_id);
                         m.mark_peer_seen(&uuid);
                         let is_new = !m.peers.contains_key(&uuid);
-                        let renamed = m
-                            .peers
-                            .get(&uuid)
-                            .is_some_and(|p| p.name != name);
-                        if is_new || renamed {
+                        // Session 29: refresh the roster when the name OR the
+                        // persistent id changed. The id matters because a room-wide
+                        // mute is keyed on it, so learning it late must update the
+                        // roster rather than be discarded as "not a rename". An
+                        // empty id never overwrites a known one — that is a peer
+                        // built before this field existed.
+                        let changed = m.peers.get(&uuid).is_some_and(|p| {
+                            p.name != name || (p.user_id != user_id && !user_id.is_empty())
+                        });
+                        if is_new || changed {
                             let identity = Identity {
                                 uuid: verio_discovery::Uuid::parse_str(&uuid).unwrap_or_else(|_| {
                                     verio_discovery::Uuid::nil()
                                 }),
+                                user_id,
                                 name,
                                 version: String::new(),
                             };
@@ -1106,6 +1322,29 @@ fn spawn_transport_pump(
                                 m.adopt_peer(identity);
                             }
                         }
+                    }
+                    TransportEvent::Control {
+                        peer,
+                        message: ControlMessage::MuteUser {
+                            target_user_id,
+                            muted,
+                        },
+                    } => {
+                        let mut m = room.lock().expect("room lock");
+                        let actor = resolve_peer(&peer, &peer_id);
+                        m.mark_peer_seen(&actor);
+                        // The actor comes from the envelope, not the payload: the
+                        // relay stamps every control frame with its sender, so the
+                        // message neither has to repeat it nor gets to lie about it.
+                        let by = m
+                            .peers
+                            .get(&actor)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        // `broadcast: false` — this is the mute we just received.
+                        // Sending it on would have it circulate for the life of the
+                        // room.
+                        m.apply_mute(&target_user_id, muted, &by, false);
                     }
                     TransportEvent::Rtt { ms } => {
                         let m = room.lock().expect("room lock");
@@ -1172,14 +1411,36 @@ mod tests {
     fn identity(name: &str, n: u128) -> Identity {
         Identity {
             uuid: verio_discovery::Uuid::from_u128(n),
+            // Distinct per (name, n) so mute tests cannot accidentally collide.
+            user_id: format!("user-{name}-{n}"),
             name: name.to_string(),
             version: String::new(),
         }
     }
 
+    /// A private, empty local store per test. The room persists mutes through it,
+    /// so the tests exercise the real write path rather than a stub that could not
+    /// fail.
+    ///
+    /// The name is made unique per call, not per test: tests run in parallel and a
+    /// shared directory has them deleting each other's database out from under an
+    /// open connection ("database is locked"), which then leaks one test's mutes
+    /// into the next.
+    fn temp_db(name: &str) -> Db {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("verio-room-test-{name}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Db::open(&dir).expect("open test database")
+    }
+
     fn manager() -> (RoomManager, mpsc::Receiver<RoomEvent>) {
         let (tx, rx) = mpsc::channel();
-        (RoomManager::new(identity("self", 999), tx), rx)
+        (
+            RoomManager::new(identity("self", 999), tx, temp_db("manager")),
+            rx,
+        )
     }
 
     /// `(name, arrived)` for every roster event drained so far.
@@ -1265,6 +1526,252 @@ mod tests {
         let announced: Vec<String> = peer_events(&rx).into_iter().map(|(n, _)| n).collect();
         assert_eq!(announced, vec!["Ada", "Bo", "Cy"]);
         assert_eq!(m.peers.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_id_never_erases_one_we_already_learned() {
+        // A peer built before Session 29 sends no `user_id`. If that empty string
+        // overwrote a known id, the tile would lose its room-mute control the next
+        // time the peer renamed themselves — a capability that disappears for a
+        // reason nothing on screen explains.
+        let (mut m, _rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        assert_eq!(
+            m.peers.get(&uuid(2)).map(|p| p.user_id.as_str()),
+            Some("user-Bo-2")
+        );
+
+        m.adopt_peer(Identity {
+            uuid: verio_discovery::Uuid::from_u128(2),
+            user_id: String::new(),
+            name: "Bo Renamed".to_string(),
+            version: String::new(),
+        });
+        assert_eq!(
+            m.peers.get(&uuid(2)).map(|p| p.user_id.as_str()),
+            Some("user-Bo-2"),
+            "the id we knew survived a Hello that carried none"
+        );
+        assert_eq!(
+            m.peers.get(&uuid(2)).map(|p| p.name.as_str()),
+            Some("Bo Renamed"),
+            "…while the rename still took effect"
+        );
+    }
+
+    #[test]
+    fn a_peer_event_carries_the_persistent_id_a_room_mute_needs() {
+        // The tile offers "mute for everyone" only once it holds an id to send, so
+        // an event that dropped this field would leave the control absent with
+        // nothing to explain why — the same shape of defect as the roster that
+        // announced an arrival it never had.
+        let (mut m, rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerConnected { name, user_id, .. } = ev {
+                seen.push((name, user_id));
+            }
+        }
+        assert_eq!(seen, vec![("Bo".to_string(), "user-Bo-2".to_string())]);
+    }
+
+    // -- Session 29: the room-wide mute ---------------------------------------
+    //
+    // One thing these cannot reach: whether `apply_mute(broadcast: true)` actually
+    // sends. With no live session there is no handle to send through, so the two
+    // values are indistinguishable from in here. The receive path is covered
+    // instead — it is the half that changes state.
+
+    /// The mixer's mute gate: the set of wire ids currently silenced.
+    type Gate = Arc<Mutex<std::collections::HashSet<String>>>;
+
+    /// A gate to project into, plus a second handle to read back what was derived.
+    fn sink() -> (Gate, Gate) {
+        let s = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+        (Arc::clone(&s), s)
+    }
+
+    /// What the mixer would see, sorted so the comparison is order-independent.
+    fn gated(sink: &Gate) -> Vec<String> {
+        let mut v: Vec<String> = sink.lock().expect("gate lock").iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn uuid(n: u128) -> String {
+        verio_discovery::Uuid::from_u128(n).to_string()
+    }
+
+    /// `(target, muted, by)` for every mute event drained so far.
+    fn mute_events(rx: &mpsc::Receiver<RoomEvent>) -> Vec<(String, bool, String)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerMuted {
+                target_user_id,
+                muted,
+                by,
+            } = ev
+            {
+                out.push((target_user_id, muted, by));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_mute_targets_the_person_so_it_survives_their_next_launch() {
+        // The reason the mute is keyed on `user_id` at all. A wire id is minted per
+        // process, so a mute stored against it would stop matching the next time
+        // this person launched — which is exactly when a persisted mute is supposed
+        // to still be in force.
+        let (mut m, _rx) = manager();
+        let (write, read) = sink();
+        m.set_mute_sink(write);
+
+        m.add_peer(identity("Bo", 2));
+        m.set_room_mute("user-Bo-2", true).expect("mute");
+        assert_eq!(gated(&read), vec![uuid(2)]);
+
+        // Bo quits and comes back: same person, new session id.
+        m.remove_peer(&uuid(2));
+        m.add_peer(Identity {
+            uuid: verio_discovery::Uuid::from_u128(7),
+            user_id: "user-Bo-2".to_string(),
+            name: "Bo".to_string(),
+            version: String::new(),
+        });
+        assert_eq!(
+            gated(&read),
+            vec![uuid(7)],
+            "the same person is still muted under their new session id"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_no_persistent_id_cannot_be_muted() {
+        // A peer whose `Hello` we never saw has nothing a mute can key on. Muting
+        // their wire id instead would appear to work and then quietly stop.
+        let (mut m, _rx) = manager();
+        assert!(m.set_room_mute("", true).is_err());
+        assert!(m.set_room_mute("   ", true).is_err());
+        assert!(m.mutes().is_empty());
+        assert!(m.db.muted_users().expect("read").is_empty());
+    }
+
+    #[test]
+    fn the_gate_mirrors_the_mute_list_and_the_roster() {
+        let (mut m, _rx) = manager();
+        let (write, read) = sink();
+        m.set_mute_sink(write);
+        m.add_peer(identity("Bo", 2));
+        m.add_peer(identity("Cy", 3));
+
+        m.set_room_mute("user-Bo-2", true).expect("mute");
+        assert_eq!(gated(&read), vec![uuid(2)]);
+
+        // An unrelated peer leaving must not disturb the gate.
+        m.remove_peer(&uuid(3));
+        assert_eq!(gated(&read), vec![uuid(2)]);
+
+        // The muted peer leaving clears it from the gate, but the *mute* stays on
+        // the list, ready to apply again the moment they return.
+        m.remove_peer(&uuid(2));
+        assert!(gated(&read).is_empty());
+        assert_eq!(
+            m.mutes(),
+            vec![MuteInfo {
+                target_user_id: "user-Bo-2".to_string(),
+                by: "self".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pipeline_restart_re_applies_the_mutes_it_already_held() {
+        // A restart hands the room a brand-new, empty gate. Without the re-derive
+        // in `set_mute_sink`, changing your output device would silently lift every
+        // mute in the room — with nothing in the UI to say so.
+        let (mut m, _rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        m.set_room_mute("user-Bo-2", true).expect("mute");
+
+        let (write, read) = sink();
+        m.set_mute_sink(write);
+        assert_eq!(gated(&read), vec![uuid(2)]);
+    }
+
+    #[test]
+    fn a_mute_outlives_the_process() {
+        let db = temp_db("mute-restart");
+        let (tx, _rx) = mpsc::channel();
+        let mut first = RoomManager::new(identity("self", 999), tx, db.clone());
+        first.set_room_mute("user-Bo-2", true).expect("mute");
+        drop(first);
+
+        let (tx2, _rx2) = mpsc::channel();
+        let second = RoomManager::new(identity("self", 999), tx2, db);
+        assert_eq!(
+            second.mutes(),
+            vec![MuteInfo {
+                target_user_id: "user-Bo-2".to_string(),
+                // Not persisted: we know they are muted, not who muted them, and an
+                // invented name would be worse than none.
+                by: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_mute_change_is_reported_to_the_ui_with_who_made_it() {
+        // The target's own client is told who silenced it. Being silenced with no
+        // explanation is the bug `by` exists to avoid.
+        let (mut m, rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        m.set_room_mute("user-Bo-2", true).expect("mute");
+        m.set_room_mute("user-Bo-2", false).expect("unmute");
+        assert_eq!(
+            mute_events(&rx),
+            vec![
+                ("user-Bo-2".to_string(), true, "self".to_string()),
+                ("user-Bo-2".to_string(), false, "self".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mute_that_arrives_from_the_wire_is_recorded_and_persisted() {
+        // `apply_mute(.., broadcast: false)` is the receive path. It has to land in
+        // the list, the gate and the store exactly like a local one — otherwise a
+        // peer's mute would work until you restarted and then forget itself.
+        let (mut m, rx) = manager();
+        let (write, read) = sink();
+        m.set_mute_sink(write);
+        m.add_peer(identity("Bo", 2));
+
+        m.apply_mute("user-Bo-2", true, "Cy", false);
+
+        assert_eq!(gated(&read), vec![uuid(2)]);
+        assert_eq!(
+            m.db.muted_users().expect("read"),
+            vec!["user-Bo-2".to_string()]
+        );
+        assert_eq!(
+            mute_events(&rx),
+            vec![("user-Bo-2".to_string(), true, "Cy".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_wire_mute_with_no_target_is_dropped_rather_than_stored() {
+        // Reachable from the wire: a peer built before the persistent id existed
+        // sends an empty target. Storing it would put a mute in the list that
+        // matches nobody, and restore it uselessly on every launch from then on.
+        let (mut m, rx) = manager();
+        m.apply_mute("  ", true, "Cy", false);
+        assert!(m.mutes().is_empty());
+        assert!(m.db.muted_users().expect("read").is_empty());
+        assert!(mute_events(&rx).is_empty());
     }
 }
 

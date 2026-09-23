@@ -25,9 +25,27 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Peer identity exchanged before any SDP flows. The uuid decides the
 /// deterministic role: on any pairwise setup the peer with the LARGER uuid is the
 /// offerer (prevents double-dial deadlock).
+///
+/// Session 28 split this into two tiers and Session 29 made both explicit here,
+/// because every consumer needs to be able to tell them apart:
+///
+/// - `uuid` is the **session** id. It is minted per process and is the wire id —
+///   the relay prefix, the mDNS name, and the id on every audio packet. Two
+///   instances on one PC must never share it, which is why it is not persisted.
+/// - `user_id` is the **person**. It is persistent (`identity.user_id`), and it is
+///   what a room-wide mute is keyed on, because a persisted mute has to match the
+///   same person after they restart — and their `uuid` will be different by then.
+///
+/// Never use one where the other belongs: keying a mute on `uuid` makes it expire
+/// at the next launch, and putting `user_id` on the wire as a transport prefix
+/// would make two instances on one machine indistinguishable to the relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub uuid: Uuid,
+    /// Persistent id, stable across launches. Empty means "unknown" (a peer that
+    /// predates Session 29, or a test that does not care) — never invent one.
+    #[serde(default)]
+    pub user_id: String,
     pub name: String,
     pub version: String,
 }
@@ -397,6 +415,7 @@ mod tests {
     fn identity(name: &str) -> Identity {
         Identity {
             uuid: Uuid::new_v4(),
+            user_id: format!("user-{name}"),
             name: name.to_string(),
             version: "0.1.0".to_string(),
         }
@@ -498,6 +517,7 @@ mod tests {
         // sides could compute Answerer and block in receive_offer forever.
         let mk = |name: &str, id: u128| Identity {
             uuid: Uuid::from_u128(id),
+            user_id: format!("user-{name}"),
             name: name.to_string(),
             version: "0.0.0".to_string(),
         };
