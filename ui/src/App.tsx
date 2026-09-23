@@ -12,7 +12,6 @@ import { TelemetryRow, TelemetryList } from "./components/verio/telemetry-row";
 import { IconButton } from "./components/ui/button";
 import { SectionLabel } from "./components/ui/field";
 import { IconError, IconX } from "./components/verio/icons";
-import { describeLiveTransport } from "./lib/transport";
 import { useMusic } from "./lib/use-music";
 import { MusicPanel } from "./components/verio/music-panel";
 import { Lobby } from "./components/verio/lobby";
@@ -682,27 +681,25 @@ export default function App() {
   const isPttMode = Boolean(settings?.hotkeys.ptt && settings.hotkeys.ptt.trim().length > 0);
 
   /**
-   * Live transport descriptor: what is actually carrying voice right now, from
-   * `TransportDiagnostics.mode`. Only meaningful once a call exists.
+   * Session 24: the live transport descriptor is gone, and with it
+   * `src/lib/transport.ts`.
    *
-   * There is deliberately no *configured* counterpart any more. Voice transport
-   * used to be user-selectable, and the Host Call card used to advertise the
-   * configured mode behind a "change it in Settings" button. That surface was a
-   * stack of three falsehoods: no control in Settings could change the value, the
-   * frontend never called the existing `set_transport_mode` command, and
-   * `room.rs` pinned the effective mode to cloud relay regardless. Transport
-   * selection is a legacy concept — Verio is cloud-relay only — so the surface was
-   * removed rather than repaired.
+   * It rendered exactly one row in the diagnostics drawer — "Transport path /
+   * Encrypted relay" — and that row was the only thing in the panel asserted
+   * from architecture rather than measured. `TransportDiagnostics` exposes no
+   * crypto field at all, so the app cannot know whether the media is encrypted,
+   * only that it ought to be. The claim was true (the transport establishes ICE
+   * + DTLS) but every neighbouring row is a value the app actually read, and one
+   * unmeasured row in a panel of measurements is the wrong kind of mixed.
    *
-   * See src/lib/transport.ts for the value sets and their backend sources.
-   *
-   * Session 22: this used to be passed to `AppHeader` as well, which rendered it
-   * as a `Connected · Relay` suffix. That suffix is gone — see the removal note
-   * in components/verio/app-header.tsx. The descriptor now has exactly one
-   * consumer, the diagnostics drawer below, which is the surface where it has
-   * room to be honest about itself.
+   * History worth keeping, because it explains why transport has no UI at all:
+   * voice transport used to be user-selectable, and the Host Call card
+   * advertised the configured mode behind a "change it in Settings" button. That
+   * surface was a stack of three falsehoods — no control in Settings could
+   * change the value, the frontend never called the existing `set_transport_mode`
+   * command, and `room.rs` pinned the effective mode to cloud relay regardless.
+   * Verio is cloud-relay only, so the surface was removed rather than repaired.
    */
-  const liveTransport = describeLiveTransport(diagnostics?.mode);
 
   return (
     <div className="app-container">
@@ -790,13 +787,6 @@ export default function App() {
                   </div>
 
                   <TelemetryList className="min-h-0 flex-1 overflow-y-auto">
-                    <TelemetryRow
-                      label="Transport path"
-                      value={liveTransport.label}
-                      hint={liveTransport.hint}
-                      tone="accent"
-                    />
-
                     <TelemetryRow
                       label="Latency (RTT)"
                       value={

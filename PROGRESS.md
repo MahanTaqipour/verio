@@ -3872,4 +3872,134 @@ the shipped bundle.
    no caller; its contract is a pair, so wiring it alone would leave a hotkey permanently
    unregistered).
 
+---
+
+## Session 25 (2026-09-23) — the four decisions, executed
+
+All four Phase 8 decisions were answered and implemented.
+
+| question | answer |
+| --- | --- |
+| Speaking colour | **Keep `--accent` (amber)** |
+| `components/ui/dialog.tsx` | **Commit first, then delete** |
+| `tauri.conf.json` Q6 | **pnpm only, no `minWidth`** |
+| "Encrypted relay" descriptor row | **Drop the row** |
+
+### 1. The working tree is committed — it had been uncommitted for two days
+
+The last commit was `98f9143` (2026-09-20, "chore: migrate ui to pnpm"). Everything since —
+Phases 2–8, 35 untracked files under `ui/src` — existed **only in the working tree**. That is
+also why `dialog.tsx` could not simply be deleted: an untracked file has no git history to
+restore it from.
+
+Three commits, in dependency order:
+
+| commit | contents |
+| --- | --- |
+| `4175802` `feat(music): add a play queue to the Rust backend` | `pipeline.rs` (+548), `ui/src-tauri/src/lib.rs` (+172) |
+| `6f0faae` `refactor(ui): migrate the frontend to Tailwind v4 + shadcn` | 44 files |
+| `54d9ebf` `docs: add the redesign plan, the design tokens, and the licence holder` | `REDESIGN-PLAN.md`, `design.md`, `LICENSE` |
+
+The Rust commit is a **separate feature**, not part of the redesign: `QueueItem`, the queue's
+shape on `MusicStatus` (`queue_index`, `queue_len`, `queue_looping`), and ten commands
+(`music_queue_add/remove/move/jump/clear/list/set_loop`, `music_prev`, `music_next`,
+`music_pick_files`) plus `music_queue_changed`. The frontend's queue UI depends on it, which is
+why it is committed first.
+
+Deliberately **not** committed: `.workbuddy-ai/` (agent state, not project source) and
+`stitch_verio_desktop_interface_suite.zip` (1.5 MB design source; `/design/` is ignored and a
+similar zip, `/verio-music-player-panel.zip`, is ignored by precedent).
+
+### 2. The speaking colour was a real contradiction, and `design.md` wins
+
+My Session 23 note said "the deck and `REDESIGN-PLAN.md` §4.0 say mossy green (`--idle`)" and
+implied `state-chip.tsx` was the odd one out. Re-reading the sources, the attribution is
+sharper:
+
+- **`design.md`** — `--accent #c9873f` = "Primary action + **speaking indicator**. Nothing
+  else.", and "`--accent` is used for exactly two things: primary actions and the speaking
+  indicator."
+- **`REDESIGN-PLAN.md` §4.0** line 42 — "Mossy green `#5b7a72` = transmitting"; line 222 —
+  "speaking = flat mossy-green outline".
+- **The deck** renders the speaking tile in `secondary` = `#5b7a72`, with the literal comment
+  `<!-- TILE 2: Dan (Active Speaking - Mossy Green #5b7a72 Audio Wave) -->`.
+
+So `state-chip.tsx`'s comment was **faithful to `design.md`**, not an invention. The deck and the
+plan genuinely disagree with `design.md`, and Q2 already made `design.md` the tie-breaker on
+§4.0 conflicts. **Decision: keep `--accent`.** No code change.
+
+One measurement that makes the alternative expensive, and is worth keeping: in the deck almost
+every avatar is `bg-surface-container-highest` (neutral) and **only** the actively-speaking tile
+gets the green. Switching to green without also moving the default avatar off `--idle` would make
+the speaking and non-speaking avatars identical — and `--idle` is already the header's Connected
+dot, the Paused music chip, the non-PTT badge, and the non-speaking avatar.
+
+### 3. `dialog.tsx` deleted — 0 unreachable modules
+
+Deleted after the commit made it recoverable. `dead-modules.mjs` now reports
+**reachable 33, unreachable 0**; every module in `ui/src` is reachable from the entry points.
+
+### 4. `tauri.conf.json`: pnpm, and deliberately no `minWidth`
+
+`npm run dev` / `npm run build` → `pnpm dev` / `pnpm build`. **No `minWidth`**, because Q6
+proposed ~720 while the verification protocol renders at **700** — adding it would make a width
+the protocol verifies at unreachable in the real window.
+
+### 5. Dropping the "Encrypted relay" row cascaded to deleting a module
+
+The row was the diagnostics drawer's only value asserted from architecture:
+`TransportDiagnostics` exposes no crypto field at all (`mode`, `endpoint`, `local_addr`,
+`packets_*`, `bytes_*`, `last_recv_ms_ago`, `rtt_ms`, `ice_state`, `status`, `error`,
+`relay_*`), so the app cannot know whether the media is encrypted — only that it ought to be.
+With the row gone, `describeLiveTransport` had no caller, so **`src/lib/transport.ts` was
+deleted** (all four of its exports were internal). The drawer is now uniformly measured:
+
+```text
+Latency (RTT) · Packets · Last recv · Relay packets · Relay mode · Remote endpoint · Local socket
+```
+
+Effect on the build: 1924 → **1923 modules**, CSS 35.55 → **34.91 kB**, JS 336.04 → **335.15 kB**.
+
+### 6. A stale guard, and the mutation that proves the replacement works
+
+`verify-room.mjs` asserted the drawer contained `transport path` — the row just removed. A guard
+that encodes an obsolete expectation is the mirror of the earlier "fires on its own explanation"
+bug: it fails on a correct change.
+
+Replaced with a matched pair: the **first and last measured rows** must be present
+(`latency (rtt)`, `local socket`) **and** the unmeasured row must stay gone. Also raised the
+probe's `innerText` slice from 160 → 500 chars, because 160 truncated the list before
+`Remote endpoint` — the probe could not have seen the last row it was asserting.
+
+Mutation-tested: re-adding a `Transport path` row fails exactly the negative check while the
+positive one still passes; revert byte-exact (`git hash-object` → `841a0804…`).
+
+Section G's comment in the same file was also corrected — it claimed the panel button was the
+only route to the banner's error branch, which stopped being true in Session 24. Section G still
+uses the button deliberately: it needs the "no banner before the event" precondition, which a
+scenario that boots into a banner cannot give. `verify-harness.mjs` covers the boot path.
+
+### 7. Verification
+
+`tsc --noEmit` clean · `vite build` clean · `assert-fresh` 36/36 · `check-phantom-classes`
+PHANTOM: none · `check-collisions` LEAK/MIX clean · `dead-css` DEAD: none, ORPHAN KEYFRAMES:
+none · `verify-harness` 8/8 · `verify-room` · `verify-settings` · `verify-music` ·
+`verify-contents-wrapper` 40/40 · `dead-modules` 0 unreachable.
+
+**Environment note:** the dev server was dead when the session resumed — it belonged to the
+previous session's background task, and those are cleaned up. `assert-fresh.mjs` caught it
+(`cannot reach the dev server at http://127.0.0.1:1420`) before any probe could report a
+misleading green, which is exactly why it runs first. Cold start is **12.3 s**, so a probe fired
+too soon after a restart fails with `ERR_CONNECTION_REFUSED` rather than a real defect.
+
+### 8. Still open
+
+- **`sounds/*.wav` is untracked *and* gitignored.** `.gitignore` has `*.wav` with only
+  `!ui/public/**/*.wav` excepted, so the shipping sound assets are in no commit.
+- **`LICENSE` reads `Mahan [Mahan Taqipour]`** — the brackets were part of the placeholder.
+- **`identifier: "ir.verio.app"`** ends in `.app`, which `tauri build` warns conflicts with the
+  macOS bundle extension. Changing it moves the Windows app-data path, so it needs a deliberate
+  decision.
+- Carried: **`prepare_hotkey_capture`** (live command, no caller, contract is a pair).
+
 

@@ -43,10 +43,10 @@ import verioLogo from "@/assets/verio-logo-primary-96.png";
  * paths that no longer have any UI.
  *
  * A value that cannot vary is not information, so it is gone from the header
- * rather than kept as decoration. The transport is still described *properly*
- * one click away, in the diagnostics drawer, where it has room for its label
- * and its explanation — that is the surface where it is real and useful.
- * `lib/transport.ts` therefore still has a live consumer and stays.
+ * rather than kept as decoration. It then lived on only in the diagnostics
+ * drawer, until Session 24 removed it there too — see the note in `App.tsx`.
+ * With that row gone, `lib/transport.ts` had no consumer left and was deleted.
+ * The diagnostics drawer now shows only values the app measured.
  */
 
 /** Mirrors the `RoomState` union the app already keeps; structural, so the
