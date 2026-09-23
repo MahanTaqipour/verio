@@ -703,7 +703,7 @@ fn toggle_mute(app: AppHandle, bridge: State<Bridge>) -> AudioState {
         pipe.play_earcon(if is_muted {
             verio_app::EarconKind::MuteOn
         } else {
-            verio_app::EarconKind::MuteOff
+            verio_app::EarconKind::Unmute
         });
     }
     send_room_state(&bridge);
@@ -716,11 +716,15 @@ fn toggle_deafen(app: AppHandle, bridge: State<Bridge>) -> AudioState {
     bridge.tx.toggle_deafen();
     let is_deafened = bridge.tx.is_deafened();
     if let Some(pipe) = bridge.pipeline.lock().expect("pipeline lock").as_ref() {
-        if is_deafened {
-            pipe.play_earcon(verio_app::EarconKind::Deafen);
+        // `Undeafen`, not `Unmute`. Until Session 27 the deafen-off branch
+        // played the mute-off cue, so deafen and undeafen were not the
+        // distinguishable pair they read as — you could not tell by ear
+        // whether you had unmuted or undeafened.
+        pipe.play_earcon(if is_deafened {
+            verio_app::EarconKind::Deafen
         } else {
-            pipe.play_earcon(verio_app::EarconKind::MuteOff);
-        }
+            verio_app::EarconKind::Undeafen
+        });
     }
     send_room_state(&bridge);
     emit_audio_state(&app, &bridge);
@@ -1542,5 +1546,49 @@ mod tests {
         assert!(parse_binding("Ctrl+B").is_ok(), "Ctrl+B failed");
         assert!(parse_binding("Space").is_ok(), "Space failed");
         assert!(parse_binding("B").is_ok(), "B failed");
+    }
+
+    /// Contract test with the frontend. `ui/src/lib/hotkey.ts` builds numpad
+    /// bindings out of `event.code`, and every name it can emit has to survive
+    /// `normalize_combo` and then parse. The frontend deliberately does *not* use
+    /// `event.key` for these — NumpadAdd reports `"+"`, and with NumLock off the
+    /// digits report `Insert`/`End`/`ArrowDown`, so `key` yields either an
+    /// unparseable string or the wrong key entirely.
+    #[test]
+    fn numpad_bindings_parse() {
+        for name in [
+            "Numpad0",
+            "Numpad1",
+            "Numpad2",
+            "Numpad3",
+            "Numpad4",
+            "Numpad5",
+            "Numpad6",
+            "Numpad7",
+            "Numpad8",
+            "Numpad9",
+            "NumpadAdd",
+            "NumpadSubtract",
+            "NumpadMultiply",
+            "NumpadDivide",
+            "NumpadDecimal",
+            "NumpadEnter",
+            "NumpadEqual",
+        ] {
+            assert!(parse_binding(name).is_ok(), "{name} did not parse");
+            assert!(
+                parse_binding(&format!("Ctrl+Shift+{name}")).is_ok(),
+                "Ctrl+Shift+{name} did not parse"
+            );
+        }
+    }
+
+    /// Pins the reason the frontend cannot use `event.key` for the numpad: the
+    /// string it would build is rejected. `normalize_combo` drops the empty
+    /// segments, leaving a bare "Ctrl", which is not a valid shortcut.
+    #[test]
+    fn bare_double_plus_binding_is_rejected() {
+        assert!(parse_binding("Ctrl++").is_err(), "Ctrl++ should be rejected");
+        assert!(parse_binding("Ctrl+NumpadAdd").is_ok());
     }
 }

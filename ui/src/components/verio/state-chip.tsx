@@ -61,6 +61,13 @@ export interface StateChipProps {
   onClick?: () => void;
   /** Tooltip / accessible description. */
   title?: string;
+  /**
+   * The chip's accessible name. Required when the chip contains only an icon:
+   * the chip renders as a plain `<span>` (or `<button>`), and every icon in the
+   * module is `aria-hidden`, so without this an icon-only chip would be silent
+   * to a screen reader. Ignored when the chip already has text children.
+   */
+  ariaLabel?: string;
   /** Only meaningful when `onClick` is set. */
   expanded?: boolean;
 }
@@ -73,6 +80,7 @@ export function StateChip({
   className,
   onClick,
   title,
+  ariaLabel,
   expanded,
 }: StateChipProps) {
   const classes = cn(
@@ -94,7 +102,7 @@ export function StateChip({
 
   if (!onClick) {
     return (
-      <span title={title} className={classes}>
+      <span title={title} aria-label={ariaLabel} className={classes}>
         {body}
       </span>
     );
@@ -105,6 +113,7 @@ export function StateChip({
       type="button"
       onClick={onClick}
       title={title}
+      aria-label={ariaLabel}
       aria-expanded={expanded}
       className={classes}
     >

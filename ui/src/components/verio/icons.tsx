@@ -30,7 +30,6 @@ import {
   CircleDot,
   Clock,
   Copy,
-  Ear,
   EarOff,
   ExternalLink,
   FileAudio,
@@ -38,6 +37,7 @@ import {
   Gauge,
   Hash,
   Headphones,
+  HeadphoneOff,
   Info,
   Keyboard,
   LoaderCircle,
@@ -137,8 +137,15 @@ export const IconHeadphones = makeIcon(Headphones, "headphones");
 /* Deafen is a hearing on/off pair, so it follows the module's `X` / `XOff`
    convention (`IconMic`/`IconMicOff`, `IconVolume`/`IconVolumeOff`). The two
    glyphs are from the same lucide family so the pair reads as one control
-   changing state rather than two unrelated buttons. */
-export const IconEar = makeIcon(Ear, "ear");
+   changing state rather than two unrelated buttons.
+
+   Headphones, not ears. An ear glyph names the organ where the state is about
+   the act of not listening, and it read as a second, unrelated control next to
+   the mic. `IconEar` was deleted in Session 27: the dock's deafen button was its
+   only consumer, and it now uses this pair. `IconEarOff` survives because the
+   peer tile's local-mute button is a different idea — silencing one peer for
+   yourself, not deafening yourself — and it keeps its own ear glyph. */
+export const IconHeadphoneOff = makeIcon(HeadphoneOff, "headphoneOff");
 export const IconEarOff = makeIcon(EarOff, "earOff");
 export const IconLeave = makeIcon(PhoneOff, "leave");
 export const IconUsers = makeIcon(Users, "users");

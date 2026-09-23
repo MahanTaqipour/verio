@@ -5,8 +5,8 @@ import { KbdChip } from "@/components/verio/kbd-chip";
 import { MicLevelMeter, type LevelMeterHandle } from "@/components/verio/level-meter";
 import {
   IconCheck,
-  IconEar,
-  IconEarOff,
+  IconHeadphoneOff,
+  IconHeadphones,
   IconMic,
   IconMicOff,
   IconMusic,
@@ -287,7 +287,7 @@ export function Dock({
           onClick={onToggleDeafen}
           aria-pressed={deafened}
           title={`Toggle deafen (${deafenHotkey})`}
-          icon={deafened ? <IconEarOff size={16} /> : <IconEar size={16} />}
+          icon={deafened ? <IconHeadphoneOff size={16} /> : <IconHeadphones size={16} />}
           trailingIcon={<KbdChip decorative>{shortKey(deafenHotkey)}</KbdChip>}
         >
           Deafen

@@ -59,4 +59,8 @@ tauri.key.pub
 
 # Debug audio dumps; retain shipping sound assets
 *.wav
+# The earcons are compiled into the binary with include_bytes! from
+# crates/verio-dsp/src/earcon.rs, so this path is load-bearing: if it is not
+# tracked, a clean checkout fails to build rather than shipping without cues.
+!crates/verio-dsp/assets/sounds/*.wav
 !ui/public/**/*.wav

@@ -73,6 +73,7 @@ import {
   IconCheck,
   IconCopy,
   IconEarOff,
+  IconHeadphoneOff,
   IconLeave,
   IconMicOff,
   IconMusic,
@@ -174,9 +175,19 @@ function Avatar({ name, speaking }: { name: string; speaking: boolean }) {
   );
 }
 
-function Chip({ tone, children, title }: { tone: ChipTone; children: ReactNode; title?: string }) {
+function Chip({
+  tone,
+  children,
+  title,
+  ariaLabel,
+}: {
+  tone: ChipTone;
+  children: ReactNode;
+  title?: string;
+  ariaLabel?: string;
+}) {
   return (
-    <StateChip tone={tone} title={title}>
+    <StateChip tone={tone} title={title} ariaLabel={ariaLabel}>
       {children}
     </StateChip>
   );
@@ -232,8 +243,22 @@ function PeerTile({
           <div className="flex flex-wrap items-center gap-1">
             {isSelf && <Chip tone="neutral">You</Chip>}
             {speaking && <Chip tone="accent">Speaking</Chip>}
-            {muted && <Chip tone="warn">Muted</Chip>}
-            {deafened && <Chip tone="warn">Deafened</Chip>}
+            {/* Icon-only chips. The glyph carries the state, so the accessible
+                name has to come from `ariaLabel` — every icon in the module is
+                `aria-hidden`, so without it these would be silent to a screen
+                reader. Muted is `--warn`; deafened is `--danger`, which is
+                already how the dock styles its deafen button, so the same state
+                reads the same in both places. */}
+            {muted && (
+              <Chip tone="warn" title="Muted" ariaLabel="Muted">
+                <IconMicOff size={14} />
+              </Chip>
+            )}
+            {deafened && (
+              <Chip tone="danger" title="Deafened" ariaLabel="Deafened">
+                <IconHeadphoneOff size={14} />
+              </Chip>
+            )}
             {music && (
               // `accent` because a peer injecting music is actively putting
               // audio into the room — the same semantic as speaking, and the
@@ -263,7 +288,7 @@ function PeerTile({
           <Slider
             min={0}
             max={2}
-            step={0.05}
+            step={0.01}
             value={volume ?? 1}
             fillPercent={((volume ?? 1) / 2) * 100}
             valueText={`${Math.round((volume ?? 1) * 100)} percent`}

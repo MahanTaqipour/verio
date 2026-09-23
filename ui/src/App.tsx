@@ -13,6 +13,7 @@ import { IconButton } from "./components/ui/button";
 import { SectionLabel } from "./components/ui/field";
 import { IconError, IconX } from "./components/verio/icons";
 import { useMusic } from "./lib/use-music";
+import { comboFromEvent } from "./lib/hotkey";
 import { MusicPanel } from "./components/verio/music-panel";
 import { Lobby } from "./components/verio/lobby";
 import { Settings, type HotkeyAction } from "./components/verio/settings";
@@ -376,30 +377,14 @@ export default function App() {
         return;
       }
 
-      // Ignore pure modifier keys alone until a main key is pressed
-      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
+      // Build the binding from `event.code`, not `event.key`. The numpad
+      // needs it: NumpadAdd reports "+" (which would build the unparseable
+      // "Ctrl++"), and with NumLock off Numpad0-9 report Insert/End/ArrowDown.
+      // See lib/hotkey.ts.
+      const combo = comboFromEvent(e);
+      if (combo === null) {
         return;
       }
-
-      // Build key combo
-      const parts: string[] = [];
-      if (e.ctrlKey) parts.push("Ctrl");
-      if (e.shiftKey) parts.push("Shift");
-      if (e.altKey) parts.push("Alt");
-
-      let key = e.key;
-      if (e.code.startsWith("Key")) {
-        key = e.code.replace(/^Key/, "").toUpperCase();
-      } else if (e.code.startsWith("Digit")) {
-        key = e.code.replace(/^Digit/, "");
-      } else if (e.code === "Space") {
-        key = "Space";
-      } else if (key.length === 1) {
-        key = key.toUpperCase();
-      }
-
-      parts.push(key);
-      const combo = parts.join("+");
 
       try {
         await invoke("set_hotkey", { action: capturingAction, combo });

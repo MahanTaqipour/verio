@@ -4135,3 +4135,227 @@ for both, and nothing tells you one was lost.
 
 Re-verified after both changes: `VERIFY OK`, `EXITCODE=0`, with **71 passed, 0 failed** — which
 also confirms the collapsed `if let` is behaviour-preserving, since that test exercises it.
+
+## Session 27 (2026-09-23) — quick fixes: volume step, numpad capture, mute/deafen icons, WAV earcons
+
+Five items, four of them small and one that turned out to need a decision. Everything below is
+measured output unless it is explicitly labelled otherwise.
+
+### 1. Per-peer volume steps by 1 %, not 5 %
+
+`ui/src/components/verio/room.tsx` — the peer slider was `step={0.05}` over `min=0 max=2`, so the
+reachable values were 0/5/10…% and 1 % was not selectable at all. Changed to `step={0.01}`.
+
+The music slider needed nothing: `ui/src/components/verio/music-panel.tsx` is `min=0 max=200` with
+no `step`, and `use-music.ts`'s `setVolume` multiplies by 2 while the slider divides by 200, so the
+two cancel and it was already 1 %. Verified by reading both, not assumed from the report.
+
+### 2. Numpad hotkeys: the bug was in the UI, not the backend
+
+Read `global-hotkey` 0.8.0's source before changing anything. `parse_key` accepts `Numpad0`–`Numpad9`,
+`NumpadAdd`, `NumpadSubtract`, `NumpadMultiply`, `NumpadDivide`, `NumpadDecimal`, `NumpadEnter` and
+`NumpadEqual`, plus `Num0`-style aliases — so the backend was never the problem.
+
+The frontend was. `App.tsx`'s `handleKeyDown` built bindings from `event.key`, and the numpad is the
+one place where `key` is unusable: `NumpadAdd` reports `"+"`, which builds the unparseable `"Ctrl++"`;
+with NumLock off `Numpad0`–`Numpad9` report `Insert`/`End`/`ArrowDown`; `NumpadDecimal` reports `"."`
+or `"Delete"`, and `Delete` is already the clear-binding key.
+
+- **New** `ui/src/lib/hotkey.ts` — pure, testable `mainKeyName` / `comboFromEvent`, checking
+  `event.code` for the numpad **first**. `NumpadEqual` was added beyond the agreed minimum because it
+  would otherwise fall through to `event.key === "="` and alias the main keyboard's `=`.
+- **New** `ui/tests/hotkey.test.ts` — 12 tests on `node:test`, no framework installed. Lives outside
+  `src/` so `@types/node` is not needed for `tsc --noEmit` to stay green. The `pnpm test` script
+  carries an explicit `--experimental-strip-types` because system Node 22.14.0 does not strip types
+  by default (measured: 0/1 without the flag, 12/12 with it).
+- `ui/src-tauri/src/lib.rs` — 2 new tests: `numpad_bindings_parse` (all 17 names parse, bare and
+  `Ctrl+Shift+`) and `bare_double_plus_binding_is_rejected`, which pins *why* the frontend cannot use
+  `event.key`.
+- `verify-settings.mjs` section G drives the real capture: `Control+NumpadAdd` records
+  `{"action":"mute","combo":"Ctrl+NumpadAdd"}` with no `++`, and `NumpadMultiply` binds bare.
+
+### 3. Mute/deafen as icons
+
+`room.tsx` now renders icon-only chips: `IconMicOff` at 14 px in `--warn`, `IconHeadphoneOff` at
+14 px in `--danger`, each keeping an `aria-label`.
+
+Two things had to change for that to be correct rather than merely done:
+
+- **The dock's deafen button used `IconEar`/`IconEarOff`** — exactly what the instruction forbids. It
+  now uses a `Headphones`/`HeadphoneOff` pair, and the now-unused `IconEar` is deleted.
+  `IconEarOff` **survives deliberately**: the peer tile's local-mute button is a different idea
+  (silencing one peer for yourself, not deafening yourself) and keeps its ear glyph.
+- **`StateChip` had no `aria-label` support.** Every icon in the module is `aria-hidden`, so an
+  icon-only chip would have been silent to a screen reader. Added an `ariaLabel` prop; without it
+  this change would have been an accessibility regression that no existing check was shaped to catch.
+
+`verify-room.mjs` had **no** assertion on these chips — the visible text *was* the assertion, by
+accident of being present. Added ~17 assertions (counts from the roster rather than tile indices,
+runtime-resolved `--warn`/`--danger` compared against the chips' computed colour, text gone, glyph
+still present and `aria-hidden`, and the deafened glyph provably *not* the ear glyph).
+
+### 4. The six WAV earcons — replaced the synthesizer outright
+
+**This is the item that needed a decision, so it was asked rather than guessed.** The facts that made
+it ambiguous, all measured first: the files were untracked (`.gitignore` has `*.wav` with only
+`!ui/public/**/*.wav` excepted); there was **no** `resource_dir` / `include_bytes!` / `asset:` usage
+anywhere in the repo; `verio-app` has no Tauri dependency and `soak-harness` also depends on it; and
+Tauri embeds `frontendDist` into the binary, so anything in `ui/public/` is not on disk in a packaged
+build, which rules out a Rust-side `File::open` there.
+
+Decided: **`include_bytes!`**, files moved to `crates/verio-dsp/assets/sounds/`.
+
+- `sounds/` at the repo root is **gone**; the six files now live in the crate that owns playback.
+  `defean.wav` was misspelled and is renamed **`deafen.wav`**. All six are 44.1 kHz stereo 16-bit PCM,
+  0.433–0.451 s, 496 KB total, and all six are byte-distinct (md5-verified before relying on it).
+- `.gitignore` — the exception is now `!crates/verio-dsp/assets/sounds/*.wav`. This is load-bearing:
+  without it a clean checkout **fails to build** rather than shipping without cues. Confirmed with
+  `git add --dry-run`, which listed all six.
+- `verio_dsp::wav` — extracted `read_wav_bytes(bytes, label)` out of `read_wav`, so the embedded
+  assets go through the same tested parser without a filesystem. Two new tests, including one that
+  proves the byte path and the file path produce identical samples.
+- `earcon.rs` — rewritten. `EarconKind` is now
+  `{MuteOn, Unmute, Deafen, Undeafen, PeerJoin, PeerLeave}`; each variant indexes a `CUE_BYTES` array
+  of `include_bytes!` assets, decoded **once** into resident `Arc<[f32]>` buffers through
+  `to_pipeline_format` (mixdown + resample to 48 kHz mono, already tested at 44.1 k). `synthesize_earcon`,
+  `generate_tone` and `DEFAULT_VOLUME` are **deleted** — there is no fallback path, and the module says
+  why: a cue that silently reverts to a *different* sound is worse than no cue, because the point of the
+  pairs is that they are distinguishable by ear.
+- `pipeline.rs` — `warm()` before the RX thread spawns, so the first cue never decodes on the audio
+  thread; the drain is now a pointer copy.
+- **A real defect found and fixed:** `toggle_deafen`'s undeafen branch played
+  `EarconKind::MuteOff` (`ui/src-tauri/src/lib.rs:722`), so unmute and undeafen were audibly
+  identical. It now plays `Undeafen`.
+
+**Gain is unity, and that is a measurement.** Measured peak **-10.9 to -17.5 dBFS**, RMS **-24.6 to
+-31.0 dBFS**, against **-18.4 dBFS peak / -21.4 dBFS RMS** for the 0.12-amplitude sine this replaced:
+comparable peak, *lower* RMS. Trimming to match the old tone would have made them inaudible, so no
+trim is applied.
+
+### 5. Volume display — verified, not rewritten
+
+`probe-volume-display.mjs` (new) drives the real slider through the native value setter so React's
+value tracker cannot swallow the event, and asserts the round trip: the label **and** the
+`set_peer_volume` args for 1 %, 2 %, 3 %, 7 %, 13 % and 100 %.
+
+```
+  PASS  the slider steps by 0.01  — step=0.01
+  PASS  1 % is a reachable step  — 200 steps across the range
+  0.01    1%      {"peerId":"011a2b3c-…","volume":0.01}
+  0.03    3%      {"peerId":"011a2b3c-…","volume":0.03}
+  PASS  1 %, 2 % and 3 % all display distinctly  — saw 1% -> 2% -> 3%
+ALL VOLUME-DISPLAY CHECKS PASSED
+```
+
+**Made to fail on purpose:** with `step={0.05}` restored, **13 checks fail** and the failure is
+exactly the reported bug — 1 % and 2 % both display `0%`, and 3 % displays `5%`. Reverted
+byte-exact (`git hash-object room.tsx` = `d0cba631f381d5712729e27fa0c477a222d2bf6c` before and after).
+
+### 6. Verification — real output
+
+| Check | Result |
+| --- | --- |
+| `pnpm tsc --noEmit` | exit 0 |
+| `pnpm test` | 12 passed, 0 failed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --exclude verio` | 22+8+28+6+8 = **72 passed, 0 failed** |
+| `cargo test -p verio --lib` | **4 passed, 0 failed** |
+| `pnpm tauri build --no-bundle` | exit 0 → `target/release/verio.exe`, 18 594 816 bytes |
+| `check-phantom-classes.mjs` | 29 files, 291 defined, 235 tokens → **PHANTOM: none** |
+| `check-collisions.mjs` | **LEAK: clean**, **MIX: clean** |
+| `dead-css.mjs` | 8/8 mentioned → **DEAD: none**, ORPHAN KEYFRAMES: none |
+| `dead-modules.mjs C:/dev/verio/ui/src --strict` | 33 modules, 33 reachable, **0 unreachable** |
+| `verify-music.mjs` | all 12 scenario/width states render, all controls wired |
+| `verify-contents-wrapper.mjs` | 40 configurations, layout-neutral in all |
+| `probe-room-contrast.mjs` | runs, exit 0 (a probe: reports ratios, does not gate) |
+| `verify-room.mjs` | **80 PASS, 0 FAIL** — ALL ROOM CHECKS PASSED |
+| `verify-settings.mjs` | **ALL CHECKS PASSED** |
+| `verify-harness.mjs` | 8 passed, 0 failed |
+| `assert-fresh.mjs` | 37/37 served files match their on-disk mtime |
+| `probe-volume-display.mjs` | ALL VOLUME-DISPLAY CHECKS PASSED |
+| `verify-embedded-assets.mjs` | 6/6 cue assets found in `verio.exe`, both controls correct |
+
+`cargo test --workspace --exclude verio` went 69 → 72 (+2 `wav`, +1 net in `earcon`: 3 tests replaced
+by 4). `cargo test -p verio --lib` went 2 → 4.
+
+### 7. Mutation tests — every new guard was made to fail
+
+| Guard | Mutation | Observed |
+| --- | --- | --- |
+| `hotkey.ts` (unit) | revert numpad branch to `event.key` | the numpad cases fail |
+| `hotkey.ts` (browser) | same, via `verify-settings.mjs` G | combo becomes `Ctrl++`-shaped |
+| `ui/src-tauri/src/lib.rs` | re-inject the `Ctrl++` case | `bare_double_plus_binding_is_rejected` fails |
+| `room.tsx` chips | deafened chip back to a text chip | exactly 4 of the new assertions fail |
+| `probe-volume-display.mjs` | `step={0.01}` → `0.05` | **13 checks fail** |
+| `earcon.rs` distinctness | `deafen.wav` → `mute.wav` | `the_six_cues_are_pairwise_distinct` fails: *"MuteOn and Deafen are the same audio"* |
+| `earcon.rs` order | swap `MuteOn`/`Unmute` variants | `cue_labels_match_enum_order` fails |
+
+All reverted byte-exact. The last two are worth keeping together: swapping the enum fails **only** the
+order test and swapping the bytes fails **only** the distinctness test, so neither guard subsumes the
+other — distinctness alone would have missed a mis-mapping.
+
+### 8. What was NOT verified, and why
+
+**The 8 s boot smoke test did not run.** `target/release/verio.exe` cannot be launched from a
+non-elevated shell:
+
+```
+SMOKE: process exited before 8s
+C:\…\bash.exe: line 1: ./verio.exe: Permission denied      # exit 126
+```
+
+That is not a sandbox or file-permission problem. Confirmed from the artefact itself —
+`grep -a -o 'requestedExecutionLevel level="[a-zA-Z]*"' target/release/verio.exe` →
+`requestedExecutionLevel level="requireAdministrator"`, from `ui/src-tauri/build.rs:18`. It is the
+same manifest that stops `cargo test --workspace` launching the bin harness. **Running it needs an
+elevated shell.** A green `tauri build` answers "does it link", not "does it start", so this is
+recorded as not run rather than inferred.
+
+**The join/leave cues were not heard.** Two instances producing a real join/leave needs a human at
+the machine. What *is* verified: both assets decode (`every_cue_decodes_to_audio_at_48k`), both are
+present in the packaged binary, `PeerJoin`/`PeerLeave` reach `play_earcon` at
+`ui/src-tauri/src/lib.rs:1290/1297`, and the enum→file mapping is pinned. Audibility itself is a
+listening test.
+
+### 9. Corrections to my own earlier work
+
+- **`sounds/` was described wrongly in Session 25 §8 and Session 26 §5** — "orphaned earcon
+  prototypes, NOT shipping assets" and "zero code references". That was accurate then and is false
+  now: they are shipping assets, compiled into the binary, with the crate as their home.
+- **Two assertions I added this session printed a failure reason on PASS.** `verify-room.mjs` and
+  `verify-settings.mjs` both pass a `detail` string that `ok()` prints on *both* paths, so a green
+  run read `PASS  the Deafened glyph is not the ear glyph — deafened chip is missing its glyph, or
+  shares a path with the ear button`. Rewritten to report the measurement
+  (`2 deafened chip(s), 0 sharing the ear path`). A PASS line that reads like a failure is worse than
+  no detail.
+- **I ran `dead-modules.mjs` with no argument**, so it scanned the workspace instead of the repo and
+  printed `modules: 0, reachable: 0, unreachable: 0` — a green verdict about an empty set. Re-run
+  correctly it reports 33/33/0. The script's own docstring takes the directory as an argument; the
+  lesson is that a report of *zero* problems deserves a look at the denominator.
+
+### 10. Skill updates
+
+- **The documented invocation was wrong.** `NODE_PATH` does not work for ESM — it affects only
+  CommonJS `require` — so `node "$SKILL/verify-room.mjs"` fails with
+  `ERR_MODULE_NOT_FOUND: Cannot find package 'playwright-core'`. ESM resolves from the *importing
+  module's* directory, so the fix is to run the workspace copy. Replaced the snippet, replaced the
+  `$SKILL` examples with `$WS`, and added the separate trap that **path arguments still resolve
+  against cwd** (`dead-modules.mjs ui/src` from the workspace reports an empty set).
+- **20 scripts were drifted** between the workspace and the skill's `scripts/`; all synced, drift now
+  **0**. Two of the new ones (`probe-volume-display.mjs`, `verify-embedded-assets.mjs`) were added to
+  the suite table.
+- New skill section: **"Earcon assets: `include_bytes!`, and what 'do not keep both' cost"**.
+- The elevation constraint now covers the smoke test, not just `cargo test`.
+
+### 11. Found but not fixed
+
+- **`probe-room-contrast.mjs` reports pre-existing sub-AA pairs** in the peer tile: the avatar
+  initials at 3.9 and the volume percent at 3.56 (`rgb(125, 113, 102)` on `rgb(33, 28, 24)`). It is a
+  probe, not a gate, so it exits 0. Unchanged by this session — the percent element existed before;
+  only the slider's `step` moved. Flagging, not fixing: it is a palette decision.
+- Everything from Session 26 §6 and Session 25 §8 still stands: `identifier: "ir.verio.app"` (warned
+  again by this build), `prepare_hotkey_capture` with no caller, the `too_many_arguments` suppression,
+  and the untracked `.workbuddy-ai/` + `stitch_verio_desktop_interface_suite.zip`.
+- **`sounds/` no longer exists**, so that open item from Session 25 is closed by relocation rather
+  than by a decision.
+

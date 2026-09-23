@@ -105,8 +105,18 @@ pub fn read_wav(path: &Path) -> Result<WavData, String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
+    read_wav_bytes(&bytes, &path.display().to_string())
+}
+
+/// Parse 16-bit PCM WAV data that is already in memory.
+///
+/// Split out of [`read_wav`] so assets compiled in with `include_bytes!` — the
+/// earcons in [`crate::earcon`] — go through the same tested parser without
+/// touching the filesystem. `label` appears only in error messages, so a
+/// corrupt embedded asset names itself instead of a nonexistent path.
+pub fn read_wav_bytes(bytes: &[u8], label: &str) -> Result<WavData, String> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(format!("{}: not a RIFF/WAVE file", path.display()));
+        return Err(format!("{label}: not a RIFF/WAVE file"));
     }
     let mut fmt = None;
     let mut data = None;
@@ -122,7 +132,7 @@ pub fn read_wav(path: &Path) -> Result<WavData, String> {
         match id {
             b"fmt " => {
                 if size < 16 {
-                    return Err("fmt chunk too small".into());
+                    return Err(format!("{label}: fmt chunk too small"));
                 }
                 let audio_format = u16::from_le_bytes(
                     bytes[pos + 8..pos + 10].try_into().map_err(|_| "fmt")?,
@@ -138,7 +148,7 @@ pub fn read_wav(path: &Path) -> Result<WavData, String> {
                 );
                 if audio_format != 1 || bits != 16 {
                     return Err(format!(
-                        "unsupported WAV format (fmt={audio_format}, bits={bits}); want PCM 16-bit"
+                        "{label}: unsupported WAV format (fmt={audio_format}, bits={bits}); want PCM 16-bit"
                     ));
                 }
                 fmt = Some((channels, sample_rate));
@@ -148,8 +158,8 @@ pub fn read_wav(path: &Path) -> Result<WavData, String> {
         }
         pos = pos + 8 + size + (size % 2); // chunks are word-aligned
     }
-    let (channels, sample_rate) = fmt.ok_or("missing fmt chunk")?;
-    let raw = data.ok_or("missing data chunk")?;
+    let (channels, sample_rate) = fmt.ok_or(format!("{label}: missing fmt chunk"))?;
+    let raw = data.ok_or(format!("{label}: missing data chunk"))?;
     let samples: Vec<f32> = raw
         .chunks_exact(2)
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32_768.0)
@@ -197,6 +207,37 @@ mod tests {
             assert!((orig - back).abs() < 3.1e-5, "{orig} vs {back}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_wav_bytes_matches_read_wav() {
+        // The embedded-asset path must agree with the on-disk path exactly.
+        // `include_bytes!` is a build-time copy, so if these ever diverge the
+        // shipped earcons are not the files that were auditioned.
+        let dir = std::env::temp_dir().join("verio-dsp-wav-bytes-test");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("bytes.wav");
+        let samples: Vec<f32> = (0..960)
+            .map(|i| ((i as f32 / 960.0) * 2.0 - 1.0) * 0.5)
+            .collect();
+        {
+            let mut w = WavWriter::create(&path).expect("create");
+            w.write_f32(&samples).expect("write");
+        }
+        let from_disk = read_wav(&path).expect("read file");
+        let bytes = std::fs::read(&path).expect("read bytes");
+        let from_bytes = read_wav_bytes(&bytes, "bytes.wav").expect("parse bytes");
+        assert_eq!(from_disk.sample_rate, from_bytes.sample_rate);
+        assert_eq!(from_disk.channels, from_bytes.channels);
+        assert_eq!(from_disk.samples, from_bytes.samples);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_wav_bytes_rejects_non_wav_and_names_the_asset() {
+        let err = read_wav_bytes(&[0_u8; 64], "garbage.wav").expect_err("should reject");
+        assert!(err.contains("garbage.wav"), "should name the asset: {err}");
+        assert!(err.contains("RIFF"), "should say why: {err}");
     }
 
     #[test]

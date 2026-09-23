@@ -25,7 +25,7 @@ use verio_audio::{Consumer, Observer, Producer};
 use verio_dsp::codec::{OpusDecoderWrapper, OpusEncoderWrapper};
 use verio_dsp::convert::LinearResampler;
 use verio_dsp::denoise::RnNoise;
-use verio_dsp::earcon::{synthesize_earcon, EarconKind};
+use verio_dsp::earcon::{cue, EarconKind};
 use verio_dsp::music::MusicDecoder;
 use verio_dsp::util::{db_to_linear, rms_dbfs};
 use verio_dsp::vad::SpeakingGate;
@@ -383,6 +383,10 @@ pub fn start(
     // --- RX / Multi-Source Mixer thread ---
     let r_stop = Arc::clone(&stop);
     let net_in_rx = cfg.net_in_rx;
+    // Decode the cue assets up front so the mixer never pays for it: the first
+    // cue would otherwise decode on the audio thread, which is both late and
+    // work the audio thread should not be doing.
+    verio_dsp::earcon::warm();
     let (earcon_tx, earcon_rx) = mpsc::channel::<EarconKind>();
     let peer_volumes = Arc::new(Mutex::new(HashMap::<String, f32>::new()));
     let rx_peer_volumes = Arc::clone(&peer_volumes);
@@ -1440,10 +1444,11 @@ fn rx_loop(
             }
         }
 
-        // 3. Drain earcon cues
+        // 3. Drain earcon cues. `cue` hands back a pointer copy of a buffer that
+        // was decoded once at pipeline start, so this loop stays allocation-free
+        // on the audio thread.
         while let Ok(kind) = earcon_rx.try_recv() {
-            let cue = synthesize_earcon(kind);
-            earcon_buf.extend(cue);
+            earcon_buf.extend(cue(kind).iter().copied());
         }
 
         // 3b. Drain local music-monitor chunks

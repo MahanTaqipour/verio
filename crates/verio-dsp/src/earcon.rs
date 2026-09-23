@@ -1,102 +1,180 @@
-//! Audio cues (earcons) synthesized as subtle sine wave tones.
+//! Audio cues (earcons), played from WAV assets compiled into the binary.
 //!
-//! Hotkey press feedback:
-//! - Mute ON: 400 Hz tone (20 ms).
-//! - Mute OFF: 800 Hz tone (20 ms).
-//! - Deafen: two short 300 Hz blips.
+//! Six files in `assets/sounds/` are embedded with `include_bytes!` and decoded
+//! once into resident 48 kHz mono f32 buffers. `verio-app`'s RX mixer adds them
+//! to the output stream, which is what keeps them audible while deafened:
+//! deafen silences *remote* audio, not the local cues.
+//!
+//! Session 27 replaced a sine-wave synthesizer with these files, and there is
+//! deliberately no fallback to synthesis. If an asset fails to decode the cue is
+//! silent and the failure is logged. A cue that quietly reverts to a different
+//! sound would be worse than no cue at all — the entire point of the pairs is
+//! that mute/unmute and deafen/undeafen are distinguishable by ear.
+//!
+//! The assets are 44.1 kHz stereo 16-bit PCM. Downmix and resample happen once,
+//! at load, so the audio thread only ever copies f32 samples.
+//!
+//! **Gain is unity, and that is a measurement, not a default.** Measured peak is
+//! -10.9 to -17.5 dBFS and RMS -24.6 to -31.0 dBFS, against -18.4 dBFS peak /
+//! -21.4 dBFS RMS for the 0.12-amplitude sine this replaced: comparable peak,
+//! lower RMS. Trimming to match the old tone would make them inaudible.
 
-use std::f32::consts::PI;
-use crate::SAMPLE_RATE;
+use std::sync::{Arc, OnceLock};
 
+use crate::convert::to_pipeline_format;
+use crate::wav::read_wav_bytes;
+
+/// A cue the app can play.
+///
+/// The variant order is load-bearing: it indexes [`CUE_BYTES`]. Reordering the
+/// enum without reordering that array silently swaps two sounds, so
+/// `cue_labels_match_enum_order` pins the pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EarconKind {
+    /// Local microphone muted.
     MuteOn,
-    MuteOff,
+    /// Local microphone unmuted.
+    Unmute,
+    /// Local deafen engaged.
     Deafen,
-    /// Pleasant rising two-note chime played when a peer joins the room.
+    /// Local deafen released.
+    Undeafen,
+    /// A peer joined the room.
     PeerJoin,
-    /// Descending two-note chime played when a peer leaves the room.
+    /// A peer left the room.
     PeerLeave,
 }
 
-const DEFAULT_VOLUME: f32 = 0.12; // -18 dBFS, subtle but clearly audible
+/// Number of cues. Named so the array type and the index bound cannot drift.
+const CUE_COUNT: usize = 6;
 
-/// Synthesize samples for the given earcon at 48 kHz mono f32.
-#[must_use]
-pub fn synthesize_earcon(kind: EarconKind) -> Vec<f32> {
-    match kind {
-        EarconKind::MuteOn => generate_tone(400.0, 20, DEFAULT_VOLUME),
-        EarconKind::MuteOff => generate_tone(800.0, 20, DEFAULT_VOLUME),
-        EarconKind::Deafen => {
-            // Two short 300 Hz blips: 15 ms tone, 15 ms silence, 15 ms tone
-            let blip = generate_tone(300.0, 15, DEFAULT_VOLUME);
-            let silence_len = (15 * SAMPLE_RATE / 1000) as usize;
-            let mut out = Vec::with_capacity(blip.len() * 2 + silence_len);
-            out.extend_from_slice(&blip);
-            out.extend(std::iter::repeat_n(0.0_f32, silence_len));
-            out.extend_from_slice(&blip);
-            out
-        }
-        EarconKind::PeerJoin => {
-            // Rising perfect-fifth chime: 660 Hz then 990 Hz.
-            let mut out = generate_tone(660.0, 70, DEFAULT_VOLUME);
-            out.extend(generate_tone(990.0, 95, DEFAULT_VOLUME));
-            out
-        }
-        EarconKind::PeerLeave => {
-            // Falling mirror of the join cue: 990 Hz then 660 Hz.
-            let mut out = generate_tone(990.0, 70, DEFAULT_VOLUME);
-            out.extend(generate_tone(660.0, 95, DEFAULT_VOLUME));
-            out
-        }
+/// `(label, bytes)` per cue, in [`EarconKind`] order.
+///
+/// The label is only used in error messages — it names the asset that failed to
+/// decode rather than a path that does not exist at runtime.
+const CUE_BYTES: [(&str, &[u8]); CUE_COUNT] = [
+    ("mute.wav", include_bytes!("../assets/sounds/mute.wav")),
+    ("unmute.wav", include_bytes!("../assets/sounds/unmute.wav")),
+    ("deafen.wav", include_bytes!("../assets/sounds/deafen.wav")),
+    (
+        "undeafen.wav",
+        include_bytes!("../assets/sounds/undeafen.wav"),
+    ),
+    ("join.wav", include_bytes!("../assets/sounds/join.wav")),
+    ("leave.wav", include_bytes!("../assets/sounds/leave.wav")),
+];
+
+/// Decoded cues, resident for the process lifetime.
+static CUES: OnceLock<Result<[Arc<[f32]>; CUE_COUNT], String>> = OnceLock::new();
+
+fn decode_all() -> Result<[Arc<[f32]>; CUE_COUNT], String> {
+    let mut out = Vec::with_capacity(CUE_COUNT);
+    for (label, bytes) in CUE_BYTES {
+        let wav = read_wav_bytes(bytes, label)?;
+        // 44.1 kHz stereo on disk -> 48 kHz mono here, so playback is a copy.
+        let mono = to_pipeline_format(&wav.samples, wav.channels, wav.sample_rate);
+        out.push(Arc::from(mono.into_boxed_slice()));
+    }
+    out.try_into()
+        .map_err(|_| format!("expected {CUE_COUNT} earcon assets"))
+}
+
+fn cues() -> &'static Result<[Arc<[f32]>; CUE_COUNT], String> {
+    CUES.get_or_init(decode_all)
+}
+
+/// Decode every cue and keep it resident.
+///
+/// Call once when the audio pipeline starts. Without it the first cue pays the
+/// decode cost on the audio thread; nothing breaks, but it shows up as a late
+/// cue. A decode failure is logged here so it is visible before the first press
+/// rather than only when a cue is asked for.
+pub fn warm() {
+    if let Err(e) = cues() {
+        tracing::error!(error = %e, "earcon assets failed to decode; cues will be silent");
     }
 }
 
-/// Generate a sine wave tone with smooth 2 ms fade-in and fade-out to prevent clicks.
-fn generate_tone(freq_hz: f32, duration_ms: u32, volume: f32) -> Vec<f32> {
-    let total_samples = (duration_ms * SAMPLE_RATE / 1000) as usize;
-    let fade_samples = (2 * SAMPLE_RATE / 1000) as usize; // 2 ms ramp
-    let mut out = Vec::with_capacity(total_samples);
-
-    for i in 0..total_samples {
-        let env = if i < fade_samples {
-            i as f32 / fade_samples as f32
-        } else if i >= total_samples.saturating_sub(fade_samples) {
-            (total_samples - 1 - i) as f32 / fade_samples as f32
-        } else {
-            1.0
-        };
-
-        let t = i as f32 / SAMPLE_RATE as f32;
-        let s = (2.0 * PI * freq_hz * t).sin() * volume * env;
-        out.push(s);
+/// Samples for `kind`: 48 kHz mono f32, ready to mix.
+///
+/// The `Arc` is a pointer copy — the samples themselves are decoded once. An
+/// empty buffer means the assets failed to decode (already logged by [`warm`]);
+/// the caller mixes silence rather than panicking on the audio thread.
+#[must_use]
+pub fn cue(kind: EarconKind) -> Arc<[f32]> {
+    match cues() {
+        Ok(bank) => Arc::clone(&bank[kind as usize]),
+        Err(_) => Arc::from(Vec::<f32>::new().into_boxed_slice()),
     }
-
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ALL: [EarconKind; CUE_COUNT] = [
+        EarconKind::MuteOn,
+        EarconKind::Unmute,
+        EarconKind::Deafen,
+        EarconKind::Undeafen,
+        EarconKind::PeerJoin,
+        EarconKind::PeerLeave,
+    ];
+
     #[test]
-    fn test_mute_on_earcon() {
-        let samples = synthesize_earcon(EarconKind::MuteOn);
-        assert_eq!(samples.len(), (20 * SAMPLE_RATE / 1000) as usize);
-        assert!(samples.iter().any(|&s| s.abs() > 0.05));
+    fn cue_labels_match_enum_order() {
+        // The enum is used as an index into CUE_BYTES, so a reorder on one side
+        // and not the other silently swaps two sounds. This pins the pairing.
+        let expected = [
+            "mute.wav",
+            "unmute.wav",
+            "deafen.wav",
+            "undeafen.wav",
+            "join.wav",
+            "leave.wav",
+        ];
+        for (i, (label, _)) in CUE_BYTES.iter().enumerate() {
+            assert_eq!(*label, expected[i], "CUE_BYTES index {i}");
+        }
+        assert_eq!(EarconKind::MuteOn as usize, 0);
+        assert_eq!(EarconKind::Unmute as usize, 1);
+        assert_eq!(EarconKind::Deafen as usize, 2);
+        assert_eq!(EarconKind::Undeafen as usize, 3);
+        assert_eq!(EarconKind::PeerJoin as usize, 4);
+        assert_eq!(EarconKind::PeerLeave as usize, 5);
     }
 
     #[test]
-    fn test_mute_off_earcon() {
-        let samples = synthesize_earcon(EarconKind::MuteOff);
-        assert_eq!(samples.len(), (20 * SAMPLE_RATE / 1000) as usize);
-        assert!(samples.iter().any(|&s| s.abs() > 0.05));
+    fn every_cue_decodes_to_audio_at_48k() {
+        for kind in ALL {
+            let c = cue(kind);
+            assert!(!c.is_empty(), "{kind:?} decoded to nothing");
+            // Source is ~0.43-0.45 s; 44.1 k -> 48 k grows the count by ~8.8 %.
+            let secs = c.len() as f32 / 48_000.0;
+            assert!((0.40..0.50).contains(&secs), "{kind:?} is {secs:.3}s");
+            let peak = c.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(peak > 0.05, "{kind:?} is effectively silent (peak {peak})");
+        }
     }
 
     #[test]
-    fn test_deafen_earcon() {
-        let samples = synthesize_earcon(EarconKind::Deafen);
-        let expected_len = (45 * SAMPLE_RATE / 1000) as usize;
-        assert_eq!(samples.len(), expected_len);
+    fn the_six_cues_are_pairwise_distinct() {
+        // Catches a copy-paste in CUE_BYTES that would make two events sound
+        // identical — the one failure the mute/unmute and deafen/undeafen pairs
+        // exist to prevent. `Arc<[f32]>`'s PartialEq compares contents, so this
+        // is a real audio comparison and not pointer identity. `assert!` rather
+        // than `assert_ne!` so a failure does not dump 20 000 floats.
+        for (i, a) in ALL.iter().enumerate() {
+            for b in ALL.iter().skip(i + 1) {
+                assert!(cue(*a) != cue(*b), "{a:?} and {b:?} are the same audio");
+            }
+        }
+    }
+
+    #[test]
+    fn cues_are_cached_not_redecoded() {
+        // Same buffer, not an equal copy: proves the OnceLock is actually
+        // caching rather than decoding per call.
+        assert!(Arc::ptr_eq(&cue(EarconKind::MuteOn), &cue(EarconKind::MuteOn)));
     }
 }
