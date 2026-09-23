@@ -230,7 +230,7 @@ export default function App() {
       setStatusMsg({ text: `Connected to room #${ev.payload.code}.` });
     }).then((u) => unlistens.push(u));
 
-    listen<{ name: string; uuid?: string }>("peer_connected", (ev) => {
+    listen<{ name: string; uuid?: string; arrived?: boolean }>("peer_connected", (ev) => {
       const uuid = ev.payload.uuid || ev.payload.name;
       setPeers((prev) => {
         const rest = prev.filter((p) => p.uuid !== uuid);
@@ -248,7 +248,13 @@ export default function App() {
           },
         ].sort((a, b) => a.uuid.localeCompare(b.uuid));
       });
-      setStatusMsg({ text: `${ev.payload.name} joined the call.` });
+      // `arrived === false` means the roster is telling us who is *already*
+      // here — the peers listed when we join a populated room, or a peer
+      // renaming themselves. The peer belongs in the list either way, but
+      // saying they "joined the call" would be a claim the app cannot support.
+      if (ev.payload.arrived !== false) {
+        setStatusMsg({ text: `${ev.payload.name} joined the call.` });
+      }
     }).then((u) => unlistens.push(u));
 
     listen<{ reason: string; peer_id?: string | null }>("peer_disconnected", (ev) => {

@@ -1290,11 +1290,22 @@ pub fn run() {
                                 RoomEvent::RoomJoined { code } => {
                                     let _ = fwd_app.emit("room_joined", serde_json::json!({ "code": code }));
                                 }
-                                RoomEvent::PeerConnected { name, uuid } => {
-                                    play_cue(&fwd_app, verio_app::EarconKind::PeerJoin);
+                                RoomEvent::PeerConnected { name, uuid, arrived } => {
+                                    // Only a genuine arrival is audible. The
+                                    // roster adopted when we join a populated room
+                                    // and a peer renaming themselves both arrive
+                                    // here with `arrived: false` — the roster
+                                    // still needs them, the cue does not.
+                                    if arrived {
+                                        play_cue(&fwd_app, verio_app::EarconKind::PeerJoin);
+                                    }
                                     let _ = fwd_app.emit(
                                         "peer_connected",
-                                        serde_json::json!({ "name": name, "uuid": uuid }),
+                                        serde_json::json!({
+                                            "name": name,
+                                            "uuid": uuid,
+                                            "arrived": arrived,
+                                        }),
                                     );
                                 }
                                 RoomEvent::PeerDisconnected { reason, peer_id } => {

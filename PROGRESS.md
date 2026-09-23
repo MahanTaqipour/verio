@@ -4359,3 +4359,69 @@ listening test.
 - **`sounds/` no longer exists**, so that open item from Session 25 is closed by relocation rather
   than by a decision.
 
+---
+
+## Session 27b (2026-09-23) — the join/leave cue was wired to the wrong event
+
+Requested behaviour, verbatim: *"when another user join the call the join sound should play and when
+user leaves the leave sound should play so everyone should notice when user leaves or joins."*
+
+The files decoded, the bank was embedded, and the cue fired — so a naive check ("does a cue play?")
+passed. The defect was in **which** event triggered it. Traced end to end and found **four**, all one
+root cause: the cue was tied to *transport teardown* and *roster insertion* rather than to a genuine
+arrival.
+
+1. **Joining a populated room played one cue per person already there.** `room.rs` looped
+   `session.initial_peers()` calling `add_peer`, and `add_peer` emitted `PeerConnected`. The relay is
+   correct — `ClientMessage::Join` broadcasts `PeerJoined` to *existing* peers only and sends the
+   joiner a `Joined` roster — so the joiner's own client was reading the roster as arrivals.
+2. **Two duplicate emits.** `activate_direct_p2p` and `activate_relay_session` each called
+   `m.add_peer(remote.clone())` (which already emits) and *then* emitted `PeerConnected` by hand.
+3. **A rename played a join cue.** The Hello handler emitted `PeerConnected` on the `renamed` branch.
+4. **You heard the leave cue when *you* left your own call.** The transport `Disconnected` arm
+   emitted `PeerDisconnected { peer_id: Some(remote.uuid) }` unconditionally — that peer is the
+   session's remote, not you. Both `RoomManager::disconnect()` (user Leave) and `remove_peer` (last
+   peer leaving) already call `teardown_session` + `set_state(Idle)` *before* the transport winds
+   down, so the last peer's departure also produced a **double** leave cue.
+
+Net before the fix: joining an N-person room fired up to **N+2** join cues, and the one person who
+actually joined heard nothing of their own arrival.
+
+### The fix, and the constraint that shaped it
+
+The obvious move — suppress `PeerConnected` for adopted peers — is **wrong**: the frontend builds its
+peer roster *from that event*, so suppressing it would make everyone already in the room invisible.
+Measured before choosing.
+
+Instead `RoomEvent::PeerConnected` gained `arrived: bool`. `add_peer(peer)` → `upsert_peer(peer,
+true)`, new `adopt_peer(peer)` → `upsert_peer(peer, false)`, and the shared body emits when
+`is_new || !arrived`, so **every peer that reaches the roster is announced exactly once** whatever
+route it took. Cues gate on `arrived` in `ui/src-tauri/src/lib.rs`; the frontend gates only the
+status *message* on `arrived !== false` (the peer still joins the list either way).
+
+- Join-time roster adoption → `adopt_peer`, with a comment naming the symptom.
+- Both duplicate emits removed (the relay-session one carries the explanation).
+- Rename → `adopt_peer` when the peer was already known, `add_peer` only when `is_new`.
+- Transport `Disconnected` arm guarded by `was_active = !matches!(m.state, RoomState::Idle)`.
+- `mock/invoke.ts` `addRandomPeer()` now sends `arrived: true`; scenario rosters are seeded into
+  `state.room.peers` directly and emit nothing, which matches real behaviour.
+
+### Verification
+
+- `cargo test -p verio-app --lib` → **27 passed, 0 failed** (was 22; five new in `room.rs`:
+  `adopting_the_roster_at_join_time_is_not_an_arrival`, `a_peer_who_actually_joins_is_an_arrival`,
+  `re_adding_a_known_peer_does_not_re_announce`,
+  `a_rename_updates_the_roster_without_announcing_an_arrival`,
+  `every_peer_that_reaches_the_roster_is_announced_once`).
+- Mutation: flipping `adopt_peer` back to `upsert_peer(peer, true)` failed exactly the two predicted
+  tests, with the intended messages. Reverted byte-exact — `room.rs` hashes to
+  `83150c1824fe37bada35659baf64c79b66c999f2`.
+- `cargo check --workspace --all-targets` exit 0 · clippy `--all-targets -- -D warnings` exit 0 ·
+  `pnpm tsc --noEmit` exit 0.
+
+### Found but not fixed
+
+- **Still needs a human listening test** with two instances. The wiring and the decode are verified;
+  that the room *sounds* right is not something a test can assert here. Flagging rather than claiming.
+
+

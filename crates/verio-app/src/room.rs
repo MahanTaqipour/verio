@@ -53,7 +53,15 @@ pub enum RoomEvent {
     StateChanged { state: RoomState },
     RoomCreated { code: String },
     RoomJoined { code: String },
-    PeerConnected { name: String, uuid: String },
+    PeerConnected {
+        name: String,
+        uuid: String,
+        /// `true` only when this peer was not in the roster before — a genuine
+        /// arrival. `false` covers the roster adopted when we join a populated
+        /// room, and a peer renaming themselves: the roster changed, but nobody
+        /// arrived, so a consumer must not announce it.
+        arrived: bool,
+    },
     PeerDisconnected {
         reason: String,
         peer_id: Option<String>,
@@ -210,8 +218,29 @@ impl RoomManager {
         }
     }
 
-    /// Session 12: register a peer (from signalling or a relay hello) and tell the UI.
+    /// Session 12: a peer arrived (from signalling or a relay hello) — tell the UI.
     pub fn add_peer(&mut self, peer: Identity) {
+        self.upsert_peer(peer, true);
+    }
+
+    /// Session 27: put a peer in the roster **without** announcing an arrival.
+    ///
+    /// Two callers: the roster the server lists when we join a populated room,
+    /// and a peer whose display name changed. In both cases nobody joined —
+    /// either *we* did, or they were already here. Announcing these played one
+    /// join cue per person already present, so joining a six-person call greeted
+    /// you with six chimes while the one person who actually joined heard
+    /// nothing of their own arrival.
+    pub fn adopt_peer(&mut self, peer: Identity) {
+        self.upsert_peer(peer, false);
+    }
+
+    /// Shared body of [`add_peer`] / [`adopt_peer`].
+    ///
+    /// Every peer that reaches the roster is announced exactly once, so a
+    /// consumer that builds its peer list from these events never misses one.
+    /// `arrived` is what separates "someone joined" from "here is who is here".
+    fn upsert_peer(&mut self, peer: Identity, arrived: bool) {
         let uuid = peer.uuid.to_string();
         let is_new = !self.peers.contains_key(&uuid);
         self.peer_seen
@@ -226,10 +255,13 @@ impl RoomManager {
             music_title: String::new(),
         });
         entry.name = peer.name.clone();
-        if is_new {
+        // `!arrived` forces the event even for a peer we already know, because
+        // an adopt is the only thing that tells the UI about a rename.
+        if is_new || !arrived {
             self.emit(RoomEvent::PeerConnected {
-                name: peer.name.clone(),
+                name: peer.name,
                 uuid,
+                arrived,
             });
         }
     }
@@ -427,10 +459,6 @@ impl RoomManager {
             m.transport_mode = Some("direct_p2p".to_string());
             m.set_state(RoomState::Connected);
             m.emit(RoomEvent::TransportModeChanged { mode: "direct_p2p".to_string() });
-            m.emit(RoomEvent::PeerConnected {
-                name: remote.name.clone(),
-                uuid: remote.uuid.to_string(),
-            });
             *m.active.lock().expect("active lock") = Some(ActiveSession { handle });
         }
         spawn_transport_pump(Arc::clone(room), event_rx, remote);
@@ -467,10 +495,10 @@ impl RoomManager {
             m.transport_mode = Some(mode_label.to_string());
             m.set_state(RoomState::Connected);
             m.emit(RoomEvent::TransportModeChanged { mode: mode_label.to_string() });
-            m.emit(RoomEvent::PeerConnected {
-                name: remote.name.clone(),
-                uuid: remote.uuid.to_string(),
-            });
+            // `add_peer` above already announced this peer if it was new. A
+            // second `PeerConnected` here fired a duplicate join cue for the same
+            // peer on every relay call; a peer adopted from the server's roster
+            // was announced by that adopt, so nothing is lost by dropping it.
             *m.active.lock().expect("active lock") = Some(ActiveSession { handle });
         }
         spawn_transport_pump(Arc::clone(room), event_rx, remote);
@@ -691,9 +719,11 @@ impl RoomManager {
         // always resolves to the relay path (ICE/STUN gathering and the P2P
         // handshake are no longer reachable from the 4-digit room flow).
         // Session 12: adopt the peers the server already listed for this room.
+        // Session 27: `adopt_peer`, not `add_peer` — these peers did not join,
+        // *we* did, and announcing each of them played a join cue per head.
         for peer in session.initial_peers() {
             let mut m = room.lock().expect("room lock");
-            m.add_peer(peer);
+            m.adopt_peer(peer);
         }
 
         let effective_mode = crate::settings::TransportModeSetting::CloudRelay;
@@ -1057,22 +1087,24 @@ fn spawn_transport_pump(
                             .peers
                             .get(&uuid)
                             .is_some_and(|p| p.name != name);
-                        if is_new {
-                            m.add_peer(Identity {
+                        if is_new || renamed {
+                            let identity = Identity {
                                 uuid: verio_discovery::Uuid::parse_str(&uuid).unwrap_or_else(|_| {
                                     verio_discovery::Uuid::nil()
                                 }),
-                                name: name.clone(),
-                                version: String::new(),
-                            });
-                        } else if renamed {
-                            if let Some(p) = m.peers.get_mut(&uuid) {
-                                p.name = name.clone();
-                            }
-                            m.emit(RoomEvent::PeerConnected {
                                 name,
-                                uuid,
-                            });
+                                version: String::new(),
+                            };
+                            if is_new {
+                                m.add_peer(identity);
+                            } else {
+                                // A rename is a roster update, not an arrival.
+                                // `adopt_peer` refreshes the name and tells the
+                                // UI; emitting `PeerConnected` by hand here used
+                                // to play a join cue every time a peer renamed
+                                // themselves.
+                                m.adopt_peer(identity);
+                            }
                         }
                     }
                     TransportEvent::Rtt { ms } => {
@@ -1091,12 +1123,21 @@ fn spawn_transport_pump(
                     }
                     TransportEvent::Disconnected { reason } => {
                         let mut m = room.lock().expect("room lock");
+                        // Only report a departure if this teardown is what ended
+                        // the call. Both `disconnect()` (the user pressing Leave)
+                        // and `remove_peer` (the last peer leaving) idle the room
+                        // *before* the transport winds down, so without this guard
+                        // the leave cue played when you left your own call, and
+                        // twice for the last peer's already-reported departure.
+                        let was_active = !matches!(m.state, RoomState::Idle);
                         m.teardown_session(&reason);
                         m.set_state(RoomState::Idle);
-                        m.emit(RoomEvent::PeerDisconnected {
-                            reason,
-                            peer_id: Some(peer_id.clone()),
-                        });
+                        if was_active {
+                            m.emit(RoomEvent::PeerDisconnected {
+                                reason,
+                                peer_id: Some(peer_id.clone()),
+                            });
+                        }
                         break;
                     }
                 }
@@ -1121,6 +1162,109 @@ fn encode_silence_frame() -> Vec<u8> {
             tracing::error!("silence frame generation failed: {e}");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(name: &str, n: u128) -> Identity {
+        Identity {
+            uuid: verio_discovery::Uuid::from_u128(n),
+            name: name.to_string(),
+            version: String::new(),
+        }
+    }
+
+    fn manager() -> (RoomManager, mpsc::Receiver<RoomEvent>) {
+        let (tx, rx) = mpsc::channel();
+        (RoomManager::new(identity("self", 999), tx), rx)
+    }
+
+    /// `(name, arrived)` for every roster event drained so far.
+    fn peer_events(rx: &mpsc::Receiver<RoomEvent>) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerConnected { name, arrived, .. } = ev {
+                out.push((name, arrived));
+            }
+        }
+        out
+    }
+
+    // -- Session 27: which roster changes are *arrivals* ----------------------
+    //
+    // `arrived` is what the shell keys the join cue off, so each of these is
+    // audible. Before this, joining a populated room played one cue per person
+    // already in it, plus a duplicate for the transport's remote peer.
+
+    #[test]
+    fn adopting_the_roster_at_join_time_is_not_an_arrival() {
+        let (mut m, rx) = manager();
+        for (i, name) in ["Ada", "Bo", "Cy"].iter().enumerate() {
+            m.adopt_peer(identity(name, i as u128 + 1));
+        }
+        let events = peer_events(&rx);
+        assert_eq!(events.len(), 3, "the roster must still reach the UI");
+        assert!(
+            events.iter().all(|(_, arrived)| !arrived),
+            "adopted peers must not be announced as arrivals: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_who_actually_joins_is_an_arrival() {
+        let (mut m, rx) = manager();
+        m.adopt_peer(identity("Ada", 1));
+        let _ = peer_events(&rx); // discard the adopt
+        m.add_peer(identity("Bo", 2));
+        assert_eq!(peer_events(&rx), vec![("Bo".to_string(), true)]);
+    }
+
+    #[test]
+    fn re_adding_a_known_peer_does_not_re_announce() {
+        let (mut m, rx) = manager();
+        m.add_peer(identity("Ada", 1));
+        let _ = peer_events(&rx);
+        m.add_peer(identity("Ada", 1));
+        assert!(
+            peer_events(&rx).is_empty(),
+            "a repeat add must not fire a second join cue"
+        );
+    }
+
+    #[test]
+    fn a_rename_updates_the_roster_without_announcing_an_arrival() {
+        let (mut m, rx) = manager();
+        m.add_peer(identity("Ada", 1));
+        let _ = peer_events(&rx);
+        m.adopt_peer(identity("Ada Lovelace", 1));
+        assert_eq!(
+            peer_events(&rx),
+            vec![("Ada Lovelace".to_string(), false)],
+            "the UI needs the new name, but nobody arrived"
+        );
+        let uuid = verio_discovery::Uuid::from_u128(1).to_string();
+        assert_eq!(
+            m.peers.get(&uuid).map(|p| p.name.as_str()),
+            Some("Ada Lovelace")
+        );
+    }
+
+    #[test]
+    fn every_peer_that_reaches_the_roster_is_announced_once() {
+        // The frontend builds its peer list from these events, so a peer in the
+        // roster that was never announced would be invisible in the call — which
+        // is the trap in "just stop emitting for adopted peers".
+        let (mut m, rx) = manager();
+        m.adopt_peer(identity("Ada", 1)); // pre-existing when we joined
+        m.add_peer(identity("Bo", 2)); // arrives after us
+        m.add_peer(identity("Bo", 2)); // repeat — must stay silent
+        m.adopt_peer(identity("Cy", 3)); // later roster refresh
+        let announced: Vec<String> = peer_events(&rx).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(announced, vec!["Ada", "Bo", "Cy"]);
+        assert_eq!(m.peers.len(), 3);
     }
 }
 

@@ -685,7 +685,12 @@ export function installMockTransport(scenarioId: string): MockTransport {
         music: false,
         music_title: "",
       });
-      void emit("peer_connected", { name, uuid });
+      // `arrived: true` because this control simulates a peer actually joining,
+      // which is the only thing that should announce itself or play a cue. The
+      // scenario rosters are seeded into `state.room.peers` directly and emit
+      // nothing, which is what the real app does for the peers already present
+      // when you join.
+      void emit("peer_connected", { name, uuid, arrived: true });
     },
     removeLastPeer() {
       const last = state.room.peers.pop();
