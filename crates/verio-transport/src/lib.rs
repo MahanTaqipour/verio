@@ -193,6 +193,30 @@ pub enum ControlMessage {
         /// still understood, just not addressable by id.
         #[serde(default)]
         user_id: String,
+        /// Session 29b: this session is a music bot, so it renders distinctly —
+        /// its own tile treatment and a Stop control.
+        ///
+        /// Carried here rather than in the join message on purpose. The join
+        /// message goes to the signalling server, whose `PeerIdentity` has no such
+        /// field and would have to be changed *and redeployed* to echo it back;
+        /// `Hello` rides the relay straight to the clients that render it, and the
+        /// roster already re-sends it every few seconds so a late joiner learns it
+        /// too. `#[serde(default)]` so a peer that predates the field reads as a
+        /// person, which is what it is.
+        #[serde(default)]
+        is_bot: bool,
+        /// Session 29b: may another peer stop this bot session?
+        ///
+        /// Carried beside `is_bot` because the two are read together — a client
+        /// offers a Stop control only on a peer that is a bot *and* accepts one.
+        /// Fixed when the bot joins, so unlike a mute there is no update to
+        /// broadcast and no second message to invent.
+        ///
+        /// `#[serde(default)]` so a peer that predates the field reads as "no
+        /// remote stop", which is the fail-closed direction: the worst outcome is a
+        /// control that is not offered, never one that is offered and ignored.
+        #[serde(default)]
+        force_stop: bool,
     },
     State {
         speaking: bool,
@@ -216,6 +240,14 @@ pub enum ControlMessage {
         target_user_id: String,
         muted: bool,
     },
+    /// Session 29b: stop the music bot for the whole room.
+    ///
+    /// Sent by any peer while the host has Force Stop on; the host's client is the
+    /// only one that acts on it, because it owns the bot session. Carries no
+    /// payload: like `MuteUser`, the actor comes from the transport envelope the
+    /// relay stamps, so the message neither repeats it nor gets to lie about it.
+    /// A stop is an event rather than state, so it cannot be folded into `State`.
+    MusicStop,
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1230,8 @@ impl Driver {
                             name: self.identity.name.clone(),
                             version: self.identity.version.clone(),
                             user_id: self.identity.user_id.clone(),
+                            is_bot: self.identity.is_bot,
+                            force_stop: self.identity.force_stop,
                         });
                     }
                     other => tracing::debug!(label = other, "unexpected channel open"),
@@ -1531,6 +1565,14 @@ pub fn spawn_relay_session_with_candidates(
         name: local_identity.name.clone(),
         version: local_identity.version.clone(),
         user_id: local_identity.user_id.clone(),
+        // Session 29b: the bot's declaration rides this frame. It is the only
+        // `Hello` a bot session ever sends, so the flag has to be on it.
+        is_bot: local_identity.is_bot,
+        // And this is the frame that makes the value correct from the very first
+        // packet a peer sees. The periodic announcement repeats it, but a peer who
+        // joined between two announcements would otherwise read the default and
+        // render a Stop control that the bot would refuse.
+        force_stop: local_identity.force_stop,
     };
     if let Ok(json) = serde_json::to_string(&hello) {
         let mut pkt = Vec::with_capacity(21 + json.len());
@@ -1872,6 +1914,8 @@ mod tests {
             name: "Alice".into(),
             version: "0.1.0".into(),
             user_id: "user-alice".into(),
+            is_bot: false,
+            force_stop: false,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
@@ -1881,6 +1925,99 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ControlMessage>(&json).expect("parse"),
             msg
+        );
+    }
+
+    /// Session 29b: a bot has to be *declared*, because nothing about a peer's
+    /// name or ids distinguishes it from a person. If this flag did not survive
+    /// the trip, the Music peer would render as an ordinary participant and the
+    /// Stop control would never appear.
+    #[test]
+    fn hello_carries_the_bot_declaration() {
+        let bot = ControlMessage::Hello {
+            name: "Music".into(),
+            version: "0.1.0".into(),
+            user_id: "user-alice".into(),
+            is_bot: true,
+            force_stop: true,
+        };
+        let json = serde_json::to_string(&bot).expect("serialize");
+        assert!(json.contains(r#""is_bot":true"#), "flag missing: {json}");
+        // Session 29b Force Stop: the host's decision travels beside the bot
+        // declaration, because a listener needs both before it can know whether to
+        // offer a Stop control at all.
+        assert!(
+            json.contains(r#""force_stop":true"#),
+            "the force-stop decision must reach the room: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&json).expect("parse"),
+            bot
+        );
+
+        // And the two are distinguishable, which is the whole point: the host's
+        // voice session and their bot session share a `user_id`.
+        let person = ControlMessage::Hello {
+            name: "Music".into(),
+            version: "0.1.0".into(),
+            user_id: "user-alice".into(),
+            is_bot: false,
+            force_stop: false,
+        };
+        assert_ne!(
+            serde_json::to_string(&person).unwrap(),
+            json,
+            "a bot and a person must not serialize identically"
+        );
+
+        // Force-stop off must differ from force-stop on, or the setting would be a
+        // control that changes nothing on the wire — which is the exact failure the
+        // rest of this feature is built to avoid.
+        let refuses = ControlMessage::Hello {
+            name: "Music".into(),
+            version: "0.1.0".into(),
+            user_id: "user-alice".into(),
+            is_bot: true,
+            force_stop: false,
+        };
+        assert_ne!(
+            serde_json::to_string(&refuses).unwrap(),
+            json,
+            "a bot that accepts a remote stop and one that refuses it must differ on the wire"
+        );
+    }
+
+    /// A peer built before Session 29b sends neither flag. Absent `is_bot` means
+    /// "person" — defaulting it to `true` would dress every older peer up as a music
+    /// bot — and absent `force_stop` means "no remote stop", which is the fail-closed
+    /// direction: a control that is not offered, never one that is offered and then
+    /// silently ignored.
+    #[test]
+    fn hello_without_the_bot_flags_reads_as_an_ordinary_peer() {
+        let json = r#"{"type":"hello","name":"Old","version":"0.1.0","user_id":"user-old"}"#;
+        match serde_json::from_str::<ControlMessage>(json).expect("parse") {
+            ControlMessage::Hello {
+                is_bot, force_stop, ..
+            } => {
+                assert!(!is_bot, "a missing is_bot must default to false, not to a bot");
+                assert!(
+                    !force_stop,
+                    "a missing force_stop must default to false, not to a bot a stranger may stop"
+                );
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    /// A stop is an event, not state: it must not be confusable with `State`,
+    /// whose `music` field describes whether music *is* playing.
+    #[test]
+    fn music_stop_is_distinguishable_on_the_wire() {
+        let json = serde_json::to_string(&ControlMessage::MusicStop).expect("serialize");
+        assert!(json.contains(r#""type":"music_stop""#), "tag missing: {json}");
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&json).expect("parse"),
+            ControlMessage::MusicStop
         );
     }
 
@@ -1944,6 +2081,8 @@ mod tests {
                 name: "Mahan".into(),
                 version: "0.1.0".into(),
                 user_id: "user-mahan".into(),
+                is_bot: false,
+                force_stop: false,
             },
             ControlMessage::State {
                 speaking: true,
@@ -1965,6 +2104,10 @@ mod tests {
                 target_user_id: "user-bob".into(),
                 muted: false,
             },
+            // Session 29b: a unit variant, so the only thing that can go wrong is
+            // the tag — and a tag that failed to round-trip would make Stop a
+            // no-op that looked like it had been sent.
+            ControlMessage::MusicStop,
         ] {
             let json = serde_json::to_string(&msg).expect("serialize");
             let back: ControlMessage = serde_json::from_str(&json).expect("deserialize");
@@ -2050,12 +2193,16 @@ mod tests {
         let id_a = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(1),
             user_id: "user-alice".into(),
+            is_bot: false,
+            force_stop: false,
             name: "Alice".into(),
             version: "0.1.0".into(),
         };
         let id_b = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(2),
             user_id: "user-bob".into(),
+            is_bot: false,
+            force_stop: false,
             name: "Bob".into(),
             version: "0.1.0".into(),
         };
@@ -2102,12 +2249,16 @@ mod tests {
         let id_a = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(10),
             user_id: "user-host".into(),
+            is_bot: false,
+            force_stop: false,
             name: "HostUser".into(),
             version: "0.1.0".into(),
         };
         let id_b = verio_discovery::Identity {
             uuid: verio_discovery::Uuid::from_u128(20),
             user_id: "user-guest".into(),
+            is_bot: false,
+            force_stop: false,
             name: "GuestUser".into(),
             version: "0.1.0".into(),
         };

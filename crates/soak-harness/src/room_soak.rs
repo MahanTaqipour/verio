@@ -94,12 +94,20 @@ fn main() {
     let id_a = Identity {
         uuid: uuid::Uuid::from_u128(0xA000_0000_0000_0000_0000_0000_0000_0001),
         user_id: "user-instance-a".into(),
+        is_bot: false,
+        // Session 29b: the soak has no music bot, so neither instance ever accepts
+        // a remote stop.
+        force_stop: false,
         name: "InstanceA".into(),
         version: verio_app::APP_VERSION.into(),
     };
     let id_b = Identity {
         uuid: uuid::Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0002),
         user_id: "user-instance-b".into(),
+        is_bot: false,
+        // Session 29b: the soak has no music bot, so neither instance ever accepts
+        // a remote stop.
+        force_stop: false,
         name: "InstanceB".into(),
         version: verio_app::APP_VERSION.into(),
     };
@@ -312,7 +320,15 @@ fn spawn_event_collector(
                 RoomEvent::Error { message } => {
                     errors.lock().unwrap().push(format!("[{side}] {message}"))
                 }
-                RoomEvent::PeerDisconnected { reason, peer_id: _ } => {
+                RoomEvent::PeerDisconnected {
+                    reason,
+                    peer_id: _,
+                    // Session 29b: the soak has no music bot, so this is always a
+                    // person. Named rather than ignored with `..` so adding a field
+                    // to this event forces a decision here instead of silently
+                    // defaulting.
+                    is_bot: _,
+                } => {
                     errors
                         .lock()
                         .unwrap()
@@ -326,7 +342,11 @@ fn spawn_event_collector(
                 RoomEvent::RoomCreated { .. }
                 | RoomEvent::RoomJoined { .. }
                 | RoomEvent::TransportModeChanged { .. }
-                | RoomEvent::PeerMuted { .. } => {}
+                | RoomEvent::PeerMuted { .. }
+                // Session 29b: the soak has no music bot, so no stop is ever
+                // requested. Named rather than waved through for the same reason as
+                // the mute above.
+                | RoomEvent::MusicStopRequested { .. } => {}
             }
         }
     });

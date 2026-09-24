@@ -108,6 +108,70 @@ struct Bridge {
     _log_guard: WorkerGuard,
     /// Session 13: music bus (shared with the audio pipeline).
     music: std::sync::Arc<verio_app::pipeline::MusicSource>,
+    /// Session 29b: the running music-bot session, if this client is hosting.
+    ///
+    /// `None` is IDLE and `Some` is HOSTING — the whole host state machine, with no
+    /// second flag to fall out of step with it.
+    bot: std::sync::Arc<Mutex<Option<verio_app::music_bot::MusicBot>>>,
+    /// Session 29b: where the bot pushes the host's own copy of the music.
+    ///
+    /// A slot rather than a sender because a pipeline restart replaces the mixer's
+    /// monitor channel — the same reason the room takes its mute gate as a sink.
+    /// Without this, changing the output device while hosting would silently end
+    /// the host's local monitor.
+    bot_monitor: std::sync::Arc<
+        Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
+    >,
+}
+
+/// Session 29b: whether this client is hosting the music bot.
+#[derive(Debug, Serialize, Clone)]
+struct BotState {
+    hosting: bool,
+    /// The bot session's id. `None` when idle.
+    session_id: Option<String>,
+    /// The person this bot belongs to. Equal to our own nickname when we host.
+    host_name: Option<String>,
+}
+
+/// Session 29b: the state the UI needs to draw Play/Stop and the host badge.
+fn bot_state(bridge: &Bridge) -> BotState {
+    let guard = bridge.bot.lock().expect("bot lock");
+    match guard.as_ref() {
+        Some(bot) => BotState {
+            hosting: true,
+            session_id: Some(bot.session_id().to_string()),
+            host_name: Some(bridge.settings.get().nickname),
+        },
+        None => BotState {
+            hosting: false,
+            session_id: None,
+            host_name: None,
+        },
+    }
+}
+
+fn emit_bot_state(app: &AppHandle, bridge: &Bridge) {
+    if let Err(e) = app.emit("music_bot_changed", bot_state(bridge)) {
+        tracing::error!("emit music_bot_changed failed: {e}");
+    }
+}
+
+/// Session 29b: end the bot session and give the music bus back to the pipeline.
+///
+/// Idempotent, because four different things end a session: the host's Stop, the
+/// queue running out, another peer's stop request, and the host leaving the room.
+fn stop_bot(app: &AppHandle, bridge: &Bridge) {
+    let bot = bridge.bot.lock().expect("bot lock").take();
+    if let Some(bot) = bot {
+        tracing::info!(session = %bot.session_id(), "music bot: stopping");
+        bot.stop();
+    }
+    // Handed back unconditionally: leaving the bus owned by a bot that no longer
+    // exists would leave the voice session deaf to its own music player, and the
+    // player would look broken with no error anywhere.
+    bridge.music.set_bot_owned(false);
+    emit_bot_state(app, bridge);
 }
 
 /// Snapshot of mute/deafen/PTT/speaking state for the UI.
@@ -204,6 +268,12 @@ fn restart_pipeline(app: &AppHandle, bridge: &Bridge) {
                 // the room takes a sink rather than holding a `PipelineHandle`: the
                 // room is built first, before any pipeline does.
                 room.set_mute_sink(handle.peer_mutes_handle());
+                // Session 29b: a restart builds a new mixer, and therefore a new
+                // monitor channel. Re-point the bot's slot at it, or changing the
+                // output device while hosting would silently end the host's own
+                // copy of the music — audible, but with nothing anywhere saying why.
+                *bridge.bot_monitor.lock().expect("bot monitor lock") =
+                    Some(handle.music_monitor_handle());
                 *guard = Some(handle);
             }
             Err(e) => {
@@ -519,6 +589,167 @@ fn music_set_monitor(on: bool, app: AppHandle, bridge: State<Bridge>) {
     emit_music_status(&app, &bridge);
 }
 
+/// Session 29b Force Stop: may other peers stop the music this user hosts?
+///
+/// A *setting*, not a live control. It is read at the moment the bot is spawned —
+/// the plan's "applied each time the user becomes host" — so changing it while
+/// hosting affects the next session, never the running one. That is deliberate: the
+/// value is announced to the room when the bot joins, so a bot that changed its mind
+/// mid-session would be refusing a stop it had told every peer it would accept.
+///
+/// Nothing is emitted. The switch that drives this belongs to the same client, so it
+/// already knows; and the room is deliberately not told until the next bot joins.
+#[tauri::command]
+fn set_music_force_stop(enabled: bool, bridge: State<Bridge>) {
+    bridge.settings.update(|s| s.music_force_stop = enabled);
+}
+
+/// Session 29b Force Stop: ask this room's music host to stop.
+///
+/// A listener's control. Whether the request is honoured is deliberately *not*
+/// decided here: the host's bot refuses the frame outright when the host disabled
+/// Force Stop, and the host is the only client that owns a bot. So this reports only
+/// that the request left, which is all this client can honestly claim — the music
+/// stopping is something the roster will show, not something this call can promise.
+#[tauri::command]
+fn request_music_stop(bridge: State<Bridge>) -> Result<(), String> {
+    bridge.room.lock().expect("room lock").request_music_stop()
+}
+
+// ---------------------------------------------------------------------------
+// Session 29b: the music bot session
+// ---------------------------------------------------------------------------
+
+/// A peer already hosting music in this room, if any.
+///
+/// Read from the roster rather than remembered locally, because the host may be
+/// somebody else entirely: this client only knows that a bot is in the room, which
+/// is exactly what it needs to refuse a second one.
+fn room_bot_peer(room: &verio_app::room::RoomManager) -> Option<verio_app::room::PeerInfo> {
+    room.peers().into_iter().find(|p| p.is_bot)
+}
+
+#[tauri::command]
+fn music_bot_state(bridge: State<Bridge>) -> BotState {
+    bot_state(&bridge)
+}
+
+/// Start hosting: open a second session, join the room as "Music", and route the
+/// local music bus through it.
+#[tauri::command]
+fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
+    // Everything read from the room in one lock, so the room cannot change between
+    // the checks and the start.
+    let (room_code, host_user_id, host_name, existing_bot) = {
+        let room = bridge.room.lock().expect("room lock");
+        if !matches!(room.state(), verio_app::room::RoomState::Connected) {
+            return Err("Join a room before playing music into it.".into());
+        }
+        let code = room
+            .room_code()
+            .ok_or("This room has no code yet.")?
+            .to_string();
+        let identity = room.identity();
+        (
+            code,
+            identity.user_id.clone(),
+            identity.name.clone(),
+            room_bot_peer(&room),
+        )
+    };
+
+    // One bot per room. The distinction matters to the message: if the bot in the
+    // roster is *ours*, the user needs telling they are already hosting; if it is
+    // somebody else's, telling them to press play again would be wrong.
+    if let Some(bot) = existing_bot {
+        let mine = !host_user_id.is_empty() && bot.user_id == host_user_id;
+        return Err(if mine {
+            "You are already hosting the music for this room.".into()
+        } else {
+            "Music is already playing in this room.".to_string()
+        });
+    }
+
+    if !bridge.music.is_active() {
+        return Err("Press play before sending music to the room.".into());
+    }
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let settings = bridge.settings.get();
+    // Session 29b Force Stop: read here, at the moment the user becomes host, and
+    // fixed for the session. It travels inside `BotConfig` to both the announcement
+    // and the enforcement, so the room is told exactly what will be enforced — and
+    // toggling the setting later changes the *next* bot, never this one.
+    let force_stop = settings.music_force_stop;
+    let bot = verio_app::music_bot::start(verio_app::music_bot::BotConfig {
+        vps_addr: settings.vps_address,
+        room_code,
+        host_user_id,
+        host_name,
+        force_stop,
+        music: Arc::clone(&bridge.music),
+        controls: Arc::clone(&bridge.controls),
+        tx_state: Arc::clone(&bridge.tx),
+        monitor_tx: Arc::clone(&bridge.bot_monitor),
+        events: events_tx,
+    })?;
+
+    // Hand the bus over *after* a successful start: the voice pipeline must stop
+    // pulling it, or both consumers would interleave half-chunks and double-advance
+    // the queue.
+    bridge.music.set_bot_owned(true);
+    *bridge.bot.lock().expect("bot lock") = Some(bot);
+    emit_bot_state(&app, &bridge);
+
+    // Watch for the session ending by itself. Without this the app would keep
+    // believing it was hosting after the queue ran out, and the UI would show a
+    // Stop button for a session that no longer exists.
+    let bot_slot = Arc::clone(&bridge.bot);
+    let music = Arc::clone(&bridge.music);
+    let watcher_app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("verio-bot-watch".into())
+        .spawn(move || {
+            // A wait, not a loop. `BotEvent` has one variant and acting on it ends
+            // the session, so every path through the body left — clippy's
+            // `never_loop` caught the `while` for claiming otherwise.
+            let Ok(ev) = events_rx.recv() else {
+                // The senders are gone, so the bot's threads have already ended. The
+                // only path that ends them without an event is a Stop this client
+                // asked for, and that has already cleared the slot and handed the
+                // music bus back — so there is nothing to do.
+                //
+                // Deliberately *not* clearing `bot_owned` here: if the user had
+                // started a new bot in the meantime, this stale watcher would take
+                // the bus away from it.
+                tracing::debug!("music bot: watcher exiting with no event");
+                return;
+            };
+            let verio_app::music_bot::BotEvent::Stopped { reason } = ev;
+            let taken = bot_slot.lock().expect("bot lock").take();
+            if let Some(bot) = taken {
+                bot.stop();
+            }
+            music.set_bot_owned(false);
+            let bridge = tauri::Manager::state::<Bridge>(&watcher_app);
+            emit_bot_state(&watcher_app, &bridge);
+            let _ = watcher_app.emit(
+                "music_bot_ended",
+                serde_json::json!({ "reason": reason }),
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::error!("spawn music bot watcher failed: {e}");
+    }
+    Ok(())
+}
+
+/// Stop hosting. Safe to call when not hosting.
+#[tauri::command]
+fn music_bot_stop(app: AppHandle, bridge: State<Bridge>) {
+    stop_bot(&app, &bridge);
+}
+
 /// Native picker, starting in the folder used last time.
 #[tauri::command]
 fn music_pick_file(bridge: State<Bridge>) -> Option<String> {
@@ -679,6 +910,24 @@ fn play_cue(app: &tauri::AppHandle, kind: verio_app::EarconKind) {
     }
 }
 
+/// Session 29b: the music presence the **voice** peer should announce.
+///
+/// While a bot session owns the bus, the voice peer is no longer the one injecting
+/// music — the Music peer is, and it announces its own. Reporting `true` from both
+/// would put a music chip on both of one person's tiles and claim two streams where
+/// there is one.
+fn voice_music_presence(music: &verio_app::pipeline::MusicSource) -> (bool, String) {
+    if music.is_bot_owned() {
+        return (false, String::new());
+    }
+    let status = music.status();
+    if status.active {
+        (true, status.title.unwrap_or_default())
+    } else {
+        (false, String::new())
+    }
+}
+
 /// Push local speaking/mute state to the connected peer (no-op when idle).
 /// Called on every mute/deafen/PTT transition and speaking change.
 fn send_room_state(bridge: &Bridge) {
@@ -686,13 +935,9 @@ fn send_room_state(bridge: &Bridge) {
     let muted = bridge.tx.is_muted();
     let deafened = bridge.tx.is_deafened();
     // Session 14: carry music presence so peers see who is playing what.
-    let status = bridge.music.status();
-    let music = status.active;
-    let title = if music {
-        status.title.clone().unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // Session 29b: except while a bot session owns the music, which announces its
+    // own presence as a peer in its own right.
+    let (music, title) = voice_music_presence(&bridge.music);
     bridge
         .room
         .lock()
@@ -819,7 +1064,12 @@ async fn join_room(code: String, bridge: State<'_, Bridge>) -> Result<(), String
 }
 
 #[tauri::command]
-fn leave_room(bridge: State<Bridge>) -> Result<(), String> {
+fn leave_room(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
+    // Session 29b: the bot session dies with the host's, by design — "if the host
+    // disconnects, the bot session dies with them". Stopping it here rather than
+    // letting it notice means the room returns to IDLE before we have even finished
+    // leaving, so nobody is left looking at a Music tile for a host who has gone.
+    stop_bot(&app, &bridge);
     bridge.room.lock().expect("room lock").disconnect();
     Ok(())
 }
@@ -1090,7 +1340,15 @@ pub fn run() {
             music_set_volume,
             music_set_loop,
             music_set_monitor,
+            // Session 29b Force Stop: the host's decision, persisted as a setting.
+            set_music_force_stop,
+            // And a listener's request to end somebody else's music.
+            request_music_stop,
             music_pick_file,
+            // Session 29b: the music bot session.
+            music_bot_state,
+            music_bot_start,
+            music_bot_stop,
             music_queue_list,
             music_queue_add,
             music_queue_remove,
@@ -1206,6 +1464,14 @@ pub fn run() {
             let identity = Identity {
                 uuid: peer_uuid,
                 user_id: user_id.clone(),
+                // The voice session is a person. The music bot is a *second*
+                // session built in `music_bot.rs`, and that is the only place
+                // this is ever `true`.
+                is_bot: false,
+                // Session 29b Force Stop: meaningless on a person's identity —
+                // nothing reads it — and `false` is the honest value, since a voice
+                // session is not a thing anybody can ask to stop.
+                force_stop: false,
                 name: if settings_snapshot.nickname.is_empty() {
                     "Player".to_string()
                 } else {
@@ -1297,6 +1563,9 @@ pub fn run() {
                 listener,
                 _mdns: mdns,
                 _log_guard: guard,
+                // Session 29b: IDLE until somebody presses play for the room.
+                bot: std::sync::Arc::new(Mutex::new(None)),
+                bot_monitor: std::sync::Arc::new(Mutex::new(None)),
             };
 
             // Session 13: push music status to the UI (~4 Hz while playing, and
@@ -1362,6 +1631,8 @@ pub fn run() {
                                     name,
                                     uuid,
                                     user_id,
+                                    is_bot,
+                                    force_stop,
                                     arrived,
                                 } => {
                                     // Only a genuine arrival is audible. The
@@ -1369,7 +1640,15 @@ pub fn run() {
                                     // and a peer renaming themselves both arrive
                                     // here with `arrived: false` — the roster
                                     // still needs them, the cue does not.
-                                    if arrived {
+                                    //
+                                    // Session 29b: nor is a bot. The cue exists so
+                                    // people notice when somebody joins or leaves
+                                    // the call; a bot is not a participant, and
+                                    // sounding one would make pressing Play on your
+                                    // own music announce a person arriving — twice
+                                    // over, once for the bot and once for its
+                                    // departure when the queue ends.
+                                    if arrived && !is_bot {
                                         play_cue(&fwd_app, verio_app::EarconKind::PeerJoin);
                                     }
                                     let _ = fwd_app.emit(
@@ -1378,12 +1657,29 @@ pub fn run() {
                                             "name": name,
                                             "uuid": uuid,
                                             "user_id": user_id,
+                                            "is_bot": is_bot,
+                                            // Session 29b Force Stop: a listener's
+                                            // Stop control is drawn from this, so a
+                                            // bot whose host disabled it arrives
+                                            // with `false` and the control is simply
+                                            // not offered — rather than offered and
+                                            // then ignored.
+                                            "force_stop": force_stop,
                                             "arrived": arrived,
                                         }),
                                     );
                                 }
-                                RoomEvent::PeerDisconnected { reason, peer_id } => {
-                                    play_cue(&fwd_app, verio_app::EarconKind::PeerLeave);
+                                RoomEvent::PeerDisconnected {
+                                    reason,
+                                    peer_id,
+                                    is_bot,
+                                } => {
+                                    // Session 29b: a bot is not a participant, so its
+                                    // departure is as silent as its arrival. See the
+                                    // join cue above for why the pair must agree.
+                                    if !is_bot {
+                                        play_cue(&fwd_app, verio_app::EarconKind::PeerLeave);
+                                    }
                                     let _ = fwd_app.emit(
                                         "peer_disconnected",
                                         serde_json::json!({ "reason": reason, "peer_id": peer_id }),
@@ -1424,6 +1720,52 @@ pub fn run() {
                                             "target_user_id": target_user_id,
                                             "muted": muted,
                                             "by": by,
+                                        }),
+                                    );
+                                }
+                                RoomEvent::MusicStopRequested { by } => {
+                                    // Session 29b: the room only carries the
+                                    // request; the client that owns the bot acts on
+                                    // it, so `acted` is what the UI keys the toast
+                                    // off — a listener who is not hosting must not
+                                    // be told that somebody stopped *their* music.
+                                    //
+                                    // Session 29b Force Stop: `acted` now means the
+                                    // stop actually *happened*, not merely that we
+                                    // own a bot. The bot is the authority on whether
+                                    // it accepts one — its own control pump refuses
+                                    // the same request — and asking it, rather than
+                                    // re-reading the setting, is what stops the two
+                                    // from disagreeing about whether the music
+                                    // stopped. The guard is dropped before
+                                    // `stop_bot`, which takes the same lock.
+                                    let bridge = tauri::Manager::state::<Bridge>(&fwd_app);
+                                    let (hosts, willing) = {
+                                        let guard = bridge.bot.lock().expect("bot lock");
+                                        match guard.as_ref() {
+                                            Some(bot) => (true, bot.accepts_remote_stop()),
+                                            None => (false, false),
+                                        }
+                                    };
+                                    if hosts && willing {
+                                        stop_bot(&fwd_app, &bridge);
+                                    } else if hosts {
+                                        // We host it and we refused. Worth a line:
+                                        // the requester was shown no Stop control, so
+                                        // a frame arriving anyway is either a peer
+                                        // ignoring its own UI or one that never had
+                                        // it — and either is a thing to be able to
+                                        // see in a log rather than infer.
+                                        tracing::info!(
+                                            by = %by,
+                                            "music bot: refusing a remote stop — Force Stop is off"
+                                        );
+                                    }
+                                    let _ = fwd_app.emit(
+                                        "music_stop_requested",
+                                        serde_json::json!({
+                                            "by": by,
+                                            "acted": hosts && willing,
                                         }),
                                     );
                                 }
@@ -1503,13 +1845,10 @@ fn forward_events(
                     // Spec: state{speaking,mute} JSON on the control channel
                     // drives the remote speaking ring.
                     // Session 14: music presence rides along with the speaking state.
-                    let music_status = tauri::Manager::state::<Bridge>(&app).music.status();
-                    let music = music_status.active;
-                    let music_title = if music {
-                        music_status.title.unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
+                    // Session 29b: unless a bot owns the bus — see
+                    // `voice_music_presence`.
+                    let (music, music_title) =
+                        voice_music_presence(&tauri::Manager::state::<Bridge>(&app).music);
                     room.lock().expect("room lock").send_state(
                         effective_speaking,
                         tx.is_muted(),

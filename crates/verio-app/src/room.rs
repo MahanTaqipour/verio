@@ -61,6 +61,14 @@ pub enum RoomEvent {
         /// mute. Empty until their `Hello` reaches us, at which point the roster
         /// refresh re-emits this event carrying it.
         user_id: String,
+        /// Session 29b: this peer is a music bot session, not a person. `false`
+        /// covers both "a person" and "we have not been told yet".
+        is_bot: bool,
+        /// Session 29b: this bot accepts a remote stop. Meaningful only when
+        /// `is_bot`; `false` for a person, and `false` for a bot we have not been
+        /// told about — the fail-closed direction, where the cost is a control that
+        /// is not offered rather than one that is offered and ignored.
+        force_stop: bool,
         /// `true` only when this peer was not in the roster before — a genuine
         /// arrival. `false` covers the roster adopted when we join a populated
         /// room, and a peer renaming themselves: the roster changed, but nobody
@@ -70,6 +78,13 @@ pub enum RoomEvent {
     PeerDisconnected {
         reason: String,
         peer_id: Option<String>,
+        /// Session 29b: this was a bot session, not a person.
+        ///
+        /// Carried so the departure cue can stay silent for it. The join cue is
+        /// already withheld from bots — they are not participants, and a bot is
+        /// something the user started themselves — so without this the pair would be
+        /// asymmetric: no sound when the music starts, a chime when it stops.
+        is_bot: bool,
     },
     /// Remote speaking/mute/deafen/music state (control channel).
     PeerState {
@@ -99,6 +114,19 @@ pub enum RoomEvent {
         /// is honest where a remembered name would be a guess.
         by: String,
     },
+    /// Session 29b: a peer asked for the music to stop.
+    ///
+    /// The room does not act on this — only the host's client owns a bot session,
+    /// so only the host's client can stop one. The room's whole job here is to
+    /// carry the request and its actor up to whoever *can* act, which is also why
+    /// this is a distinct event rather than a reuse of `PeerState`: a stop is
+    /// something that happened, not a description of how things are.
+    MusicStopRequested {
+        /// Display name of whoever asked. Empty when we have no roster entry for
+        /// them, which the UI renders as a nameless "somebody" rather than
+        /// inventing a name.
+        by: String,
+    },
 }
 
 /// Session 12: one remote participant. The relay fans out to every peer in the
@@ -121,6 +149,20 @@ pub struct PeerInfo {
     /// Session 14: this peer is playing music into the room.
     pub music: bool,
     pub music_title: String,
+    /// Session 29b: this peer is a music bot session rather than a person.
+    ///
+    /// The host's voice peer and their bot peer share a `user_id`, so this is the
+    /// only thing that separates them — and it is declared, never inferred.
+    pub is_bot: bool,
+    /// Session 29b: this bot accepts a remote stop — the host's "Force Stop"
+    /// setting, as it stood when the bot was spawned.
+    ///
+    /// Meaningful only when `is_bot`. The UI reads the two together: it offers a
+    /// Stop control only on a peer that is a bot *and* accepts one, so a peer whose
+    /// host disabled force-stop is not shown a button that would do nothing.
+    ///
+    /// Always `false` for a person, where nothing reads it.
+    pub force_stop: bool,
 }
 
 /// Session 29: one room-wide mute, as the UI sees it.
@@ -276,6 +318,14 @@ impl RoomManager {
                 name: self.identity.name.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 user_id: self.identity.user_id.clone(),
+                // Session 29b: carried on every re-announce, not just the first, so
+                // a peer who joined after us still learns what we are.
+                is_bot: self.identity.is_bot,
+                // Session 29b Force Stop: sent for completeness rather than because
+                // a person's value means anything. The room's own session is a voice
+                // peer, so this is always `false`; a bot announces its own through
+                // `music_bot.rs`, on a session of its own.
+                force_stop: self.identity.force_stop,
             });
         }
     }
@@ -292,10 +342,13 @@ impl RoomManager {
             .collect();
         for uuid in stale {
             self.peer_seen.remove(&uuid);
+            // Read before the removal takes the entry with it.
+            let was_bot = self.peers.get(&uuid).is_some_and(|p| p.is_bot);
             if self.peers.remove(&uuid).is_some() {
                 self.emit(RoomEvent::PeerDisconnected {
                     reason: "peer timed out".into(),
                     peer_id: Some(uuid),
+                    is_bot: was_bot,
                 });
             }
         }
@@ -337,6 +390,11 @@ impl RoomManager {
             deafen: false,
             music: false,
             music_title: String::new(),
+            is_bot: peer.is_bot,
+            // Session 29b Force Stop: read from the identity that arrived, not from
+            // any local setting — the host's decision belongs to the host, and a
+            // listener's own preference must never stand in for it.
+            force_stop: peer.force_stop,
         });
         entry.name = peer.name.clone();
         // An empty id means "unknown" (a peer built before Session 29), so it must
@@ -344,6 +402,26 @@ impl RoomManager {
         if !peer.user_id.is_empty() {
             entry.user_id = peer.user_id.clone();
         }
+        // Session 29b: the same asymmetry for the bot flag. Only a relay `Hello`
+        // can declare a bot — a signalling-sourced identity never can, because the
+        // server's `PeerIdentity` has no such field and serde drops it — so a
+        // `false` arriving down that path must not clear a `true` we already
+        // learned. A bot also cannot stop being a bot; its session simply ends,
+        // and the roster entry goes with it.
+        if peer.is_bot {
+            entry.is_bot = true;
+        }
+        // Session 29b Force Stop: the same asymmetry, for the same reason. Only a
+        // relay `Hello` can carry the host's decision — a signalling identity never
+        // can, because the server's `PeerIdentity` has no such field — so a `false`
+        // arriving down that path must not clear a `true` we already learned. Unlike
+        // a mute, this value cannot change during a session: the host's setting is
+        // applied when the bot is spawned. So ratcheting it one way loses nothing.
+        if peer.force_stop {
+            entry.force_stop = true;
+        }
+        let is_bot = entry.is_bot;
+        let force_stop = entry.force_stop;
         // `!arrived` forces the event even for a peer we already know, because
         // an adopt is the only thing that tells the UI about a rename.
         if is_new || !arrived {
@@ -351,6 +429,8 @@ impl RoomManager {
                 name: peer.name,
                 uuid,
                 user_id: peer.user_id,
+                is_bot,
+                force_stop,
                 arrived,
             });
         }
@@ -362,13 +442,23 @@ impl RoomManager {
 
     /// Session 12: drop a peer and tell the UI; the room idles when it empties.
     pub fn remove_peer(&mut self, uuid: &str) {
+        // Session 29b: a bot is not a participant, so its departure must not count
+        // as "everybody left".
+        //
+        // A host alone in a room has an empty roster, and the only way the roster
+        // ever becomes non-empty for them is their own bot joining it. So without
+        // this flag the teardown below fires the moment they stop the music: they
+        // get thrown out of their own call for having played a track. Read before
+        // the removal, because the flag lives on the entry being removed.
+        let was_bot = self.peers.get(uuid).is_some_and(|p| p.is_bot);
         if self.peers.remove(uuid).is_some() {
             self.emit(RoomEvent::PeerDisconnected {
                 reason: "peer left room".into(),
                 peer_id: Some(uuid.to_string()),
+                is_bot: was_bot,
             });
         }
-        if self.peers.is_empty() {
+        if !was_bot && self.peers.is_empty() {
             self.teardown_session("all peers left");
             self.set_state(RoomState::Idle);
         }
@@ -575,6 +665,29 @@ impl RoomManager {
         }
         let by = self.identity.name.clone();
         self.apply_mute(target_user_id, muted, &by, true);
+        Ok(())
+    }
+
+    /// Session 29b Force Stop: ask this room's music host to stop.
+    ///
+    /// Sends the request and returns. The room deliberately does **not** act on it:
+    /// only the client that owns the bot session can end one, so this is a request
+    /// and not a command, and whether it is honoured is the host's decision — one
+    /// announced when the bot joined, not renegotiated now.
+    ///
+    /// Nothing here says who is asking. The relay stamps the actor onto every frame,
+    /// and that is the whole reason the payload is empty: the host is told who
+    /// stopped their music, and a request that named its own sender would let anyone
+    /// blame anyone.
+    ///
+    /// # Errors
+    /// We are not in a room, or the room has no live transport.
+    pub fn request_music_stop(&self) -> Result<(), String> {
+        let active = self.active.lock().expect("active lock");
+        let Some(active) = active.as_ref() else {
+            return Err("Join a room before stopping its music.".into());
+        };
+        active.handle.send_control(ControlMessage::MusicStop);
         Ok(())
     }
 
@@ -1287,7 +1400,14 @@ fn spawn_transport_pump(
                     }
                     TransportEvent::Control {
                         peer,
-                        message: ControlMessage::Hello { name, user_id, .. },
+                        message:
+                            ControlMessage::Hello {
+                                name,
+                                user_id,
+                                is_bot,
+                                force_stop,
+                                ..
+                            },
                     } => {
                         let mut m = room.lock().expect("room lock");
                         let uuid = resolve_peer(&peer, &peer_id);
@@ -1299,8 +1419,25 @@ fn spawn_transport_pump(
                         // roster rather than be discarded as "not a rename". An
                         // empty id never overwrites a known one — that is a peer
                         // built before this field existed.
+                        //
+                        // Session 29b: the bot flag refreshes it for the same
+                        // reason, and only in one direction — a bot is declared by
+                        // its `Hello`, so a `false` here must not clear a `true`
+                        // that arrived earlier. Without this clause a bot whose
+                        // `Hello` landed before its signalling `PeerJoined` would
+                        // settle back into looking like a person.
+                        //
+                        // The force-stop decision rides the same clause and the same
+                        // direction: this message is the only thing that can teach
+                        // it, and learning it late is precisely why the clause
+                        // exists — the Stop control has to appear on a listener's
+                        // screen when the bot's announcement arrives, not whenever
+                        // its tile happened to.
                         let changed = m.peers.get(&uuid).is_some_and(|p| {
-                            p.name != name || (p.user_id != user_id && !user_id.is_empty())
+                            p.name != name
+                                || (p.user_id != user_id && !user_id.is_empty())
+                                || (is_bot && !p.is_bot)
+                                || (force_stop && !p.force_stop)
                         });
                         if is_new || changed {
                             let identity = Identity {
@@ -1308,6 +1445,8 @@ fn spawn_transport_pump(
                                     verio_discovery::Uuid::nil()
                                 }),
                                 user_id,
+                                is_bot,
+                                force_stop,
                                 name,
                                 version: String::new(),
                             };
@@ -1346,6 +1485,24 @@ fn spawn_transport_pump(
                         // room.
                         m.apply_mute(&target_user_id, muted, &by, false);
                     }
+                    TransportEvent::Control {
+                        peer,
+                        message: ControlMessage::MusicStop,
+                    } => {
+                        let mut m = room.lock().expect("room lock");
+                        let actor = resolve_peer(&peer, &peer_id);
+                        m.mark_peer_seen(&actor);
+                        // The actor again comes from the envelope. This is the one
+                        // that matters most: the host is told *who* stopped their
+                        // music, so taking that from the payload would let anyone
+                        // blame anyone.
+                        let by = m
+                            .peers
+                            .get(&actor)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        m.emit(RoomEvent::MusicStopRequested { by });
+                    }
                     TransportEvent::Rtt { ms } => {
                         let m = room.lock().expect("room lock");
                         m.emit(RoomEvent::Rtt { ms });
@@ -1369,12 +1526,17 @@ fn spawn_transport_pump(
                         // the leave cue played when you left your own call, and
                         // twice for the last peer's already-reported departure.
                         let was_active = !matches!(m.state, RoomState::Idle);
+                        // Read before the teardown clears the roster. The transport
+                        // signs with whichever peer joined first, so for a host
+                        // alone in a room that peer is their own bot.
+                        let was_bot = m.peers.get(&peer_id).is_some_and(|p| p.is_bot);
                         m.teardown_session(&reason);
                         m.set_state(RoomState::Idle);
                         if was_active {
                             m.emit(RoomEvent::PeerDisconnected {
                                 reason,
                                 peer_id: Some(peer_id.clone()),
+                                is_bot: was_bot,
                             });
                         }
                         break;
@@ -1413,8 +1575,38 @@ mod tests {
             uuid: verio_discovery::Uuid::from_u128(n),
             // Distinct per (name, n) so mute tests cannot accidentally collide.
             user_id: format!("user-{name}-{n}"),
+            is_bot: false,
+            force_stop: false,
             name: name.to_string(),
             version: String::new(),
+        }
+    }
+
+    /// Session 29b: a music bot session. Same shape as a person's, except for the
+    /// declaration — which is the whole point, since nothing else about it differs.
+    ///
+    /// `force_stop: true` matches the product default, so a test that says nothing
+    /// about Force Stop exercises the ordinary case. Use
+    /// [`unforceable_bot_identity`] for the host who turned it off.
+    fn bot_identity(name: &str, n: u128, host_user_id: &str) -> Identity {
+        Identity {
+            uuid: verio_discovery::Uuid::from_u128(n),
+            user_id: host_user_id.to_string(),
+            is_bot: true,
+            force_stop: true,
+            name: name.to_string(),
+            version: String::new(),
+        }
+    }
+
+    /// Session 29b: a bot whose host disabled Force Stop. Identical to
+    /// [`bot_identity`] but for the one field — which is the point, because
+    /// everything else about the two sessions is indistinguishable, so the flag is
+    /// the only thing a listener has to go on.
+    fn unforceable_bot_identity(name: &str, n: u128, host_user_id: &str) -> Identity {
+        Identity {
+            force_stop: false,
+            ..bot_identity(name, n, host_user_id)
         }
     }
 
@@ -1544,6 +1736,8 @@ mod tests {
         m.adopt_peer(Identity {
             uuid: verio_discovery::Uuid::from_u128(2),
             user_id: String::new(),
+            is_bot: false,
+            force_stop: false,
             name: "Bo Renamed".to_string(),
             version: String::new(),
         });
@@ -1638,6 +1832,8 @@ mod tests {
         m.add_peer(Identity {
             uuid: verio_discovery::Uuid::from_u128(7),
             user_id: "user-Bo-2".to_string(),
+            is_bot: false,
+            force_stop: false,
             name: "Bo".to_string(),
             version: String::new(),
         });
@@ -1772,6 +1968,215 @@ mod tests {
         assert!(m.mutes().is_empty());
         assert!(m.db.muted_users().expect("read").is_empty());
         assert!(mute_events(&rx).is_empty());
+    }
+
+    // -- Session 29b: the music bot peer --------------------------------------
+
+    /// The bot is a peer like any other, and the roster must say what it is —
+    /// nothing else about it is distinguishable from a person.
+    #[test]
+    fn a_bot_peer_is_marked_as_a_bot() {
+        let (mut m, _rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+        let peer = m.peers.get(&uuid(42)).expect("bot in the roster");
+        assert!(peer.is_bot, "the bot declaration must reach the roster");
+        assert_eq!(peer.name, "Music");
+    }
+
+    /// Session 29b Force Stop: the host's decision has to reach the roster, because
+    /// a listener's Stop control is drawn from it and from nothing else.
+    #[test]
+    fn a_bot_carries_the_force_stop_decision() {
+        let (mut m, _rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+        assert!(
+            m.peers.get(&uuid(42)).expect("bot").force_stop,
+            "a bot whose host allows a remote stop has to say so"
+        );
+    }
+
+    /// And the other direction, which is the one the whole feature exists for: a
+    /// host who turned Force Stop off must be visibly distinguishable, or listeners
+    /// would be shown a button that does nothing.
+    #[test]
+    fn a_bot_whose_host_disabled_force_stop_says_so() {
+        let (mut m, _rx) = manager();
+        m.add_peer(unforceable_bot_identity("Music", 43, "user-Kaveh-1"));
+        assert!(
+            !m.peers.get(&uuid(43)).expect("bot").force_stop,
+            "a bot whose host disabled Force Stop must not appear stoppable"
+        );
+    }
+
+    /// The safe direction for a peer we have not been told about: no control is
+    /// offered, rather than one that is offered and silently ignored.
+    #[test]
+    fn an_ordinary_peer_never_accepts_a_remote_stop() {
+        let (mut m, _rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        assert!(!m.peers.get(&uuid(2)).expect("peer").force_stop);
+    }
+
+    /// The UI builds its tile list from this event, so the flag has to be on it —
+    /// the tile has no other way to know whether to draw a Stop control.
+    #[test]
+    fn the_roster_event_carries_the_force_stop_decision() {
+        let (mut m, rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerConnected {
+                is_bot, force_stop, ..
+            } = ev
+            {
+                seen.push((is_bot, force_stop));
+            }
+        }
+        assert_eq!(seen, vec![(true, true)]);
+    }
+
+    /// A signalling adopt carries no force-stop decision — the server's
+    /// `PeerIdentity` has no such field and serde drops it — so it must not clear
+    /// the one we learned from the relay `Hello`. If it did, the Stop control would
+    /// vanish from a listener's screen moments after it appeared.
+    #[test]
+    fn a_signalling_identity_does_not_clear_force_stop() {
+        let (mut m, _rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+        m.adopt_peer(identity("Music", 42));
+
+        assert!(
+            m.peers.get(&uuid(42)).expect("bot").force_stop,
+            "a signalling adopt must not revoke the host's force-stop decision"
+        );
+    }
+
+    /// The host is whoever's voice peer shares the bot's `user_id`. That is the
+    /// only link between the two sessions, so it has to be on both.
+    #[test]
+    fn a_bot_and_its_host_share_a_persistent_id() {
+        let (mut m, _rx) = manager();
+        let host_user_id = "user-Kaveh-1";
+        m.add_peer(identity("Kaveh", 1));
+        m.add_peer(bot_identity("Music", 42, host_user_id));
+
+        let host = m
+            .peers
+            .values()
+            .find(|p| p.user_id == host_user_id && !p.is_bot)
+            .expect("a voice peer with the bot's user id");
+        assert_eq!(host.name, "Kaveh");
+        let bot = m.peers.get(&uuid(42)).expect("bot");
+        assert_eq!(bot.user_id, host.user_id, "the two sessions are one person");
+        assert_ne!(bot.uuid, host.uuid, "but not one session");
+    }
+
+    /// A `PeerJoined` from the signalling server cannot carry the bot flag — the
+    /// server's own identity struct has no such field — so its `false` must not
+    /// erase a `true` we already learned from the relay. Without this asymmetry the
+    /// bot would flip back into looking like a person whenever signalling won a
+    /// race.
+    #[test]
+    fn a_signalling_identity_does_not_clear_the_bot_flag() {
+        let (mut m, _rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+        m.adopt_peer(identity("Music", 42));
+
+        assert!(
+            m.peers.get(&uuid(42)).expect("bot").is_bot,
+            "a signalling adopt must not demote a bot to a person"
+        );
+    }
+
+    /// The UI learns what a peer is from the roster event, so the flag has to be
+    /// on it — the tile has no other way to know it should offer a Stop control.
+    #[test]
+    fn the_roster_event_carries_the_bot_flag() {
+        let (mut m, rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+
+        let mut flags = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerConnected { name, is_bot, .. } = ev {
+                flags.push((name, is_bot));
+            }
+        }
+        assert_eq!(flags, vec![("Music".to_string(), true)]);
+    }
+
+    /// A person is not a bot, and the default has to be the safe direction: a peer
+    /// that predates the field reads as a person rather than being dressed up as a
+    /// music bot and given a Stop button.
+    #[test]
+    fn an_ordinary_peer_is_not_a_bot() {
+        let (mut m, _rx) = manager();
+        m.add_peer(identity("Bo", 2));
+        assert!(!m.peers.get(&uuid(2)).expect("peer").is_bot);
+    }
+
+    /// The flag has to be on the event the UI builds its list from, and it must
+    /// survive a rename — a rename is a roster update, not a change of nature.
+    #[test]
+    fn a_rename_keeps_the_bot_flag() {
+        let (mut m, rx) = manager();
+        m.add_peer(bot_identity("Music", 42, "user-Kaveh-1"));
+        let _ = rx.try_recv();
+        m.adopt_peer(bot_identity("Music (Kaveh)", 42, "user-Kaveh-1"));
+
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerConnected { name, is_bot, .. } = ev {
+                last = Some((name, is_bot));
+            }
+        }
+        assert_eq!(last, Some(("Music (Kaveh)".to_string(), true)));
+    }
+
+    /// Session 29b: stopping the music must not throw the host out of their own
+    /// call.
+    ///
+    /// A host alone in a room has an empty roster, and the only peer that ever
+    /// appears in it is their own bot — so the bot's departure is the first time
+    /// that roster empties, and `remove_peer`'s "all peers left" teardown fired.
+    /// The host lost their room (and their room code) for having played a track.
+    #[test]
+    fn a_bot_leaving_does_not_end_the_room() {
+        let (mut m, rx) = manager();
+        let bot_id = uuid(42);
+        m.set_state(RoomState::Connected);
+        m.add_peer(bot_identity("Music", 42, "user-self-999"));
+
+        m.remove_peer(&bot_id);
+
+        assert_eq!(
+            m.state(),
+            RoomState::Connected,
+            "the host is still in the room after their own bot leaves"
+        );
+        // The guard must not swallow the departure itself: the Music tile still
+        // has to go, or a stopped bot leaves a card nobody can explain.
+        let mut gone = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let RoomEvent::PeerDisconnected { peer_id, .. } = ev {
+                gone = peer_id.as_deref() == Some(bot_id.as_str());
+            }
+        }
+        assert!(gone, "the bot's tile must still be removed");
+    }
+
+    /// The counterpart, so the guard above cannot pass by having disabled the
+    /// teardown outright: a *person* leaving an otherwise empty roster still ends
+    /// the room, exactly as it did before.
+    #[test]
+    fn the_last_person_leaving_still_ends_the_room() {
+        let (mut m, _rx) = manager();
+        m.set_state(RoomState::Connected);
+        m.add_peer(identity("Ada", 1));
+
+        m.remove_peer(&uuid(1));
+
+        assert_eq!(m.state(), RoomState::Idle);
     }
 }
 

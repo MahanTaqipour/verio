@@ -4819,4 +4819,276 @@ chip arrived, which is how it is written.
 Part A is complete, verified and committed. Parts B (`verio-bot` as a separate peer process) and C
 (the playlist UI) are **not started** — the plan says stop and wait for approval before Part B.
 
+## Session 29, Part B (2026-09-23) — the music bot, and the host's decision about who may stop it
+
+Part B, on the **revised** plan: the bot is *not* a separate binary. It is a **second session opened by
+the host's own client** to the same signalling server, joined to the same room. Part C (the playlist
+UI) is **not started**.
+
+The plan's scope guard — *"if the bot turns out to be larger than one session, stop at the boundary
+where 'bot appears as a peer, plays music, listeners control their own volume' works and report"* — was
+not needed. That boundary plus Force Stop, the Host badge and the IDLE transitions are all in.
+
+### 1. A second session, not a second program
+
+Until this session the music was mixed into the host's outgoing voice Opus frame
+(`encode_input[i] += music_buf[i] * vol`). That works, and it is why the feature looked finished, but
+it makes the music inseparable from the voice: one stream, one volume, one mute. Giving it its own
+session means every listener gets an ordinary per-peer volume slider and mute for it — controls that
+already exist, already work, and were already tested.
+
+A "second session" is one `PeerHandle` + one UDP relay socket + one signalling WebSocket per room, not
+one socket per peer: the relay fans out by room code, so a bot is cheap. `crates/verio-app/src/music_bot.rs`.
+
+Two consequences that shaped the rest of the work:
+
+- **The relay does not echo a sender's own datagrams**, so the host is a peer of their own bot and never
+  receives from it. The host hears the music through the pipeline's **local monitor**, which the bot
+  feeds directly via `monitor_tx` — the same slot a pipeline restart replaces, hence the slot rather
+  than a sender.
+- **The bot is headless.** No `verio-audio` on this path: no capture device, no RNNoise, no VAD gate, and
+  **DTX switched off explicitly** (it would collapse sustained music into near-silent packets, the same
+  reason the voice pipeline disables it while music plays). Decode → 48 kHz mono f32 → Opus 10 ms → the
+  room. The bitrate reuses the **voice** config (32 kbps), as the plan says; see §9.
+
+### 2. The protocol: one flag on an existing message, and no server change
+
+`Identity.is_bot` and `ControlMessage::Hello.is_bot`, both `#[serde(default)]`.
+
+The carrier is the **relay `Hello`**, not the join message. The join message goes to the signalling
+server, whose `PeerIdentity` has no such field — it would have to be changed *and redeployed* to echo it
+back. serde ignores unknown fields, so the field simply rides past the server, and the roster already
+re-sends `Hello` every 3 s, so a peer who joins *after* the bot still learns what it is. The signalling
+server was not touched.
+
+Two asymmetries had to be got right, and both are the kind that fail silently:
+
+- **A signalling-sourced `false` must not demote a bot.** The server cannot carry the flag at all, so
+  every identity arriving from it says `false`. `upsert_peer` therefore only ever sets `is_bot = true`,
+  and `a_signalling_identity_does_not_clear_the_bot_flag` guards it. Without the clause, a bot whose
+  `Hello` landed before its signalling `PeerJoined` would settle back into looking like a person.
+- **The departure cue needed the flag too.** `RoomEvent::PeerDisconnected` gained `is_bot`, because the
+  join cue was already withheld from bots — they are not participants, and a bot is something the user
+  started themselves. Silencing only the join would have made the pair asymmetric: no sound when the
+  music starts, a chime when it stops. All three emit sites read the flag *before* removing the entry.
+
+### 3. The host state machine
+
+`IDLE` → `HOSTING` → `IDLE`. The host is **whoever pressed Play** — not the room's creator, which is the
+whole reason `useMusicBot` exists as a hook rather than a flag on the panel's buttons. The spawn log line
+is `music bot: hosted by <nickname> session=<short_session_id> force_stop=<bool>`.
+
+- **One bot per room.** A second Play while `HOSTING` is refused with the toast *"Music is already
+  playing in this room."* — and the check is on the roster, not on local state, because the bot in the
+  room may be somebody else's. The refusal distinguishes the two cases: *"You are already hosting…"* when
+  it is ours.
+- **The queue advances the session, not the player.** `queue_finished` was added to `MusicStatus`
+  because `playing == false` conflates "paused" with "ran out" — and the plan wants opposite outcomes
+  (paused → bot stays alive; ran out → bot ends). `MusicSource::next_chunk` is the sole advancer, so the
+  bot takes the bus exclusively via `set_bot_owned(true)`; two consumers would interleave half-chunks and
+  double-advance the queue.
+- **A bot is not a participant.** The tile count grows by one and the participant count does not, and the
+  empty state keys on humans only — otherwise a host alone in a room would never see "Waiting for others"
+  and a two-person call with music would read "3 participants".
+- **No auto-takeover.** When the bot ends, the tile disappears for everyone and any client may press Play.
+  Nothing claims the host role.
+
+### 4. Force Stop
+
+**The setting.** `Settings.music_force_stop`, default `true`, stored in the settings blob in the `settings`
+table. `#[serde(default)]` at container level fills a missing field from `Settings::default()`, so an
+existing user's blob — written before the field existed — reads as **on** rather than silently off. That
+is pinned by `a_stored_blob_without_force_stop_gets_it_on`, because a `bool` that defaulted to `false`
+would disable the feature for every existing user without a word.
+
+**Why it can ride the join announcement.** The plan says the setting is *"applied each time the user
+becomes host"*, so it is fixed for the life of a bot session. That is what makes a second message
+unnecessary: `Identity.force_stop` → `Hello.force_stop`, read once at spawn, announced on the registration
+frame and repeated by every 3 s announcement. The plan's *"do not add a new message for force-stop unless
+it's genuinely needed"* holds — the existing message carries it.
+
+**The authority is the receiving side, not the button.** `MusicBot::accepts_remote_stop()` is the single
+value; `bot_pump` refuses a `MusicStop` outright when it is false, and the bridge asks the same method
+before calling `stop_bot`. Any peer can send that control frame — including one that never drew a button
+— so a check living only in the interface would be decoration. The refusal is logged
+(`music bot: stop refused — the host disabled Force Stop`), because "why can nobody stop this music?" is
+otherwise a question the log cannot answer.
+
+The value is held on `MusicBot` rather than re-read from settings on each request, so the value that is
+**enforced** is always the value that was **announced**. Re-reading would let a mid-session settings change
+make the bot refuse a stop it had told the room it would accept — a button that lies. `remote_stop_is_refused`
+is a named function for the same reason as `disconnect_ends_the_session`: the *polarity* is the thing that
+can be got wrong, and a control that quietly does the opposite of its label is worse than no control.
+
+**`acted` changed meaning.** It used to mean "this client owns a bot"; it now means "the stop actually
+happened", so the host's toast (*"<name> stopped your music."*) cannot fire for a stop that was refused.
+
+**The listener's control.** Shown whenever a bot is in the room and it is not ours, and **disabled rather
+than hidden** when the host forbade it — a control that disappears leaves a listener unsure the feature
+exists, and the tooltip *"Host has disabled force-stop."* is where the host's decision gets explained. The
+tooltip lives on a wrapper `<span>`: `Button`'s disabled style sets `pointer-events-none`, so a `title` on
+the button itself would never be shown. `request_music_stop` returns only "the request left" — whether the
+music stops is the host's decision, and the roster, not the promise, is what will show it.
+
+### 5. Three defects, all in my own earlier Part B work
+
+Found by questioning the code rather than by a failing test, which is the point of the project's rule
+about reporting bugs in one's own work directly.
+
+1. **Stopping the music threw the host out of their own call.** `remove_peer` tore the session down
+   whenever the roster emptied — and a bot *is* in the roster. A host alone in a room has an empty roster,
+   and the only way it ever becomes non-empty for them is their own bot joining it, so the teardown fired
+   the moment they pressed Stop. Fixed with `let was_bot = …` read before the removal, and
+   `if !was_bot && self.peers.is_empty()`.
+2. **Every ordinary Stop was reported as a dropped connection.** The transport reports *every* relay exit
+   through `TransportEvent::Disconnected`, including the one `MusicBot::stop` asked for — so the normal
+   path told the user their music died because "the connection dropped (user disconnect)". Fixed with the
+   named `disconnect_ends_the_session(requested_stop)` guard.
+3. **A `never_loop` in the bot watcher.** `while let Ok(ev) = events_rx.recv()` always broke on the first
+   iteration; clippy caught it for claiming to be a stream handler when it was a one-shot wait. Rewritten
+   as a single wait, and the sender-closed branch deliberately does **not** clear `bot_owned` — a stale
+   watcher would otherwise take the music bus away from a newly started bot.
+
+### 6. The frontend
+
+- `use-music-bot.ts` owns the Play/Stop policy: in a room, Play is two actions in sequence (start the
+  player, then open the bot session) and the room gets to refuse *before* any audio does. On a refusal the
+  player is stopped again, because a running player with no bot session broadcasts through the pre-29b
+  path where nothing in the UI can show or stop it.
+- The Music tile gets its own avatar treatment (an accent glyph, not "M" for "Music"), its own volume
+  slider and local mute, and **no room-wide mute** — that would be a second button for the host's *person*
+  id, labelled as though it silenced only the music.
+- The host's **voice** card carries a small `Host` chip; the link is the shared `user_id`, which is the
+  only thing joining the two sessions.
+- The panel gains a `Hosting` chip, and its Stop is labelled "Stop playback" — deliberately **not**
+  scope-dependent. See §7.
+- The mock mirrors all of it, including the two refusals, and gains two scenarios (`room-remote-music`,
+  `room-remote-music-no-force`) because `music_bot_start` can only ever create *our* bot, which left the
+  listener's half of Force Stop unreachable in the harness.
+
+### 7. The finding: a conditional accessible name breaks every label-driven harness
+
+The panel's Stop was first labelled `hosting ? "Stop the music for the room" : "Stop playback"`. That is
+accurate, and it broke `verify-music.mjs`, which waited 30 s for a control called "Stop playback" and timed
+out. The scope belongs on the *state*, not on the action: the `Hosting` chip beside the status already says
+it, and says who it applies to. Restored to one stable name; `verify-music.mjs` passes.
+
+This is the same rule the skill already records for icon-only toggles, arriving from the opposite
+direction — the earlier case was a name that omitted the state, this one a name that absorbed it.
+
+### 8. Verification — real output
+
+Rust, from `C:/dev/verio`:
+
+| command | result |
+|---|---|
+| `cargo clippy --workspace --all-targets -- -D warnings` | **exit 0** |
+| `cargo check --workspace --all-targets` | clean |
+| `cargo test --workspace --exclude verio` | **138 passed** — verio-app **82**, verio-dsp 28, verio-transport 14, verio-discovery 8, verio-server 6 |
+| `cargo test -p verio --lib` | **4 passed** |
+
+`verio-app` went 72 → 82: room 5, settings 3, bot 2. Transport stayed at 14 — its two bot tests were
+extended and one renamed, not added to.
+
+Frontend, from `C:/dev/verio/ui`:
+
+| command | result |
+|---|---|
+| `pnpm exec tsc --noEmit` | exit 0 |
+| `pnpm test` | **12 / 12** |
+| `pnpm build` | exit 0 |
+
+Browser and CSS invariants, from `C:/Users/Mahan/.workbuddy-ai/binaries/node/workspace`:
+
+| command | result |
+|---|---|
+| `verify-room.mjs` | **134 PASS, 0 FAIL — ALL ROOM CHECKS PASSED** (D4 18, D5 18) |
+| `verify-music.mjs` | all states render, all controls wired, no overflow, no console errors |
+| `verify-harness.mjs` | 8 passed, 0 failed |
+| `verify-contents-wrapper.mjs` | 40 configurations, layout-neutral |
+| `check-phantom-classes.mjs` | `PHANTOM: none` — 239 distinct tokens |
+| `dead-css.mjs` | `DEAD: none`, `ORPHAN KEYFRAMES: none` |
+| `dead-modules.mjs ui/src` | 34 modules, **34 reachable**, 0 unreachable |
+| `check-collisions.mjs --widths=860,700` | `LEAK: clean`, `MIX: clean` |
+| `shoot-bot.mjs` | `tiles=["Kaveh","Dan","Arman","Music"]`, Host chip on `"Kaveh"`, Music avatar `glyph=true bg=oklab(0.677 0.049 0.108 / 0.08) fg=rgb(201,135,63)`, **no console errors** at 860 or 700 |
+
+D5's own claims, from that run: the switch is present and ON by default; toggling it sends
+`set_music_force_stop {enabled:false}` then `{enabled:true}` and the switch follows; with no bot there is
+no room-wide Stop; a bot that is not ours offers one, enabled; pressing it sends exactly one
+`request_music_stop` and **zero** `music_bot_stop`, and the Music tile is still in the room afterwards; a
+bot that refuses is still shown the control, disabled, with `"Host has disabled force-stop."` on the
+wrapper; and while hosting, turning Force Stop off sends no `music_bot_stop` and the bot stays.
+
+### 9. Mutation testing
+
+Every check below was made to fail on purpose, then reverted byte-exact.
+
+| # | mutation | what failed |
+|---|---|---|
+| A | `remote_stop_is_refused` returns `force_stop` instead of `!force_stop` | both polarity tests, and only those |
+| B | `adopt_peer` writes `entry.force_stop` unconditionally | `a_signalling_identity_does_not_clear_force_stop` — while `…the_bot_flag` still passed, so the two ratchets are independently covered |
+| C | the listener's Stop is `disabled={false}` | D5 `…but disabled, so it cannot be pressed` — its two neighbours still passed |
+| D | `handleRequestMusicStop` also invokes `music_bot_stop` | D5 `…and does NOT end the session locally` — while `pressing it asks the host to stop` still passed |
+
+Reverted byte-exact: `music-panel.tsx` `d5f2567ac101489b3765c2f977a8e12a4ec54f48`, `App.tsx`
+`74f7688e56347dabd448fff6b94dc91dae8bdc29`.
+
+Mutation B's first attempt was itself a lesson: writing `entry.force_stop = peer.force_stop` *inside*
+`if peer.force_stop` is a no-op, because the guard has already established the value. It changed nothing
+and no test moved. A mutation that cannot fail is not a mutation either.
+
+### 10. Found but not fixed
+
+- **`verify-room.mjs` never checks for console errors.** It has no `console`/`pageerror` listener at all,
+  so D4's and D5's "PASS" say nothing about the console. `verify-music.mjs` and `shoot.mjs` do check, and
+  both filter the dev server's favicon 404. Adding the check to this file means adding the favicon filter
+  with it, and that is a change to a file whose other 116 checks were not written against it — reported
+  rather than bolted on mid-session.
+- **`shoot-bot.mjs` reported a benign 404 as a real failure** and printed no URL, so it was
+  un-actionable. It was the favicon: the dev server has no `favicon.ico`, `index.html` declares no
+  `<link rel="icon">`, and `curl` confirms `/favicon.ico` → 404 while `/` → 200. It appeared at 860 px and
+  not 700 px because Chrome requests the favicon once per browser process and caches the 404 — ordering,
+  not width. Fixed in the script (capture the URL, filter `favicon`), which is why the run above reports
+  no console errors at either width.
+- **The bot's audio has never been heard.** `is_active()`, the encode loop, DTX-off and the 32 kbps reuse
+  are all unexercised by ear. `is_active()` and the encode path have no automated check either, because
+  they need a decoder, an encoder and a real session. This is the largest gap in the session and it needs
+  two clients and a human.
+- **The multi-client scenario is untested.** Every claim about *other* clients rests on the mock's mirror
+  plus code reading. B hearing A's music, B's volume change not affecting A, the "already playing" toast
+  arriving on a third client, and a remote Stop actually ending A's session all need 2–3 real instances.
+- **Join/leave cue suppression for bots was verified by reading the gate, not by listening.**
+- **The listener's panel can read oddly.** In `room-remote-music` the panel says "No track loaded" and its
+  status chip says IDLE while music *is* playing in the room — because the panel reports *this client's*
+  player, and the room's music belongs to somebody else. The "Stop for everyone" button sits beside it and
+  is correct; whether the panel should say something about the room's music is a design question, not a
+  bug, so it is raised rather than decided.
+- **`force_stop` on a person's identity is meaningless.** It is carried because it travels the same road as
+  `is_bot` and the registration frame has to be right from the first packet; every non-bot identity sends
+  `false` and nothing reads it. Noted so the next reader does not go looking for a meaning.
+- Everything from Part A §10 and Session 28 §6 still stands: a peer joining after a mute was set never
+  learns it; the `mute_list` conflates "mutes I set" with "mutes others set"; `--danger` as text fails
+  contrast app-wide (2.19 / 2.29 / 2.38 : 1); `spawn_audio_pump` is called twice; the pre-existing sub-AA
+  tile pairs (3.9, 3.56); `identifier: "ir.verio.app"` warns on macOS; `prepare_hotkey_capture` has no
+  caller; the `too_many_arguments` suppression in `verio-transport`; the 8 s boot smoke test still needs an
+  elevated shell; the untracked `.workbuddy-ai/` and `stitch_verio_desktop_interface_suite.zip`.
+
+### 11. PENDING USER ACTION
+
+- **Listen to the bot.** Two instances, one room, press Play, and confirm the music arrives and sounds
+  acceptable at 32 kbps. If it sounds thin, the bitrate is the thing to revisit — the plan says log the
+  observation and change nothing this session, so it is unchanged and this is the note.
+- **Decide the group-mute interaction.** Muting the *host* silences their voice peer; muting the *Music*
+  peer silences the music. A listener who wants quiet has to do both, and nothing says so. Whether a
+  single control should do both is a product decision.
+- **Decide whether the panel should describe the room's music** (see §10, "the listener's panel can read
+  oddly").
+- **Approve Part C** (the playlist UI) before it is started.
+
+### 12. Status
+
+Part B is complete, verified and committed. Part C is **not started** — the plan says stop after Part B
+and do not chain into Part C without approval.
+
+
 

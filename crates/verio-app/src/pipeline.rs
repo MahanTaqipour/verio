@@ -173,9 +173,25 @@ pub struct PipelineHandle {
     /// unmuting had to guess a level back, which is two authorities for one
     /// element — the failure this project keeps paying for.
     peer_mutes: Arc<Mutex<HashSet<String>>>,
+    /// Session 29b: the local music-monitor channel into the RX mixer.
+    ///
+    /// The bot session needs it because the relay does **not** echo a sender's own
+    /// datagrams — the host is a peer of their own bot, but never receives from it
+    /// — so the host's only way to hear the music their bot is playing is the
+    /// monitor path that already exists for exactly this purpose.
+    music_monitor_tx: mpsc::Sender<Vec<f32>>,
 }
 
 impl PipelineHandle {
+    /// Session 29b: where a music-bot session sends the host's own copy of the
+    /// audio it is playing into the room.
+    ///
+    /// A clone of the same sender the processing thread uses, so the bot's chunks
+    /// land in the same mixer buffer and obey the same deafen gate.
+    #[must_use]
+    pub fn music_monitor_handle(&self) -> mpsc::Sender<Vec<f32>> {
+        self.music_monitor_tx.clone()
+    }
     /// Play a synthesized audio cue (mute on, mute off, deafen) in local playback.
     pub fn play_earcon(&self, kind: EarconKind) {
         let _ = self.earcon_tx.send(kind);
@@ -390,6 +406,10 @@ pub fn start(
 
     // Session 13: local music-monitor chunks flow processing -> RX mixer.
     let (music_monitor_tx, music_monitor_rx) = mpsc::channel::<Vec<f32>>();
+    // Session 29b: a second sender, kept for the handle, so a music-bot session can
+    // push the host's own copy of what it is playing into the same mixer buffer.
+    // The processing thread takes the original.
+    let monitor_tx_for_handle = music_monitor_tx.clone();
 
     // --- PROCESSING thread ---
     let p_stop = Arc::clone(&stop);
@@ -462,6 +482,7 @@ pub fn start(
             earcon_tx,
             peer_volumes,
             peer_mutes,
+            music_monitor_tx: monitor_tx_for_handle,
         },
     ))
 }
@@ -668,7 +689,14 @@ fn processing_loop(
             // Otherwise: effective = !muted && (!ptt_mode || ptt_held).
             // Keep encoding while merely silent — DTX suppresses those
             // packets.
-            let music_active = music.is_active();
+            // Session 29b: while a bot session owns the bus, *it* pulls the chunks
+            // and transmits them. Two consumers would interleave half-chunks and
+            // both advance the queue, so the voice pipeline leaves the bus alone
+            // entirely. Everything music-shaped below then reads as "no music",
+            // which is right: this session is no longer the one injecting it, so
+            // it must not hold the transmit gate open, must not pick the music
+            // bitrate, and must not claim music presence to the room.
+            let music_active = pipeline_owns_music(music.is_active(), music.is_bot_owned());
             let mut using_music = false;
             if music_active && music.next_chunk(&mut music_buf) > 0 {
                 let vol = music.volume();
@@ -799,6 +827,15 @@ pub struct MusicStatus {
     pub queue_len: usize,
     /// When true the queue wraps from the last entry back to the first.
     pub queue_looping: bool,
+    /// Session 29b: playback stopped because the queue ran out — no successor and
+    /// no loop — rather than because the user paused.
+    ///
+    /// The music bot needs the difference: a pause must keep its session alive
+    /// ("queue non-empty or paused → bot stays alive"), while running out ends it.
+    /// Both show up as `playing == false`, so without this the bot would have to
+    /// re-derive the queue's successor rule itself, which is a second authority
+    /// for one answer.
+    pub queue_finished: bool,
 }
 
 impl Default for MusicStatus {
@@ -816,6 +853,7 @@ impl Default for MusicStatus {
             queue_index: None,
             queue_len: 0,
             queue_looping: false,
+            queue_finished: false,
         }
     }
 }
@@ -845,6 +883,18 @@ struct MusicInner {
     /// then incremented again by the advance, which is exactly the kind of
     /// two-place bookkeeping that drifts.
     advance_to: Option<usize>,
+    /// Session 29b: set when playback stopped because the queue ran out. See
+    /// [`MusicStatus::queue_finished`]. Cleared by anything that could make audio
+    /// available again — play, open, a queue jump, or adding to the queue.
+    queue_finished: bool,
+    /// Session 29b: a music-bot session owns this bus, so the *voice* pipeline must
+    /// not consume it.
+    ///
+    /// Both readers pull chunks from the same decoder, and `next_chunk` is what
+    /// advances the queue, so two consumers would interleave half-chunks and
+    /// double-advance. One owner at a time: while a bot is hosting, the bot pulls
+    /// and the pipeline's processing thread ignores the bus entirely.
+    bot_owned: bool,
 }
 
 /// Thread-safe music bus shared by the audio pipeline (which pulls 10 ms chunks
@@ -875,8 +925,27 @@ impl MusicSource {
                 queue_index: None,
                 queue_looping: false,
                 advance_to: None,
+                queue_finished: false,
+                bot_owned: false,
             }),
         }
+    }
+
+    /// Session 29b: hand the bus to a music-bot session, or take it back.
+    ///
+    /// Called on the command thread. The pipeline's processing thread reads it
+    /// once per 10 ms chunk, so a hand-over takes effect within one chunk — fast
+    /// enough that a stale owner cannot drain a meaningful amount of audio.
+    pub fn set_bot_owned(&self, owned: bool) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.bot_owned = owned;
+        }
+    }
+
+    /// Session 29b: true while a bot session, not the voice pipeline, owns the bus.
+    #[must_use]
+    pub fn is_bot_owned(&self) -> bool {
+        self.inner.lock().map(|g| g.bot_owned).unwrap_or(false)
     }
 
     /// Active == a track is loaded AND playing. This is what keeps the transmit
@@ -914,6 +983,9 @@ impl MusicSource {
         g.playing = false;
         g.queue_index = None;
         g.advance_to = None;
+        // A freshly opened track is material to play, so the queue is no longer
+        // "finished" even before the user presses play.
+        g.queue_finished = false;
         Ok(MusicInfo {
             path: info.path.display().to_string(),
             title: info.title,
@@ -929,6 +1001,10 @@ impl MusicSource {
             return Err("no track loaded".into());
         }
         g.playing = true;
+        // Resuming is the one thing that makes a finished queue untrue again
+        // without new material — `stop()` rewinds and `pause()` only flips
+        // `playing`, so neither clears this.
+        g.queue_finished = false;
         Ok(())
     }
 
@@ -1115,6 +1191,8 @@ impl MusicSource {
             g.queue_index = Some(index);
             g.playing = play;
             g.advance_to = None;
+            // Loading an entry means there is something to play again.
+            g.queue_finished = false;
             old
         };
         drop(old);
@@ -1198,6 +1276,8 @@ impl MusicSource {
                     // by `is_active`, and a track change must not flap it.
                     g.playing = true;
                     g.advance_to = None;
+                    // A track was installed, so whatever ran out before has not.
+                    g.queue_finished = false;
                     drop(g);
                     // Previous decoder is freed outside the lock.
                     drop(old);
@@ -1212,6 +1292,12 @@ impl MusicSource {
         if let Ok(mut g) = self.inner.lock() {
             g.playing = false;
             g.advance_to = None;
+            // Session 29b: the walk ran out of openable entries. This is the
+            // second of the two places playback can stop because the queue is
+            // over — the first is `next_chunk` finding no successor — and both
+            // must report it, or a bot would linger on a queue that ended via a
+            // broken file.
+            g.queue_finished = true;
         }
         false
     }
@@ -1259,6 +1345,7 @@ impl MusicSource {
             queue_index: g.queue_index,
             queue_len: g.queue.len(),
             queue_looping: g.queue_looping,
+            queue_finished: g.queue_finished,
         }
     }
 
@@ -1295,7 +1382,14 @@ impl MusicSource {
                 .and_then(|cur| Self::successor(cur, g.queue.len(), g.queue_looping))
             {
                 Some(next) => g.advance_to = Some(next),
-                None => g.playing = false,
+                None => {
+                    g.playing = false;
+                    // Session 29b: no successor and no loop, so the queue is over
+                    // as opposed to paused. `playing` alone cannot say which —
+                    // both are `false` — and the music bot ends its session on
+                    // this and only this.
+                    g.queue_finished = true;
+                }
             }
         }
         n
@@ -1314,6 +1408,20 @@ pub fn transmit_gate(loopback: bool, music_active: bool, tx_state: &TxState) -> 
 #[must_use]
 pub fn monitor_contributes(monitor: bool, deafened: bool, music_active: bool) -> bool {
     monitor && !deafened && music_active
+}
+
+/// Session 29b: does the **voice** pipeline treat music as part of its outgoing
+/// frame?
+///
+/// Two conditions, and the second is the one that is easy to forget: while a
+/// music-bot session is hosting, the bot pulls the chunks and transmits them, so
+/// this pipeline must not. Two consumers of one decoder would interleave
+/// half-chunks and both advance the queue.
+///
+/// Pure and single-caller so that a mutation has exactly one place to land.
+#[must_use]
+fn pipeline_owns_music(playing: bool, bot_owned: bool) -> bool {
+    playing && !bot_owned
 }
 
 /// Per-peer receiver stream with a dedicated Opus decoder and 40 ms jitter pre-buffer.
@@ -1924,5 +2032,123 @@ mod music_bus_tests {
         assert!(src.is_active(), "an explicit play starts it");
 
         let _ = std::fs::remove_file(&a);
+    }
+
+    // ------------------------------------------------- Session 29b bot bus ---
+
+    /// The hand-over itself. Both readers pull from one decoder and `next_chunk`
+    /// is what advances the queue, so exactly one of them may own the bus.
+    #[test]
+    fn a_bot_takes_the_music_bus_from_the_voice_pipeline() {
+        let src = MusicSource::new(1.0, false, false);
+        assert!(!src.is_bot_owned(), "nobody owns the bus until a bot starts");
+
+        src.set_bot_owned(true);
+        assert!(src.is_bot_owned());
+        src.set_bot_owned(false);
+        assert!(
+            !src.is_bot_owned(),
+            "a stop must hand the bus back, or the music player would go silent \
+             with no error anywhere"
+        );
+    }
+
+    #[test]
+    fn the_voice_pipeline_yields_the_bus_to_a_bot() {
+        assert!(
+            pipeline_owns_music(true, false),
+            "playing with no bot: the pipeline sends it"
+        );
+        assert!(
+            !pipeline_owns_music(true, true),
+            "playing under a bot: the bot sends it, not the pipeline"
+        );
+        assert!(
+            !pipeline_owns_music(false, false),
+            "not playing: nothing to send either way"
+        );
+    }
+
+    /// The distinction the bot's whole lifecycle rests on. Both cases are
+    /// `playing == false`; only one of them means "the session is over".
+    #[test]
+    fn a_finished_queue_is_not_a_pause() {
+        let path = std::env::temp_dir().join("verio_q_finished.wav");
+        write_tone(&path);
+
+        // A single-entry queue with no loop runs out.
+        let ran_out = MusicSource::new(1.0, false, false);
+        ran_out.queue_replace(vec![
+            MusicSource::describe_track(&path).expect("describe"),
+        ]);
+        ran_out.jump_to(0, true).expect("play");
+        drain(&ran_out, 400);
+        assert!(!ran_out.is_active(), "it stopped");
+        assert!(
+            ran_out.status().queue_finished,
+            "and it stopped because the queue ran out"
+        );
+
+        // The same track, paused, has not run out.
+        let paused = MusicSource::new(1.0, false, false);
+        paused.queue_replace(vec![
+            MusicSource::describe_track(&path).expect("describe"),
+        ]);
+        paused.jump_to(0, true).expect("play");
+        let mut chunk = [0.0_f32; RNNOISE_FRAME];
+        assert!(paused.next_chunk(&mut chunk) > 0, "audio before the pause");
+        paused.pause();
+        assert_eq!(paused.next_chunk(&mut chunk), 0, "paused yields nothing");
+        assert!(
+            !paused.status().queue_finished,
+            "a pause must keep a bot session alive; only running out ends it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A looping queue is never finished, however long it runs — otherwise a bot
+    /// hosting a loop would tear itself down at the end of the first track.
+    #[test]
+    fn a_looping_queue_never_reports_finished() {
+        let path = std::env::temp_dir().join("verio_q_loop_never.wav");
+        write_tone(&path);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![
+            MusicSource::describe_track(&path).expect("describe"),
+        ]);
+        src.set_queue_looping(true);
+        src.jump_to(0, true).expect("play");
+        // Two full passes: past the first end, where a non-looping queue stops.
+        drain(&src, 200);
+        assert!(src.is_active(), "a looping queue keeps playing");
+        assert!(!src.status().queue_finished, "and is never finished");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Resuming is the one thing that un-says "finished" without new material, and
+    /// the bot reads that flag to decide whether to end its session.
+    #[test]
+    fn playing_again_clears_the_finished_flag() {
+        let path = std::env::temp_dir().join("verio_q_replay.wav");
+        write_tone(&path);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![
+            MusicSource::describe_track(&path).expect("describe"),
+        ]);
+        src.jump_to(0, true).expect("play");
+        drain(&src, 400);
+        assert!(src.status().queue_finished, "precondition: it ran out");
+
+        src.play().expect("resume");
+        assert!(
+            !src.status().queue_finished,
+            "pressing play again means the queue has not finished"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -15,6 +15,7 @@
 import type {
   AudioState,
   DeviceList,
+  MusicBotState,
   MusicStatus,
   PeerInfo,
   QueueItem,
@@ -71,6 +72,14 @@ function peer(index: number, over: Partial<PeerInfo> = {}): PeerInfo {
     deafen: false,
     music: false,
     music_title: "",
+    // Session 29b: a person unless a fixture says otherwise. The bot peer in the
+    // roster is built from this same helper with `is_bot: true`, because a bot
+    // differs from a person in exactly one field.
+    is_bot: false,
+    // Session 29b Force Stop: a person never accepts a remote stop. The bot peer
+    // overrides this from the bot's own start, so the value on a bot fixture is the
+    // one the app would really have announced rather than a fixture's opinion.
+    force_stop: false,
     ...over,
   };
 }
@@ -81,6 +90,31 @@ function roster(
   overrides: Record<number, Partial<PeerInfo>> = {},
 ): PeerInfo[] {
   return Array.from({ length: count }, (_, i) => peer(i, overrides[i] ?? {}));
+}
+
+/**
+ * Session 29b Force Stop: a bot peer as somebody *else* sees it — a music session
+ * in the room that this client does not own.
+ *
+ * Needed because `music_bot_start` can only ever create *our* bot, and a bot in the
+ * roster is otherwise always ours. That makes the listener's half of Force Stop —
+ * the Stop control, and its disabled state — unreachable in the harness, which is
+ * exactly the half the plan describes for "other clients".
+ *
+ * `hostIndex` names the roster member the bot belongs to, so the Host chip has a
+ * voice card to land on: the two sessions share a persistent id and that is the only
+ * link between them.
+ */
+function remoteBotPeer(hostIndex: number, forceStop: boolean): PeerInfo {
+  const host = ROSTER_NAMES[hostIndex] ?? `peer${hostIndex + 1}`;
+  return peer(hostIndex + 1, {
+    is_bot: true,
+    name: "Music",
+    user_id: `user-${host.toLowerCase()}`,
+    force_stop: forceStop,
+    music: true,
+    music_title: MUSIC_TRACK.title,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +151,15 @@ export interface MockState {
    * an empty queue, which is also what exercises the EmptyState in the panel.
    */
   queue?: QueueItem[];
+  /**
+   * Session 29b: the music bot session, when a scenario has one running.
+   *
+   * Optional like `queue`, and for the same reason: almost every screen in the
+   * harness is not hosting, and making this required would mean editing thirty
+   * scenarios to say "no". A scenario that omits it is idle, which is what the
+   * real `music_bot_state` reports for a client that has not pressed Play.
+   */
+  bot?: MusicBotState;
 }
 
 export interface MockBehavior {
@@ -172,6 +215,10 @@ function settings(over: Partial<Settings> = {}): Settings {
     host_port: 8444,
     voice_bitrate_kbps: 32,
     music_bitrate_kbps: 96,
+    // Session 29b Force Stop: `Settings::default()` has this on, so the fixture
+    // does too — a mock defaulting to `false` would hide the feature in every
+    // screenshot and every browser check.
+    music_force_stop: true,
     ...over,
   };
 }
@@ -226,6 +273,7 @@ function music(over: Partial<MusicStatus> = {}): MusicStatus {
     queue_index: null,
     queue_len: 0,
     queue_looping: false,
+    queue_finished: false,
     ...over,
   };
 }
@@ -496,6 +544,50 @@ export const SCENARIOS: Scenario[] = [
         state: "connected",
         room_code: ROOM_CODE,
         peers: roster(2, { 0: { speaking: true } }),
+        diagnostics: diag(),
+      }),
+      music: music(),
+    },
+    behavior: {
+      latency: { read: 20, write: 30 },
+      failures: {},
+      micLevel: { enabled: true, db: -30 },
+    },
+  },
+  {
+    id: "room-remote-music",
+    label: "Room — somebody else is hosting music",
+    note: "A bot peer that is not ours, accepting a remote stop. The listener's Stop control is enabled here.",
+    state: {
+      settings: settings(),
+      devices: DEVICES,
+      audio: audio(),
+      room: room({
+        state: "connected",
+        room_code: ROOM_CODE,
+        peers: [...roster(2), remoteBotPeer(0, true)],
+        diagnostics: diag(),
+      }),
+      music: music(),
+    },
+    behavior: {
+      latency: { read: 20, write: 30 },
+      failures: {},
+      micLevel: { enabled: true, db: -30 },
+    },
+  },
+  {
+    id: "room-remote-music-no-force",
+    label: "Room — the host disabled force-stop",
+    note: "The same room, with the bot refusing a remote stop. The Stop control must be present but disabled, with the host's reason on its tooltip.",
+    state: {
+      settings: settings(),
+      devices: DEVICES,
+      audio: audio(),
+      room: room({
+        state: "connected",
+        room_code: ROOM_CODE,
+        peers: [...roster(2), remoteBotPeer(0, false)],
         diagnostics: diag(),
       }),
       music: music(),

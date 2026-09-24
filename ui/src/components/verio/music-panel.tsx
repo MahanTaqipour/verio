@@ -47,11 +47,44 @@ import {
   formatTime,
   type MusicController,
 } from "@/lib/use-music";
+import type { MusicBotController } from "@/lib/use-music-bot";
 
 export interface MusicPanelProps {
   music: MusicController;
+  /**
+   * Session 29b: the bot's state, and the Play/Stop policy that goes with it.
+   *
+   * The transport buttons below call *this* rather than `music` directly, because
+   * in a room pressing Play is not one action but two in sequence — start the
+   * player, then open the bot session that streams it. Outside a room it delegates
+   * straight back to `music`, so the panel needs no room awareness of its own.
+   */
+  bot: MusicBotController;
   /** True when this client is deafened — the local monitor is silenced. */
   deafened: boolean;
+  /**
+   * Session 29b Force Stop: this user's stored preference.
+   *
+   * Drives the toggle, and nothing else. It is applied when this user *becomes*
+   * host, so it says nothing about the music playing right now — which is why the
+   * listener's control below reads a different value.
+   */
+  forceStop: boolean;
+  /** True when a music bot is in the room, whoever owns it. */
+  botPresent: boolean;
+  /**
+   * Session 29b Force Stop: what the bot in this room announced it will accept.
+   *
+   * The only thing that may decide whether a Stop control is *enabled*. Taken from
+   * the wire rather than from `forceStop`, because the host may be somebody else
+   * entirely and their decision is the one that applies.
+   */
+  botAcceptsRemoteStop: boolean;
+  /** True while this client is in a room. */
+  inCall: boolean;
+  onSetForceStop: (on: boolean) => void;
+  /** Ask the room's host to stop. Whether it is honoured is theirs to decide. */
+  onRequestMusicStop: () => void;
   onClose: () => void;
   className?: string;
 }
@@ -63,9 +96,22 @@ function statusChip(music: MusicController): { tone: ChipTone; label: string } {
   return { tone: "neutral", label: "Idle" };
 }
 
-export function MusicPanel({ music, deafened, onClose, className }: MusicPanelProps) {
+export function MusicPanel({
+  music,
+  bot,
+  deafened,
+  forceStop,
+  botPresent,
+  botAcceptsRemoteStop,
+  inCall,
+  onSetForceStop,
+  onRequestMusicStop,
+  onClose,
+  className,
+}: MusicPanelProps) {
   const { status, queue, hasTrack } = music;
   const chip = statusChip(music);
+  const hosting = bot.state.hosting;
   const durationMs = music.durationMs;
   const seekMax = Math.max(1, Math.round(durationMs));
 
@@ -92,6 +138,18 @@ export function MusicPanel({ music, deafened, onClose, className }: MusicPanelPr
           </h2>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {/* Session 29b: hosting is a separate fact from playback state — the bot
+              session outlives a pause — so it gets its own chip rather than
+              overloading the one that reports what the player is doing. The two
+              disagree on purpose when the music is paused. */}
+          {hosting && (
+            <StateChip
+              tone="idle"
+              title="You are hosting the music for this room. Stop ends it for everyone."
+            >
+              Hosting
+            </StateChip>
+          )}
           <StateChip
             tone={chip.tone}
             leading={
@@ -161,14 +219,27 @@ export function MusicPanel({ music, deafened, onClose, className }: MusicPanelPr
             label={status?.playing ? "Pause track" : "Play track"}
             variant="secondary"
             size="lg"
-            onClick={() => void music.playPause()}
+            // Session 29b: not `music.playPause()`. In a room, starting playback is
+            // also what opens the bot session — and the room gets to refuse first,
+            // so a listener who presses Play is told the music is already playing
+            // instead of quietly broadcasting through the pre-29b voice path.
+            onClick={() => void bot.playPause()}
             disabled={!hasTrack}
           >
             {status?.playing ? <IconPause size={16} /> : <IconPlay size={16} />}
           </IconButton>
           <IconButton
+            // One stable name, deliberately. The first version of this made the
+            // label depend on hosting ("Stop the music for the room"), which is
+            // true but broke every harness that drives the control by label —
+            // `verify-music.mjs` waited 30s for "Stop playback" and timed out.
+            // The scope belongs on the *state*, not on the action: the Hosting
+            // chip beside the status already says it, and says who it applies to.
             label="Stop playback"
-            onClick={() => void music.stop()}
+            // Session 29b: stops the bot session too when this client hosts it. A
+            // stopped player with a live bot would be a peer sitting in the room
+            // sending nothing.
+            onClick={() => void bot.stop()}
             disabled={!hasTrack}
           >
             <IconStop size={16} />
@@ -208,33 +279,81 @@ export function MusicPanel({ music, deafened, onClose, className }: MusicPanelPr
         </div>
       </div>
 
-      {/* Monitor + add */}
+      {/* Monitor + Force Stop + add */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <Switch
-            label="Local monitor playback"
-            checked={Boolean(status?.monitor)}
-            onChange={(e) => void music.setMonitor(e.currentTarget.checked)}
-          />
-          <span className="text-11 text-text-dim">Local monitor</span>
-          {deafened && status?.active ? (
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+          <span className="flex min-w-0 items-center gap-2">
+            <Switch
+              label="Local monitor playback"
+              checked={Boolean(status?.monitor)}
+              onChange={(e) => void music.setMonitor(e.currentTarget.checked)}
+            />
+            <span className="text-11 text-text-dim">Local monitor</span>
+            {deafened && status?.active ? (
+              <span
+                className="flex items-center gap-1.5 text-11 text-warn"
+                title="Your client is deafened; the music monitor is silenced locally. Music still reaches the room."
+              >
+                <IconHeadphones size={14} className="shrink-0" />
+                Silenced locally
+              </span>
+            ) : null}
+          </span>
+
+          {/* Session 29b Force Stop. A *setting*, not a live control, so it sits
+              with the other music preference rather than with the transport — and
+              its title says when it takes effect, because a switch that visibly
+              changes nothing while music is already playing reads as broken. */}
+          <span className="flex min-w-0 items-center gap-2">
+            <Switch
+              label="Force Stop"
+              checked={forceStop}
+              onChange={(e) => onSetForceStop(e.currentTarget.checked)}
+            />
             <span
-              className="flex items-center gap-1.5 text-11 text-warn"
-              title="Your client is deafened; the music monitor is silenced locally. Music still reaches the room."
+              className="text-11 text-text-dim"
+              title="Let anyone in this room stop the music you are hosting. Applied the next time you start hosting, not to music already playing."
             >
-              <IconHeadphones size={14} className="shrink-0" />
-              Silenced locally
+              Force Stop
+            </span>
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Session 29b Force Stop: ending somebody else's music. Shown whenever a
+              bot is in the room and it is not ours, and *disabled* rather than
+              hidden when the host forbade it — a control that disappears leaves a
+              listener unsure the feature exists, and the tooltip is where the host's
+              decision gets explained. The tooltip lives on the wrapper, because a
+              disabled Button sets `pointer-events-none` and would never show one. */}
+          {inCall && !hosting && botPresent ? (
+            <span
+              title={
+                botAcceptsRemoteStop
+                  ? "Stop the music for everyone in this room."
+                  : "Host has disabled force-stop."
+              }
+            >
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<IconStop size={14} />}
+                disabled={!botAcceptsRemoteStop}
+                onClick={onRequestMusicStop}
+              >
+                Stop for everyone
+              </Button>
             </span>
           ) : null}
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<IconFolderOpen size={14} />}
+            onClick={() => void music.addFiles()}
+          >
+            Add files
+          </Button>
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          icon={<IconFolderOpen size={14} />}
-          onClick={() => void music.addFiles()}
-        >
-          Add files
-        </Button>
       </div>
 
       <div className="h-px w-full bg-border" />

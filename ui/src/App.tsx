@@ -13,6 +13,7 @@ import { IconButton } from "./components/ui/button";
 import { SectionLabel } from "./components/ui/field";
 import { IconError, IconX } from "./components/verio/icons";
 import { useMusic } from "./lib/use-music";
+import { useMusicBot } from "./lib/use-music-bot";
 import { comboFromEvent } from "./lib/hotkey";
 import { MusicPanel } from "./components/verio/music-panel";
 import { Lobby } from "./components/verio/lobby";
@@ -68,6 +69,15 @@ interface Settings {
   host_port: number;
   voice_bitrate_kbps: number;
   music_bitrate_kbps: number;
+  /**
+   * Session 29b Force Stop: may other peers stop the music this user hosts?
+   *
+   * A setting rather than live state. It is applied when this user *becomes* host,
+   * so toggling it while hosting affects the next bot session, never the running
+   * one — the value is announced to the room at join, and a bot that changed its
+   * mind mid-session would refuse a stop it had said it would accept.
+   */
+  music_force_stop: boolean;
 }
 
 interface DeviceEntry {
@@ -105,6 +115,22 @@ interface PeerInfo {
   /** Session 14: peer is playing music into the room. */
   music: boolean;
   music_title: string;
+  /**
+   * Session 29b: this peer is a music bot session, not a person. Declared by the
+   * peer itself and never inferred — the roster only ever sets this to `true`, so a
+   * signalling-sourced `false` cannot demote a bot whose relay `Hello` arrived first.
+   */
+  is_bot: boolean;
+  /**
+   * Session 29b Force Stop: this bot accepts a remote stop — the host's setting, as
+   * it stood when the bot joined.
+   *
+   * Meaningful only when `is_bot`, and only ever `true` for a peer that declared it
+   * on the wire. The room offers a Stop control only on a peer that is a bot *and*
+   * accepts one, so a host who disabled force-stop is not shown a button that would
+   * do nothing.
+   */
+  force_stop: boolean;
 }
 
 /**
@@ -266,7 +292,14 @@ export default function App() {
       setStatusMsg({ text: `Connected to room #${ev.payload.code}.` });
     }).then((u) => unlistens.push(u));
 
-    listen<{ name: string; uuid?: string; user_id?: string; arrived?: boolean }>(
+    listen<{
+      name: string;
+      uuid?: string;
+      user_id?: string;
+      is_bot?: boolean;
+      force_stop?: boolean;
+      arrived?: boolean;
+    }>(
       "peer_connected",
       (ev) => {
         const uuid = ev.payload.uuid || ev.payload.name;
@@ -289,6 +322,14 @@ export default function App() {
               deafen: existing?.deafen ?? false,
               music: existing?.music ?? false,
               music_title: existing?.music_title ?? "",
+              // Session 29b: same one-way rule as the Rust roster — a bot
+              // declaration is never withdrawn, because the signalling server
+              // cannot carry it at all and would send `false` for every peer.
+              is_bot: Boolean(ev.payload.is_bot || existing?.is_bot),
+              // Session 29b Force Stop: the same one-way rule, and for the same
+              // reason — only a relay `Hello` can carry this, so a signalling
+              // event's `false` must not revoke a decision we already learned.
+              force_stop: Boolean(ev.payload.force_stop || existing?.force_stop),
             },
           ].sort((a, b) => a.uuid.localeCompare(b.uuid));
         });
@@ -524,6 +565,72 @@ export default function App() {
     onStatus: (text, isError) => setStatusMsg({ text, isError }),
   });
   const [musicPanelOpen, setMusicPanelOpen] = useState(false);
+
+  /**
+   * Session 29b: the bot peer in this room, if there is one.
+   *
+   * Read from the roster rather than remembered, because it may not be ours. The
+   * host is whoever pressed Play — not the room's creator — so every client has to
+   * be able to tell "a bot is playing here" from "the bot is mine", and the roster
+   * is the only place that knows.
+   */
+  const botPeer = peers.find((p) => p.is_bot);
+  const bot = useMusicBot({
+    inCall: isInCall,
+    music,
+    botPeerPresent: botPeer !== undefined,
+    onStatus: (text, isError) => setStatusMsg({ text, isError }),
+  });
+
+  /**
+   * The host is the person whose *voice* peer shares the bot's persistent id.
+   *
+   * That id is the only link between the two sessions, and it is what makes the
+   * badge placeable at all: a peer called "Music" on its own does not say whose
+   * music it is. Empty while the bot's `Hello` is still in flight, which reads as
+   * "nobody is hosting" and is corrected within one gossip interval.
+   */
+  const botHostUserId = botPeer?.user_id ?? "";
+
+  /**
+   * Session 29b Force Stop: this user's preference, and the running bot's decision.
+   *
+   * Two different things, deliberately kept apart.
+   *
+   * `forceStop` is the *setting* — stored, and applied the next time this user
+   * becomes host. It drives the toggle, and it says nothing about the music that is
+   * playing right now.
+   *
+   * `botAcceptsRemoteStop` is what the bot in the room actually announced, which is
+   * the only thing that may decide whether a Stop control is offered. It is `false`
+   * while no bot is present, because there is nothing to stop — and `false` for a
+   * bot whose host disabled force-stop, which is what keeps a listener from being
+   * shown a button that would do nothing.
+   */
+  const forceStop = settings?.music_force_stop ?? true;
+  const botAcceptsRemoteStop = botPeer?.force_stop ?? false;
+
+  const handleSetMusicForceStop = (on: boolean) => {
+    setSettings((prev) => (prev ? { ...prev, music_force_stop: on } : prev));
+    void invoke("set_music_force_stop", { enabled: on }).catch((e) => {
+      // Put the switch back rather than leave it showing a value that was never
+      // stored — a toggle that lies about what will be applied next time you host
+      // is worse than one that visibly failed.
+      setSettings((prev) => (prev ? { ...prev, music_force_stop: !on } : prev));
+      setStatusMsg({
+        text: `Could not save the Force Stop setting: ${e}`,
+        isError: true,
+      });
+    });
+  };
+
+  const handleRequestMusicStop = () => {
+    // Reports only that the request left. Whether the music actually stops is the
+    // host's decision, and the roster — not this promise — is what will show it.
+    void invoke("request_music_stop").catch((e) =>
+      setStatusMsg({ text: `${e}`, isError: true }),
+    );
+  };
 
   const handleSetVoiceQuality = async (kbps: number) => {
     // Reports the outcome instead of assuming it. The legacy version did
@@ -832,6 +939,7 @@ export default function App() {
                 roomMutes={roomMutes}
                 onToggleRoomMute={handleToggleRoomMute}
                 selfUserId={selfUserId}
+                botHostUserId={botHostUserId}
               />
 
               {/* Live network diagnostics — opened from the header's status chip,
@@ -952,7 +1060,18 @@ export default function App() {
         {musicPanelOpen && (
           <MusicPanel
             music={music}
+            bot={bot}
             deafened={audioState.deafened}
+            // Session 29b Force Stop. The toggle edits the setting; the two
+            // listener-facing values decide whether this client may end somebody
+            // else's music, and neither is derived from the setting above — only
+            // the host's own announcement can say what the host will accept.
+            forceStop={forceStop}
+            botPresent={botPeer !== undefined}
+            botAcceptsRemoteStop={botAcceptsRemoteStop}
+            inCall={isInCall}
+            onSetForceStop={handleSetMusicForceStop}
+            onRequestMusicStop={handleRequestMusicStop}
             onClose={() => setMusicPanelOpen(false)}
             className="mx-auto my-4 w-full max-w-140"
           />

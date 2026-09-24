@@ -81,6 +81,16 @@ pub struct Settings {
     pub music_volume: f32,
     pub music_loop: bool,
     pub music_monitor: bool,
+    /// Session 29b: may another peer stop the music this user is hosting?
+    ///
+    /// Defaults to `true` — the plan's "default: ON" — and is stored here, in the
+    /// settings blob in the database, so it survives a restart.
+    ///
+    /// Applied at the moment the user *becomes* host: it is read when the bot is
+    /// spawned and fixed for that session's life. So toggling it changes the next
+    /// bot, never the running one, which is what lets the value be announced once
+    /// at join instead of broadcast as it changes.
+    pub music_force_stop: bool,
     /// Last folder the music file dialog was pointed at.
     pub music_last_dir: Option<String>,
     /// Session 14: Opus bitrate for voice (kbps). 32 is the tuned default.
@@ -113,6 +123,7 @@ impl Default for Settings {
             music_volume: 1.0,
             music_loop: false,
             music_monitor: false,
+            music_force_stop: true,
             music_last_dir: None,
             voice_bitrate_kbps: 32,
             music_bitrate_kbps: 96,
@@ -390,6 +401,53 @@ mod tests {
         assert_eq!(s.hotkeys.mute, "Ctrl+Shift+M");
         assert!(s.noise_suppression);
         assert!(!s.loopback);
+    }
+
+    // -- Session 29b Force Stop ----------------------------------------------
+
+    /// The plan's "default: ON" is a requirement, not a comment. A default of
+    /// `false` would ship a feature that is invisible until somebody finds it, and
+    /// would make a listener's Stop button dead on first use.
+    #[test]
+    fn force_stop_defaults_to_on() {
+        assert!(
+            Settings::default().music_force_stop,
+            "Force Stop has to default to on"
+        );
+    }
+
+    /// And it stays ON for a blob written before the field existed. This leans on the
+    /// container-level `#[serde(default)]` filling a missing field from
+    /// `Settings::default()`, which is worth pinning: a `bool` that quietly defaulted
+    /// to `false` would disable the feature for every existing user without a word.
+    #[test]
+    fn a_stored_blob_without_force_stop_gets_it_on() {
+        let s: Settings =
+            serde_json::from_str(r#"{"nickname":"x","music_volume":0.5}"#).expect("parse");
+        assert_eq!(s.nickname, "x");
+        assert!(
+            s.music_force_stop,
+            "an older settings blob must not silently disable Force Stop"
+        );
+    }
+
+    /// A setting that did not survive a restart would reset the moment the app
+    /// closed, which is indistinguishable from a toggle that does not work.
+    #[test]
+    fn force_stop_survives_a_restart() {
+        let dir = temp_dir("force-stop");
+        {
+            let store = SettingsStore::load(open(&dir), &dir);
+            assert!(store.get().music_force_stop, "defaults on");
+            store.update(|s| s.music_force_stop = false);
+            store.flush();
+        }
+        let reloaded = SettingsStore::load(open(&dir), &dir);
+        assert!(
+            !reloaded.get().music_force_stop,
+            "the toggle did not survive a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

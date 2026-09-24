@@ -46,6 +46,35 @@ pub struct Identity {
     /// predates Session 29, or a test that does not care) — never invent one.
     #[serde(default)]
     pub user_id: String,
+    /// Session 29b: this session is a music bot, not a person. `false` means
+    /// "unknown or not a bot" — a peer that predates the field is not a bot.
+    ///
+    /// Declared by the bot's own session, never inferred: a client cannot tell a
+    /// bot from a person by name, and guessing from "this uuid shares a `user_id`
+    /// with another peer" would misread two windows of the same client.
+    ///
+    /// This struct is also what the client sends the signalling server, whose own
+    /// `PeerIdentity` has neither this field nor `user_id`; serde ignores unknown
+    /// fields, so adding one here needs no server change. The server therefore
+    /// cannot echo it back, and the authoritative carrier is the relay `Hello`.
+    #[serde(default)]
+    pub is_bot: bool,
+    /// Session 29b: may other peers stop this bot session?
+    ///
+    /// Meaningful only on a bot's identity. Every other identity carries `false`,
+    /// where nothing reads it — the field is here rather than on the bot alone
+    /// because it travels the same road as `is_bot`, and the two are read together:
+    /// a peer only offers a Stop control on a tile that is a bot *and* accepts one.
+    ///
+    /// Fixed when the bot is spawned. The host's "Force Stop" setting is applied at
+    /// the moment they become host, so this value cannot change for the lifetime of
+    /// a session — which is exactly why it can ride the join announcement instead of
+    /// needing a message of its own to broadcast a change.
+    ///
+    /// `false` is the fail-closed default: a peer that never says so gets no Stop
+    /// control, rather than one that appears to work and is silently ignored.
+    #[serde(default)]
+    pub force_stop: bool,
     pub name: String,
     pub version: String,
 }
@@ -416,6 +445,8 @@ mod tests {
         Identity {
             uuid: Uuid::new_v4(),
             user_id: format!("user-{name}"),
+            is_bot: false,
+            force_stop: false,
             name: name.to_string(),
             version: "0.1.0".to_string(),
         }
@@ -518,6 +549,8 @@ mod tests {
         let mk = |name: &str, id: u128| Identity {
             uuid: Uuid::from_u128(id),
             user_id: format!("user-{name}"),
+            is_bot: false,
+            force_stop: false,
             name: name.to_string(),
             version: "0.0.0".to_string(),
         };

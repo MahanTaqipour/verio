@@ -40,6 +40,12 @@ export interface Settings {
   host_port: number;
   voice_bitrate_kbps: number;
   music_bitrate_kbps: number;
+  /**
+   * Session 29b Force Stop: may other peers stop the music this user hosts?
+   * Defaults to `true` — `Settings::default()` in the Rust — and is applied when
+   * the user becomes host, not while music is already playing.
+   */
+  music_force_stop: boolean;
 }
 
 export interface DeviceEntry {
@@ -79,6 +85,17 @@ export interface PeerInfo {
   /** Session 14: this peer is playing music into the room. */
   music: boolean;
   music_title: string;
+  /**
+   * Session 29b: this peer is a music bot session, not a person. Declared by the
+   * peer itself; never inferred, and never withdrawn.
+   */
+  is_bot: boolean;
+  /**
+   * Session 29b Force Stop: this bot accepts a remote stop. Meaningful only when
+   * `is_bot`, and only ever `true` for a peer that declared it on the wire — which
+   * is why the mock sets it from the bot's own start, not from a fixture default.
+   */
+  force_stop: boolean;
 }
 
 export interface MusicStatus {
@@ -95,6 +112,19 @@ export interface MusicStatus {
   queue_index: number | null;
   queue_len: number;
   queue_looping: boolean;
+  /**
+   * Session 29b: the queue ran out, as opposed to being paused. Both leave
+   * `playing` false, and the bot session survives one of them and not the other.
+   * Carried so this mirror stays a mirror; nothing in the UI reads it.
+   */
+  queue_finished: boolean;
+}
+
+/** Session 29b: mirrors `BotState` in ui/src-tauri/src/lib.rs. */
+export interface MusicBotState {
+  hosting: boolean;
+  session_id: string | null;
+  host_name: string | null;
 }
 
 /** Mirrors `verio_app::pipeline::QueueItem`. */

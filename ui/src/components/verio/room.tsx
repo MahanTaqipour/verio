@@ -97,6 +97,16 @@ export interface RoomPeer {
   deafen: boolean;
   music: boolean;
   music_title: string | null;
+  /**
+   * Session 29b: this peer is a music bot session, not a person.
+   *
+   * It is an ordinary peer in every other respect — same relay, same control
+   * channel, same per-peer volume — which is exactly why it gets an ordinary tile
+   * with an ordinary volume slider rather than a bespoke control. What the flag
+   * changes is only how the tile is drawn, and that a bot is not counted as a
+   * participant.
+   */
+  is_bot: boolean;
 }
 
 export interface RoomProps {
@@ -123,6 +133,15 @@ export interface RoomProps {
   onToggleRoomMute: (userId: string, muted: boolean) => void;
   /** This user's own persistent id, to tell whether a mute names them. */
   selfUserId: string;
+  /**
+   * Session 29b: the persistent id of whoever is hosting the music, read from the
+   * bot peer's `user_id`. Empty when nobody is hosting.
+   *
+   * The badge goes on the host's *voice* card rather than on the Music card,
+   * because the card that needs explaining is the person's: two peers appear for
+   * one person, and this is what says which of them is in charge of the music.
+   */
+  botHostUserId: string;
   className?: string;
 }
 
@@ -178,7 +197,39 @@ function getInitials(name?: string | null): string {
  * still be visible"), and neither `design.md` nor the deck asks for a dimmed
  * avatar. So the fill stays `--idle` and the chips do the talking.
  */
-function Avatar({ name, speaking }: { name: string; speaking: boolean }) {
+function Avatar({
+  name,
+  speaking,
+  isBot,
+}: {
+  name: string;
+  speaking: boolean;
+  isBot?: boolean;
+}) {
+  // Session 29b: a bot gets a glyph and a tinted disc, not initials on a solid one.
+  //
+  // Initials would render "M" for "Music" — indistinguishable from a person whose
+  // name starts with M — and telling the two apart is the entire job of this
+  // treatment, because one person now appears as two peers.
+  //
+  // The colours are the `accent` chip tone's three classes, verbatim: this is not a
+  // new colour combination, it is the one `state-chip.tsx` already ships for
+  // "actively putting audio into the room", on a round shape. Inventing a tint here
+  // would mean a pair nobody has measured. `accent` cannot collide with the speaking
+  // fill below because a bot never speaks and a person never plays through the bot's
+  // session, so a tile is never both.
+  if (isBot) {
+    return (
+      <span
+        className={cn(
+          "grid size-8 shrink-0 place-items-center rounded-full border",
+          "border-accent/25 bg-accent/8 text-accent",
+        )}
+      >
+        <IconMusic size={14} />
+      </span>
+    );
+  }
   return (
     <span
       className={cn(
@@ -216,6 +267,8 @@ function PeerTile({
   muted,
   deafened,
   isSelf,
+  isBot,
+  host,
   music,
   musicTitle,
   volume,
@@ -230,6 +283,10 @@ function PeerTile({
   muted: boolean;
   deafened: boolean;
   isSelf?: boolean;
+  /** Session 29b: draw the bot treatment. */
+  isBot?: boolean;
+  /** Session 29b: this peer is the one hosting the music. */
+  host?: boolean;
   music?: boolean;
   musicTitle?: string | null;
   volume?: number;
@@ -245,7 +302,16 @@ function PeerTile({
   children?: ReactNode;
 }) {
   const locallyMuted = volume === 0;
-  const canRoomMute = onToggleRoomMute !== undefined;
+  /**
+   * Session 29b: never offered on a bot's tile.
+   *
+   * A room mute is keyed on the persistent id, and a bot shares its host's — so
+   * the button here would silence the *person's* voice too while labelling itself
+   * "Mute Music for everyone". Two buttons for one key, and the second one lies
+   * about what it does. The chip is a different matter and stays: when the host is
+   * room-muted the bot really is silenced for the room, and saying so is honest.
+   */
+  const canRoomMute = onToggleRoomMute !== undefined && !isBot;
 
   return (
     <Panel
@@ -258,7 +324,7 @@ function PeerTile({
       )}
     >
       <div className="flex min-w-0 items-start gap-2.5">
-        <Avatar name={name} speaking={speaking} />
+        <Avatar name={name} speaking={speaking} isBot={isBot} />
 
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <span className="truncate text-14 text-text" title={name}>
@@ -268,6 +334,15 @@ function PeerTile({
               squeezing the name to nothing. */}
           <div className="flex flex-wrap items-center gap-1">
             {isSelf && <Chip tone="neutral">You</Chip>}
+            {/* Session 29b: the badge the plan asked to keep "subtle, not loud".
+                `idle` is the tone for "quiet, connected, at rest" — a role rather
+                than an action or a warning — and it is the pair the music panel's
+                "Paused" chip already ships, so it adds no unmeasured colour. */}
+            {host && (
+              <Chip tone="idle" title="Hosting the music for this room">
+                Host
+              </Chip>
+            )}
             {speaking && <Chip tone="accent">Speaking</Chip>}
             {/* Icon-only chips. The glyph carries the state, so the accessible
                 name has to come from `ariaLabel` — every icon in the module is
@@ -409,6 +484,7 @@ export function Room({
   roomMutes,
   onToggleRoomMute,
   selfUserId,
+  botHostUserId,
   className,
 }: RoomProps) {
   // `peers` is remote only, so the participant count is peers + you. The legacy
@@ -416,7 +492,20 @@ export function Room({
   // enforces a capacity, so the app cannot know it and an eleventh joiner would
   // have produced "11 of 10". PROJECT.md documents 2–10 as the design target,
   // which is not the same as a limit the client can report.
-  const count = peers.length + 1;
+  //
+  // Session 29b: a bot is not a participant. Counting it would make a two-person
+  // call with music read "3 participants", and — worse — it would stop the room
+  // saying "Waiting for others" to a host who really is on their own, because their
+  // own bot kept the roster non-empty.
+  const humans = peers.filter((p) => !p.is_bot);
+  const count = humans.length + 1;
+
+  /**
+   * Session 29b: is the music being hosted by *this* user? The bot shares its
+   * host's persistent id, so the self tile needs the same comparison the peer
+   * tiles get — the host's own card carries the badge too.
+   */
+  const selfHosts = botHostUserId !== "" && botHostUserId === selfUserId;
 
   /**
    * Session 29: presence, not truthiness. `by` is legitimately the empty string
@@ -523,6 +612,7 @@ export function Room({
                 muted={self.muted}
                 deafened={self.deafened}
                 isSelf
+                host={selfHosts}
               >
                 <MicLevelMeter ref={micMeterRef} className="min-w-0 flex-1" />
               </PeerTile>
@@ -535,6 +625,12 @@ export function Room({
                   speaking={p.speaking}
                   muted={p.mute}
                   deafened={p.deafen}
+                  isBot={p.is_bot}
+                  // The badge belongs to the *voice* card, so the bot's own tile
+                  // never carries it — even though it shares the id that selects it.
+                  host={
+                    !p.is_bot && p.user_id !== "" && p.user_id === botHostUserId
+                  }
                   music={p.music}
                   musicTitle={p.music_title}
                   volume={peerVolumes[p.uuid] ?? 1}
@@ -553,7 +649,7 @@ export function Room({
               </li>
             ))}
 
-            {peers.length === 0 && (
+            {humans.length === 0 && (
               // A dashed slot, not a peer tile: it reads as "space waiting to be
               // filled" rather than as a participant with no name.
               <li>

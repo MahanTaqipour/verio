@@ -216,6 +216,17 @@ export function MockHarness({ transport }: MockHarnessProps) {
         >
           music pause
         </button>
+        {/* Session 29b. Labelled statically on purpose: reading `state.bot` here
+            would give a live value that never re-renders, so the label would go
+            stale the moment the button was used — the same trap the mic button
+            above falls into. */}
+        <button
+          type="button"
+          style={btn}
+          onClick={() => transport.toggleMusicBot()}
+        >
+          toggle bot
+        </button>
         <button
           type="button"
           style={btn}

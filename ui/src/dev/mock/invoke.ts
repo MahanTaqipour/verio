@@ -27,7 +27,7 @@ import {
   type MockState,
   type Scenario,
 } from "./fixtures";
-import type { QueueItem } from "./types";
+import type { MusicBotState, QueueItem } from "./types";
 
 // ---------------------------------------------------------------------------
 // window.__TAURI_INTERNALS__ typing
@@ -73,6 +73,14 @@ export interface MockTransport {
   emitRoomError(message: string): void;
   emitAudioError(message: string): void;
   setMusicPlaying(playing: boolean): void;
+  /**
+   * Session 29b: start or end the music bot session.
+   *
+   * Routed through the real command path rather than poking `state`, so the harness
+   * exercises the refusals too — a control that bypassed them would let the harness
+   * show a state the app can never reach.
+   */
+  toggleMusicBot(): void;
   /** Turn the synthetic mic level stream on or off at runtime. */
   setMicLevel(enabled: boolean): void;
   /** Emit a short input_level sweep to exercise the imperative meter. */
@@ -82,6 +90,25 @@ export interface MockTransport {
 }
 
 const MAX_LOG = 60;
+
+/**
+ * Session 29b: a client that is not hosting. Matches what `music_bot_state`
+ * returns from Rust for a client that has never pressed Play.
+ */
+const IDLE_BOT: MusicBotState = {
+  hosting: false,
+  session_id: null,
+  host_name: null,
+};
+
+/**
+ * Session 29b: the bot session's wire id.
+ *
+ * Fixed rather than generated, so a scenario that wants to name the bot peer in a
+ * fixture cannot drift from the one `music_bot_start` creates — and so the Music
+ * tile keeps its identity when the harness re-clones state.
+ */
+const BOT_UUID = "b07b07b0-1234-4abc-8def-000000000b07";
 
 // ---------------------------------------------------------------------------
 // Install
@@ -515,6 +542,30 @@ export function installMockTransport(scenarioId: string): MockTransport {
         emitMusicStatus();
         return null;
 
+      // --- Session 29b Force Stop --------------------------------------------
+      case "set_music_force_stop":
+        // A setting, so this is the whole effect: it is read by `music_bot_start`
+        // the next time this client becomes host, and by nothing else. In
+        // particular it must not touch a bot that is already running, which is the
+        // plan's "applied each time the user becomes host".
+        state.settings.music_force_stop = Boolean(args.enabled);
+        return null;
+
+      case "request_music_stop": {
+        // Mirrors `RoomManager::request_music_stop`, which fails only when there is
+        // no live transport. It deliberately does *not* consult the host's
+        // decision: the frame leaves either way, and whether it is honoured belongs
+        // to whoever owns the bot. A mock that refused here would enforce a rule the
+        // app does not have — and would hide the very asymmetry this feature is.
+        if (state.room.state !== "connected") {
+          fail("Join a room before stopping its music.");
+        }
+        // Nothing is stopped, and that is the honest outcome: this client owns no
+        // bot, so the music keeps playing here until the *host* acts. The harness
+        // asserts exactly that, so a UI that faked a local stop would fail.
+        return null;
+      }
+
       // --- music queue (Session 20) ------------------------------------------
       // Mirrors the Rust side: queue mutation only appends/removes/reorders.
       // It never loads a track, because `MusicSource::queue_append` does not
@@ -640,6 +691,79 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return null;
       }
 
+      // --- Session 29b: the music bot session ---
+      case "music_bot_state":
+        return structuredClone(state.bot ?? IDLE_BOT);
+
+      case "music_bot_start": {
+        if (!state.bot?.hosting) {
+          // The same two refusals, in the same order, as `music_bot_start` in
+          // ui/src-tauri/src/lib.rs. Duplicating them is the point: the mock has to
+          // be able to *fail* the way the real command fails, or the toast it
+          // drives is untestable.
+          //
+          // `fail`, not `new Error`: Rust returns `Err(String)`, so the rejection
+          // value is a bare string. An Error here would make the same refusal read
+          // "Error: Music is already playing…" in the harness and
+          // "Music is already playing…" in the app.
+          if (state.room.peers.some((p) => p.is_bot)) {
+            fail("Music is already playing in this room.");
+          }
+          if (!state.music.active) {
+            fail("Press play before sending music to the room.");
+          }
+          state.room.peers.push({
+            uuid: BOT_UUID,
+            // The bot shares its host's persistent id. That is the only link
+            // between the two sessions, and it is what lets the UI put the Host
+            // badge on the right voice card.
+            user_id: state.room.self_user_id,
+            name: "Music",
+            speaking: false,
+            mute: false,
+            deafen: false,
+            music: true,
+            music_title: state.music.title ?? "",
+            is_bot: true,
+            // Session 29b Force Stop: read from settings at the moment the user
+            // becomes host, exactly as `music_bot_start` in the Rust does. It cannot
+            // come from the fixture: a listener's Stop control is drawn from this
+            // value, so a mock that invented it would test a decision the app never
+            // makes.
+            force_stop: state.settings.music_force_stop,
+          });
+          state.bot = {
+            hosting: true,
+            session_id: BOT_UUID,
+            host_name: state.settings.nickname,
+          };
+          void emit("peer_connected", {
+            name: "Music",
+            uuid: BOT_UUID,
+            user_id: state.room.self_user_id,
+            is_bot: true,
+            force_stop: state.settings.music_force_stop,
+            arrived: true,
+          });
+          void emit("music_bot_changed", structuredClone(state.bot));
+        }
+        return null;
+      }
+
+      case "music_bot_stop": {
+        if (state.bot?.hosting) {
+          const uuid = state.bot.session_id;
+          state.bot = structuredClone(IDLE_BOT);
+          state.room.peers = state.room.peers.filter((p) => p.uuid !== uuid);
+          void emit("peer_disconnected", {
+            reason: "peer left room",
+            peer_id: uuid,
+          });
+          void emit("music_bot_changed", structuredClone(state.bot));
+        }
+        return null;
+      }
+
       case "debug_log":
         // eslint-disable-next-line no-console
         console.debug("[verio mock] debug_log:", args.msg);
@@ -715,6 +839,11 @@ export function installMockTransport(scenarioId: string): MockTransport {
         deafen: false,
         music: false,
         music_title: "",
+        // Session 29b: a simulated person, never a bot. The bot peer is created
+        // only by `music_bot_start`, which is the one path that declares it.
+        is_bot: false,
+        // And a person never accepts a remote stop.
+        force_stop: false,
       });
       // `arrived: true` because this control simulates a peer actually joining,
       // which is the only thing that should announce itself or play a cue. The
@@ -758,6 +887,16 @@ export function installMockTransport(scenarioId: string): MockTransport {
         state.music.position_ms = 96_000;
       }
       emitMusicStatus();
+    },
+    toggleMusicBot() {
+      const cmd = state.bot?.hosting ? "music_bot_stop" : "music_bot_start";
+      void handleCommand(cmd).catch((e) => {
+        // A refusal is the expected answer here — "press play first" is what the
+        // harness gets if it is clicked with no track loaded — so it is reported
+        // rather than swallowed, and never rethrown into the click handler.
+        // eslint-disable-next-line no-console
+        console.warn(`[verio mock] ${cmd}: ${String(e)}`);
+      });
     },
     setMicLevel(enabled) {
       scenario.behavior.micLevel.enabled = enabled;

@@ -10,6 +10,7 @@
 
 pub mod db;
 pub mod hotkeys;
+pub mod music_bot;
 pub mod pipeline;
 pub mod room;
 pub mod settings;
