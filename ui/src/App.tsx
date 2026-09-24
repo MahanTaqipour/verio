@@ -593,6 +593,25 @@ export default function App() {
   const botHostUserId = botPeer?.user_id ?? "";
 
   /**
+   * Session 29c: the room's music, for the panel of a listener who is not hosting.
+   *
+   * The title needs no new wire work: the bot already announces it as
+   * `music_title` in its control-channel `State`, immediately on every track
+   * change and every 3 s, and the roster has carried it since Session 14. What the
+   * wire does *not* carry is whose music it is — a bot is always named "Music" —
+   * so the host is resolved exactly the way the Host badge is: the voice peer
+   * sharing the bot's persistent id.
+   *
+   * Both are empty in the ordinary case where this client is the host, because
+   * `peers` holds remote peers only and no remote peer shares our own id.
+   */
+  const roomMusicTitle = botPeer?.music_title ?? "";
+  const roomMusicHost =
+    botHostUserId === ""
+      ? ""
+      : (peers.find((p) => !p.is_bot && p.user_id === botHostUserId)?.name ?? "");
+
+  /**
    * Session 29b Force Stop: this user's preference, and the running bot's decision.
    *
    * Two different things, deliberately kept apart.
@@ -1070,6 +1089,10 @@ export default function App() {
             botPresent={botPeer !== undefined}
             botAcceptsRemoteStop={botAcceptsRemoteStop}
             inCall={isInCall}
+            // Session 29c: the room's music, for a listener who is not hosting.
+            // Both come from the roster, not from this client's player.
+            roomMusicTitle={roomMusicTitle}
+            roomMusicHost={roomMusicHost}
             onSetForceStop={handleSetMusicForceStop}
             onRequestMusicStop={handleRequestMusicStop}
             onClose={() => setMusicPanelOpen(false)}

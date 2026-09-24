@@ -27,6 +27,8 @@ import { EmptyState } from "@/components/verio/empty-state";
 import { StateChip, TONE_DOT, type ChipTone } from "@/components/verio/state-chip";
 import { Panel } from "@/components/ui/surface";
 import {
+  IconChevronDown,
+  IconChevronUp,
   IconFileAudio,
   IconFolderOpen,
   IconHeadphones,
@@ -82,6 +84,24 @@ export interface MusicPanelProps {
   botAcceptsRemoteStop: boolean;
   /** True while this client is in a room. */
   inCall: boolean;
+  /**
+   * Session 29c: the track the room's music peer is playing.
+   *
+   * Read from the bot peer's `music_title`, which the bot announces over the
+   * control channel on every track change and every 3 s. Empty until that first
+   * announcement lands, and empty when the bot has nothing loaded.
+   */
+  roomMusicTitle: string;
+  /**
+   * Session 29c: the person hosting the room's music.
+   *
+   * Deliberately not the bot's own name — that is always "Music", which says
+   * nothing about whose music it is. This is the *voice* peer that shares the
+   * bot's persistent id, the same link the Host badge is placed by. Empty while
+   * that peer is unknown, which the panel renders as "somebody else's music"
+   * rather than guessing a name.
+   */
+  roomMusicHost: string;
   onSetForceStop: (on: boolean) => void;
   /** Ask the room's host to stop. Whether it is honoured is theirs to decide. */
   onRequestMusicStop: () => void;
@@ -104,6 +124,8 @@ export function MusicPanel({
   botPresent,
   botAcceptsRemoteStop,
   inCall,
+  roomMusicTitle,
+  roomMusicHost,
   onSetForceStop,
   onRequestMusicStop,
   onClose,
@@ -114,6 +136,29 @@ export function MusicPanel({
   const hosting = bot.state.hosting;
   const durationMs = music.durationMs;
   const seekMax = Math.max(1, Math.round(durationMs));
+
+  /**
+   * Session 29c: somebody else is hosting the music in this room.
+   *
+   * All three conditions are load-bearing. `inCall` because a bot only exists in
+   * a room; `!hosting` because when *we* host, this panel is describing our own
+   * player and the Hosting chip already says so; `botPresent` because a listener
+   * with no bot in the room has nothing to report but their own player.
+   */
+  const remoteMusic = inCall && !hosting && botPresent;
+
+  /**
+   * The line a listener reads instead of "No track loaded".
+   *
+   * Built only from what the room actually told us, rather than padded with
+   * placeholders: with no title yet it reads "Room music", and while the host's
+   * voice peer is unknown the clause is dropped rather than filled with a guess.
+   * Both are transient — the bot re-announces every 3 s.
+   */
+  const roomLine =
+    "Room music" +
+    (roomMusicTitle ? `: ${roomMusicTitle}` : "") +
+    (roomMusicHost ? ` — hosted by ${roomMusicHost}` : "");
 
   /** Send the seek for a raw slider value. No-op when nothing is loaded. */
   const commitSeek = (raw: number) => {
@@ -150,14 +195,21 @@ export function MusicPanel({
               Hosting
             </StateChip>
           )}
-          <StateChip
-            tone={chip.tone}
-            leading={
-              <span className={cn("size-1.5 rounded-full", TONE_DOT[chip.tone])} />
-            }
-          >
-            {chip.label}
-          </StateChip>
+          {/* Session 29c: omitted while somebody else hosts, and that is the point
+              rather than an oversight. This chip reports *this client's* player —
+              "Sending to room" / "Paused" / "Idle" — and none of those three is
+              true of somebody else's music. Leaving it in place is precisely how
+              the panel came to read "Idle" while the room was plainly playing. */}
+          {!remoteMusic && (
+            <StateChip
+              tone={chip.tone}
+              leading={
+                <span className={cn("size-1.5 rounded-full", TONE_DOT[chip.tone])} />
+              }
+            >
+              {chip.label}
+            </StateChip>
+          )}
           <IconButton label="Collapse music player panel" size="sm" onClick={onClose}>
             <IconX size={14} />
           </IconButton>
@@ -165,19 +217,36 @@ export function MusicPanel({
       </header>
 
       {/* Track identity */}
-      <div className="flex min-w-0 flex-col gap-1">
-        {status?.title ? (
-          <>
-            <span className="truncate text-13 text-text">{status.title}</span>
-            <span className="flex min-w-0 items-center gap-1.5 text-11 text-text-faint">
-              <IconFileAudio size={14} className="shrink-0" />
-              <span className="truncate">{fileNameOf(status.path)}</span>
-            </span>
-          </>
-        ) : (
-          <span className="text-13 text-text-faint">No track loaded</span>
-        )}
-      </div>
+      {remoteMusic ? (
+        // Session 29c: the room's music, not ours. The track is the bot's own
+        // announcement; the host is the voice peer sharing its persistent id.
+        // The second line is not decoration — the volume slider below stays
+        // enabled because it is *this client's* player volume, and without this
+        // line a reader would take it for the room's music volume, which is the
+        // per-peer slider on the Music card.
+        <div className="flex min-w-0 flex-col gap-1">
+          <span className="truncate text-13 text-text" title={roomLine}>
+            {roomLine}
+          </span>
+          <span className="text-11 text-text-faint">
+            Volume and mute for this music are on the Music card in the room.
+          </span>
+        </div>
+      ) : (
+        <div className="flex min-w-0 flex-col gap-1">
+          {status?.title ? (
+            <>
+              <span className="truncate text-13 text-text">{status.title}</span>
+              <span className="flex min-w-0 items-center gap-1.5 text-11 text-text-faint">
+                <IconFileAudio size={14} className="shrink-0" />
+                <span className="truncate">{fileNameOf(status.path)}</span>
+              </span>
+            </>
+          ) : (
+            <span className="text-13 text-text-faint">No track loaded</span>
+          )}
+        </div>
+      )}
 
       {/* Seek */}
       <div className="flex items-center gap-3">
@@ -207,11 +276,18 @@ export function MusicPanel({
 
       {/* Transport */}
       <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* Session 29c: every control in this cluster drives *this client's*
+            player, so while somebody else hosts the room's music they are all
+            disabled rather than left looking effective. The volume slider on the
+            right is deliberately NOT disabled: it is this client's own player
+            volume — a stored preference of theirs, like Force Stop — whereas the
+            room's loudness is the per-peer slider on the Music card, which the
+            line above the transport says. */}
         <div className="flex items-center gap-1">
           <IconButton
             label="Previous track"
             onClick={() => void music.prev()}
-            disabled={queue.length === 0}
+            disabled={remoteMusic || queue.length === 0}
           >
             <IconSkipBack size={16} />
           </IconButton>
@@ -224,7 +300,7 @@ export function MusicPanel({
             // so a listener who presses Play is told the music is already playing
             // instead of quietly broadcasting through the pre-29b voice path.
             onClick={() => void bot.playPause()}
-            disabled={!hasTrack}
+            disabled={remoteMusic || !hasTrack}
           >
             {status?.playing ? <IconPause size={16} /> : <IconPlay size={16} />}
           </IconButton>
@@ -240,14 +316,14 @@ export function MusicPanel({
             // stopped player with a live bot would be a peer sitting in the room
             // sending nothing.
             onClick={() => void bot.stop()}
-            disabled={!hasTrack}
+            disabled={remoteMusic || !hasTrack}
           >
             <IconStop size={16} />
           </IconButton>
           <IconButton
             label="Next track"
             onClick={() => void music.next()}
-            disabled={queue.length === 0}
+            disabled={remoteMusic || queue.length === 0}
           >
             <IconSkipForward size={16} />
           </IconButton>
@@ -255,6 +331,7 @@ export function MusicPanel({
             label="Repeat current track"
             aria-pressed={Boolean(status?.loop)}
             className={cn(status?.loop && "text-accent")}
+            disabled={remoteMusic}
             onClick={() => void music.setTrackLoop(!status?.loop)}
           >
             <IconRepeat size={16} />
@@ -426,6 +503,31 @@ export function MusicPanel({
                       {formatTime(item.duration_ms)}
                     </span>
                   </button>
+                  {/* Session 29c: the queue can be reordered. `music_queue_move`
+                      has existed since Session 20 and `moveItem` has been on the
+                      controller the whole time, but nothing ever called it — so
+                      the order was fixed the moment files were added. Up/down
+                      rather than drag-and-drop: the rows live in a 160px
+                      scroller, and a button is reachable by keyboard, which a
+                      drag handle is not. */}
+                  <IconButton
+                    label={`Move ${item.title} up`}
+                    size="sm"
+                    disabled={i === 0}
+                    className="opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={() => void music.moveItem(i, i - 1)}
+                  >
+                    <IconChevronUp size={14} />
+                  </IconButton>
+                  <IconButton
+                    label={`Move ${item.title} down`}
+                    size="sm"
+                    disabled={i === queue.length - 1}
+                    className="opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={() => void music.moveItem(i, i + 1)}
+                  >
+                    <IconChevronDown size={14} />
+                  </IconButton>
                   <IconButton
                     label={`Remove ${item.title} from queue`}
                     size="sm"

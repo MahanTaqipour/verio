@@ -568,7 +568,41 @@ export const SCENARIOS: Scenario[] = [
         peers: [...roster(2), remoteBotPeer(0, true)],
         diagnostics: diag(),
       }),
-      music: music(),
+      // Session 29c: the listener's OWN player, loaded and paused, with a queue of
+      // its own — deliberately not idle. With a track loaded and three rows queued,
+      // every transport control would be enabled, so D6's assertions that they are
+      // *disabled* are about somebody else's music rather than about an empty
+      // player, which would satisfy the same assertions for the wrong reason.
+      //
+      // The local track is "Montana" while the room's is "Awake", so a panel that
+      // showed the wrong one is caught rather than coincidentally matching.
+      music: music({
+        active: false,
+        playing: false,
+        path: "D:\\Music\\Tycho - Awake\\02 Montana.flac",
+        title: "Montana",
+        duration_ms: 321_000,
+        monitor: true,
+        queue_index: 0,
+        queue_len: 3,
+      }),
+      queue: [
+        queueItem({
+          path: "D:\\Music\\Tycho - Awake\\02 Montana.flac",
+          title: "Montana",
+          duration_ms: 321_000,
+        }),
+        queueItem({
+          path: "D:\\Music\\Tycho - Awake\\03 L.flac",
+          title: "L",
+          duration_ms: 279_000,
+        }),
+        queueItem({
+          path: "D:\\Music\\Tycho - Awake\\04 A Walk.flac",
+          title: "A Walk",
+          duration_ms: 305_000,
+        }),
+      ],
     },
     behavior: {
       latency: { read: 20, write: 30 },

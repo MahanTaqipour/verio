@@ -5090,5 +5090,275 @@ and no test moved. A mutation that cannot fail is not a mutation either.
 Part B is complete, verified and committed. Part C is **not started** — the plan says stop after Part B
 and do not chain into Part C without approval.
 
+---
+
+## Session 29, Part C (2026-09-23) — the playlist UI, the command nothing called, and the panel that was describing the wrong room
+
+Part C was approved with an explicit order of operations: **list what is wired and what is missing
+before adding anything**. That list is §1, and it is what drove the rest of the session — one command
+was missing, and it was not the one the shape of the request implied.
+
+Two of the four items Part B left under *PENDING USER ACTION* were answered at the top of this session:
+the group-mute interaction stays as-is (voice and music are separate peers **by design**), and the
+listener's panel **must** describe the room's music — that is a requirement, not a design question.
+
+### 1. The inventory, before a line was changed
+
+Ten commands were named in the request. Nine were fully wired, from button to `invoke` to the mock:
+
+| command | reachable from the panel as | state |
+|---|---|---|
+| `music_queue_add` | Add files | wired |
+| `music_queue_remove` | the per-row remove button | wired |
+| `music_queue_jump` | clicking a queue row | wired |
+| `music_queue_clear` | Clear | wired |
+| `music_queue_list` | the read the panel renders the queue from | wired |
+| `music_set_loop` | the repeat button | wired |
+| `music_next` / `music_prev` | the transport | wired |
+| `music_pick_files` | Add files (multi-select) | wired |
+| **`music_queue_move`** | — | **wired in the hook and the mock, called by nothing** |
+
+Reading the code rather than the request turned up four more commands that exist and were not on the
+list: `music_pick_file` (**singular** — a second, unused entry point), `music_queue_set_loop` (repeat
+the *queue*), `music_set_volume`, `music_seek`, `music_open`, `music_play` / `music_pause` /
+`music_stop`, `music_set_monitor`, `music_status`.
+
+Two names in the request do not match the codebase, and the difference matters:
+
+- The request's `music_set_loop` is the **track** repeat, and that is what the panel wires. Queue
+  repeat is a **separate** command, `music_queue_set_loop`, which is wired to nothing — a distinct
+  control nobody asked for, so it stays unwired and is recorded here rather than invented into the UI.
+- The request's `music_pick_files` is the plural, multi-select command, and it is the one the panel
+  calls. `music_pick_file` (singular) also exists with no caller.
+
+### 2. The one genuinely missing command
+
+`music_queue_move` has existed since **Session 20**. `moveItem(from, to)` has been on the music
+controller the whole time, and the mock has handled the command the whole time — but **no element in
+the UI ever called it**, so the queue order was fixed at the moment the files were added. This is the
+exact failure the project's rule about dead code is for: a command can be fully plumbed, fully
+mocked, fully typed, and still be unreachable, and nothing in the type system says so.
+
+Wired as an up/down pair per row, revealed on hover like the remove button beside them:
+
+- **Up/down, not drag-and-drop.** The rows live in a ~160 px scroller, and a button is reachable by
+  keyboard while a drag handle is not.
+- **The ends are disabled, not hidden.** Row 0 cannot move up and the last row cannot move down, and
+  the disabled state *states the boundary* rather than offering an action that would silently no-op.
+- The buttons are `IconButton`s inside the existing hover group, so `verify-music.mjs` — which drives
+  rows by `button[title^="Play "]` — is unaffected by two new controls per row.
+
+### 3. The room's music, for the listener — and no protocol work at all
+
+Item 3 needed **nothing on the wire**, and that was worth establishing before writing any code. The bot
+already broadcasts the track: `send_announcements` emits `ControlMessage::State { music: true,
+music_title }` immediately on every track change and again every 3 s; the `Hello` arm already stores it
+onto the roster entry (`p.music_title = …`); and the frontend already receives `peer_state`. The defect
+was purely one of **presentation**.
+
+The listener's panel was saying two false things while somebody else's music played:
+
+1. It read **"No track loaded"** under a **"Music"** heading, because it was describing *this client's*
+   idle player.
+2. Its status chip read `Idle` / `Paused` / `Sending to room` — every one of which is a claim about a
+   player that is not playing. A chip is a factual statement about the element it sits on; the panel's
+   chip was making statements about somebody else's music.
+
+So the identity block is **replaced** while a remote bot is present, and the chip is **omitted** (a
+matched pair — suppressing the chip without replacing the identity would leave a bare header):
+
+```
+Room music: <track> — hosted by <name>
+Volume and mute for this music are on the Music card in the room.
+```
+
+The line is built only from what the room actually told us: with no title yet it reads `Room music`,
+and while the host's voice peer is unresolved the clause is dropped rather than filled with a guess.
+Both are transient — the bot re-announces every 3 s.
+
+**"hosted by `<name>`" resolves through the shared `user_id`** — the same link the Host badge uses —
+by finding the non-bot peer whose `user_id` matches the bot's. It is deliberately **not**
+`music_bot_state.host_name`, which is empty on a listener's client, because that field is populated by
+whoever *started* the bot and a listener never did.
+
+**The volume slider stays enabled on purpose, and the second line exists because of it.** That slider is
+*this client's own* player volume; the room's music volume is the per-peer slider on the Music card. An
+unexplained enabled slider under "Room music" would be read as the room's volume — the explanatory line
+is the fix, not decoration. The transport controls (`prev` / `play` / `stop` / `next` / `repeat`) are
+disabled, because they act on *our* player, which is not the thing playing.
+
+The three conditions behind `remoteMusic = inCall && !hosting && botPresent` are each load-bearing and
+each documented at the definition: `inCall` because a bot only exists in a room; `!hosting` because when
+we host, the panel *is* describing our own player and the `Hosting` chip already says so; `botPresent`
+because a listener with no bot has nothing to report but their own player.
+
+### 4. The mute toast — deliberately not built
+
+Part B left the group-mute interaction open, and this session's answer was *leave as-is*, with a
+carve-out: add a one-line toast only **if it is cheap**, and skip it if it complicates Part C.
+
+It is not cheap. The toast would have to fire when the user mutes a *voice* peer who also owns a Music
+peer, which means tracking the mute→host-ownership relation in a second place — a rename-sensitive
+observer over roster state, for a courtesy message. Skipped under the user's own condition, and recorded
+in §9 as a future polish item.
+
+### 5. The two-instance test, and the defect it found
+
+A real two-session test (`crates/verio-app/tests/room_music_peer.rs`) over `DirectListener` +
+`run_accept_direct` / `run_connect_direct` — two actual sessions, not a mock:
+
+- `a_listener_learns_the_room_track_from_the_music_peer` — the listener's roster shows exactly one peer,
+  it carries `is_bot`, and its `music_title` is the host's track.
+- `a_person_is_not_flagged_as_a_music_peer` — the matched pair; a person carries `!is_bot`, no title and
+  no music flag, in both directions. Without this, the first test passes if *everything* is flagged.
+
+Writing it surfaced a **pre-existing defect in the direct (non-relay) transport path**, reported here and
+not fixed because it lives in the transport/roster core and is outside this session's scope:
+
+> **Each room receives its own `Hello` echoed back as an incoming frame, and every direct-path control
+> frame arrives with an empty sender id.** `resolve_peer` therefore falls back to the single known remote
+> and writes the *local* session's identity onto the *remote's* roster entry.
+
+```
+room=Listener  frame_sender=  resolved=a0..01(bot)  name=Music     <- the bot's Hello, correct
+room=Listener  frame_sender=  resolved=a0..01(bot)  name=Listener  <- its OWN Hello, echoed
+room=Music     frame_sender=  resolved=b0..02(list) name=Listener  <- the listener's Hello, correct
+room=Music     frame_sender=  resolved=b0..02(list) name=Music     <- its OWN Hello, echoed
+```
+
+`is_bot` and `music_title` survive — the flag because `upsert_peer` only ever sets it true (a one-way
+ratchet, Part B §2), the title because no `Hello` touches it. **The relay path — the one the app
+actually uses — is not affected.** The test records the finding and asserts nothing about `name` /
+`user_id`, so it cannot pass or fail by race.
+
+Two more things the test had to get right, both of which failed first:
+
+- **Both sessions must call `send_hello()`.** The roster is built from `Hello` frames, not from the
+  signalling handshake, so a bot that only announces never appears in the listener's roster at all.
+- **The dialing side must carry the larger uuid**, or the offerer role flips. A guard inside the test
+  enforces it, and it caught a bug in the test's own identity helper: people were being given `n` as
+  their uuid, so the listener (`2`) sorted *below* the bot (`0xA0…`).
+
+### 6. Verification — real output
+
+Rust, from `C:/dev/verio`:
+
+| command | result |
+|---|---|
+| `cargo clippy --workspace --all-targets -- -D warnings` | **exit 0**, no warnings |
+| `cargo test --workspace --exclude verio` | **140 passed** — verio-app 82, room_music_peer **2**, verio-dsp 28, verio-transport 14, verio-discovery 8, verio-server 6 |
+| `cargo test -p verio --lib` | **4 passed** |
+
+`verio-app` went 138 → 140: the two new integration tests, and nothing else.
+
+Frontend, from `C:/dev/verio/ui`:
+
+| command | result |
+|---|---|
+| `pnpm exec tsc --noEmit` | exit 0 |
+| `pnpm test` | **12 / 12** |
+| `pnpm build` | exit 0 |
+
+Browser and CSS invariants, from `C:/Users/Mahan/.workbuddy-ai/binaries/node/workspace`:
+
+| command | result |
+|---|---|
+| `verify-room.mjs` | **148 PASS, 0 FAIL — ALL ROOM CHECKS PASSED** (D6 **9**, D7 **5**) |
+| `verify-music.mjs` | all states render, all controls wired, no overflow, no console errors |
+| `verify-harness.mjs` | 8 passed, 0 failed |
+| `verify-contents-wrapper.mjs` | 40 configurations, layout-neutral |
+| `assert-fresh.mjs` | all 38 served files match their on-disk mtime |
+| `check-phantom-classes.mjs` | `PHANTOM: none` — 239 distinct tokens |
+| `dead-css.mjs` | `DEAD: none`, `ORPHAN KEYFRAMES: none` |
+| `dead-modules.mjs` | 0 unreachable |
+| `check-collisions.mjs` | `LEAK: clean`, `MIX: clean` |
+
+`verify-room.mjs` went 134 → 148: D6 (9) and D7 (5).
+
+**D6** runs the `room-remote-music` scenario twice. D6a: the panel is open; it does **not** say "No track
+loaded"; it shows `Room music: Awake — hosted by Dan`; the idle/paused/sending chip is **absent**; all
+five transport controls are disabled; the **volume slider is enabled**; and the listener's own queue is
+still shown. D6b is the matched pair on `room-3` (no bot): there is no room-music line, and the panel
+reports its own empty player instead. The listener fixture is deliberately given a **loaded-but-paused
+player with a three-row queue**, and its local title is `Montana` while the room's is `Awake` — so the
+disabled assertions cannot pass against an empty player, and showing the wrong title is caught.
+
+**D7** targets rows by `button[title^="Play "]` rather than by index (a row now carries four buttons), so
+it asserts the real order. It checks the end rows are disabled, then clicks "down" on row 0 and asserts
+both that `music_queue_move(from:0, to:1)` was dispatched **and** that the visible rows swapped.
+
+### 7. Mutation testing
+
+Every new guard was made to fail on purpose, then reverted. A mutation that cannot fail is not a
+mutation, and a check that cannot fail is not a check.
+
+| # | mutation | what failed |
+|---|---|---|
+| A | `p.music_title = String::new()` in the `State` arm | the Rust **title** assertion only — `a_person_is_not_flagged_as_a_music_peer` still passed |
+| C | `is_bot: true` unconditionally in `upsert_peer` | `a_person_is_not_flagged_as_a_music_peer` only, with its own message |
+| M1b | the identity ternary keyed on `inCall && !hosting` instead of `remoteMusic` | **D6b's two assertions only**; D6a untouched |
+| D7-a | the down button calls `moveItem(i, i)` | D7's **dispatch and swap** assertions — the two boundary checks still passed |
+| D7-b | the mock's move guard is `from === to` | D7's **swap** assertion only — the dispatch assertion still passed |
+
+D7-a and D7-b are the pair that matters: D7-b dispatches the *correct* command with the *correct*
+arguments and still fails the swap check, which proves the second assertion is not just echoing the
+first. Without D7-b, "…and the rows actually swap" could have been a duplicate of "…dispatches
+`music_queue_move`" and nobody would know.
+
+M1b's first form (`const remoteMusic = inCall`) was itself the lesson: it did not fail a clean
+assertion, it **aborted the script** — it disabled the Play button in `room-3`, so D5's `Play track`
+click timed out and Playwright threw before D6b ran. A mutation that breaks an unrelated test is not
+evidence about the test under scrutiny; it was replaced with a mutation that only moves the ternary.
+
+Reverted byte-exact. `ui/src/dev/mock/invoke.ts` and `crates/verio-app/src/room.rs` are **identical to
+`HEAD`** by `git hash-object` (`f10a935d…`, `07439dbc…`). The four files this session actually changes,
+as committed:
+
+| file | blob |
+|---|---|
+| `ui/src/components/verio/music-panel.tsx` | `f7929002…` |
+| `ui/src/App.tsx` | `eba05930…` |
+| `ui/src/dev/mock/fixtures.ts` | `f826be2f…` |
+| `crates/verio-app/tests/room_music_peer.rs` | `ea94fb33…` |
+
+### 8. Found but not fixed
+
+- **The direct-path `Hello` echo (§5).** In the transport/roster core, outside this session's scope.
+  The relay path is unaffected. It means any future test built on `DirectListener` must not assert on
+  `name` / `user_id`, which is why the module doc says so.
+- **`verify-room.mjs` still never checks for console errors** (Part B §10). Unchanged, and now with
+  three more sections riding on it.
+- **Queue repeat is wired to nothing.** `music_queue_set_loop` exists end-to-end and no control calls
+  it. Not requested, so not invented — recorded so the next reader does not mistake it for dead code
+  needing deletion.
+- **`music_pick_file` (singular) has no caller.** Same disposition.
+- Everything from Part B §10 and Part A §10 still stands: the bot's audio has never been heard; the
+  multi-client scenario beyond the two new Rust tests is mock-backed; `--danger` as text fails contrast
+  app-wide (2.19 / 2.29 / 2.38 : 1); a peer joining after a mute was set never learns it; `mute_list`
+  conflates "mutes I set" with "mutes others set"; `spawn_audio_pump` is called twice; the 8 s boot
+  smoke test needs an elevated shell; the untracked `.workbuddy-ai/` and
+  `stitch_verio_desktop_interface_suite.zip`.
+
+### 9. PENDING USER ACTION
+
+- **Listen to the bot's audio — DEFERRED, and NOT verified.** Carried forward from Part B §11 by the
+  user's decision this session: *"Record as PENDING USER ACTION in PROGRESS.md. Do not claim verified."*
+  Two instances, one room, press Play, and confirm the music arrives and sounds acceptable at 32 kbps.
+  Nothing in this session or the last exercises it by ear, and no automated check covers the encode
+  path. **Do not read any "PASS" in §6 as covering this.**
+- **The mute toast is a future polish item.** *"Also mute the Music peer to silence their music."* —
+  skipped under the user's carve-out because it needs the mute→host-ownership relation tracked in a
+  second place. See §4.
+- **Queue repeat and single-file pick remain unwired** (§8). Decisions, not oversights.
+- **`music_queue_move` on a touch device.** The reorder buttons are revealed on hover
+  (`group-hover:opacity-100`) with a `focus-visible` fallback. On a touch-only device there is no hover
+  and no Tab, so the controls would not be discoverable. Verio is a desktop app, so this is a note, not
+  a defect.
+
+### 10. Status
+
+Part C is complete, verified and committed. Session 29 is **closed**: Part A (room-wide mute) as
+`babe484`, Part B (the music bot) as `4259c14`, Part C as this commit. Per the plan, stop here.
+
 
 
