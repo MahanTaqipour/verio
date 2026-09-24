@@ -179,7 +179,7 @@ pub struct PipelineHandle {
     /// datagrams — the host is a peer of their own bot, but never receives from it
     /// — so the host's only way to hear the music their bot is playing is the
     /// monitor path that already exists for exactly this purpose.
-    music_monitor_tx: mpsc::Sender<Vec<f32>>,
+    music_monitor_tx: MonitorSink,
 }
 
 impl PipelineHandle {
@@ -189,7 +189,7 @@ impl PipelineHandle {
     /// A clone of the same sender the processing thread uses, so the bot's chunks
     /// land in the same mixer buffer and obey the same deafen gate.
     #[must_use]
-    pub fn music_monitor_handle(&self) -> mpsc::Sender<Vec<f32>> {
+    pub fn music_monitor_handle(&self) -> MonitorSink {
         self.music_monitor_tx.clone()
     }
     /// Play a synthesized audio cue (mute on, mute off, deafen) in local playback.
@@ -405,7 +405,7 @@ pub fn start(
     // on the stream-owner thread spawned above.
 
     // Session 13: local music-monitor chunks flow processing -> RX mixer.
-    let (music_monitor_tx, music_monitor_rx) = mpsc::channel::<Vec<f32>>();
+    let (music_monitor_tx, music_monitor_rx) = mpsc::channel::<(Option<String>, Vec<f32>)>();
     // Session 29b: a second sender, kept for the handle, so a music-bot session can
     // push the host's own copy of what it is playing into the same mixer buffer.
     // The processing thread takes the original.
@@ -565,7 +565,7 @@ fn processing_loop(
     mut capture_wav: Option<(WavWriter, PathBuf)>,
     net_out_tx: Option<mpsc::Sender<NetAudioOut>>,
     music: Arc<MusicSource>,
-    monitor_tx: mpsc::Sender<Vec<f32>>,
+    monitor_tx: mpsc::Sender<(Option<String>, Vec<f32>)>,
 ) {
     let mut converter = InputConverter::new(spec.channels, spec.sample_rate);
     let mut rnnoise = RnNoise::new();
@@ -742,7 +742,9 @@ fn processing_loop(
                 for (i, slot) in cue.iter_mut().enumerate() {
                     *slot = music_buf[i] * vol;
                 }
-                let _ = monitor_tx.send(cue);
+                // `None`: the pipeline's own music has no tile, so there is no
+                // level to obey. A bot's chunks carry its session id instead.
+                let _ = monitor_tx.send((None, cue));
             }
 
             let encode_src: &[f32] = if using_music { &mixed_buf } else { encode_input };
@@ -1424,6 +1426,15 @@ fn pipeline_owns_music(playing: bool, bot_owned: bool) -> bool {
     playing && !bot_owned
 }
 
+/// Session 29d: the host's local music-monitor sink.
+///
+/// The payload pairs the samples with the peer they belong to — a music bot's
+/// session id, or `None` for the voice pipeline's own music, which has no tile and
+/// therefore no level to obey. The id travels *with* the audio rather than being
+/// looked up in a slot, so a mixer rebuilt by `restart_pipeline` gates the monitor
+/// correctly without anything having to be re-pointed at it.
+pub type MonitorSink = mpsc::Sender<(Option<String>, Vec<f32>)>;
+
 /// Per-peer receiver stream with a dedicated Opus decoder and 40 ms jitter pre-buffer.
 struct PeerRxStream {
     decoder: OpusDecoderWrapper,
@@ -1530,7 +1541,7 @@ fn rx_loop(
     mut loopback_wav: Option<(WavWriter, PathBuf)>,
     net_in_rx: Option<mpsc::Receiver<NetAudioIn>>,
     earcon_rx: mpsc::Receiver<EarconKind>,
-    music_monitor_rx: mpsc::Receiver<Vec<f32>>,
+    music_monitor_rx: mpsc::Receiver<(Option<String>, Vec<f32>)>,
     peer_volumes: Arc<Mutex<HashMap<String, f32>>>,
     peer_mutes: Arc<Mutex<HashSet<String>>>,
     loopback: bool,
@@ -1552,6 +1563,21 @@ fn rx_loop(
     let mut earcon_buf: VecDeque<f32> = VecDeque::new();
     // Session 13: local music monitor (already deafen-gated on the TX side).
     let mut monitor_buf: VecDeque<f32> = VecDeque::new();
+    // Session 29d: which peer the buffered monitor audio belongs to. A bot tags
+    // every chunk with its own session id, so the mixer can apply the same
+    // per-peer rule it applies to remote peers. Carried *with* the audio rather
+    // than looked up in a slot: a rebuilt mixer needs no re-pointing, so this
+    // cannot go stale the way a captured map does.
+    let mut monitor_peer: Option<String> = None;
+    // Session 29d diagnostic: what actually reached the mix, per source. The
+    // gains alone cannot answer "why do I hear two musics" — this reports the
+    // peak each source contributed *after* its gain, so a source that is audible
+    // while supposedly gated names itself.
+    let mut diag_peers: HashMap<String, f32> = HashMap::new();
+    let mut diag_monitor_peak = 0.0_f32;
+    let mut diag_loopback_peak = 0.0_f32;
+    let mut diag_earcon_peak = 0.0_f32;
+    let mut last_diag = Instant::now();
     let mut mono_mixed_buf: Vec<f32> = Vec::with_capacity(960);
     let mut native_mono_buf: Vec<f32> = Vec::with_capacity(960);
     let mut interleaved_buf: Vec<f32> = Vec::with_capacity(1920);
@@ -1618,8 +1644,17 @@ fn rx_loop(
             earcon_buf.extend(cue(kind).iter().copied());
         }
 
-        // 3b. Drain local music-monitor chunks
-        while let Ok(chunk) = music_monitor_rx.try_recv() {
+        // 3b. Drain local music-monitor chunks. Each carries the peer it belongs
+        // to — a bot's session id — or `None` for the pipeline's own music, which
+        // has no tile and therefore no level to obey.
+        while let Ok((peer, chunk)) = music_monitor_rx.try_recv() {
+            // Assigned rather than merged: the tag describes the audio that arrived
+            // with it, so a `None` chunk must clear the slot. Merging left a
+            // stopped bot's session id here, and the pipeline's own music — which
+            // has no tile and no level — was then gated by a peer that no longer
+            // existed. That is the stale-state failure this design exists to
+            // remove, so the slot is never allowed to outlive its owner.
+            monitor_peer = peer;
             monitor_buf.extend(chunk);
         }
 
@@ -1645,12 +1680,27 @@ fn rx_loop(
             // Deafened: buffers keep advancing so nothing stalls, but remote peers
             // contribute silence to the mix.
             let deafened = tx_state.is_deafened();
+            // Session 29d: the monitor is one more source, and it obeys the *same*
+            // per-peer rule as a remote peer — the level the Music tile shows, the
+            // room-wide mute, and deafen. Applying it here, in the one place that
+            // owns the volumes, is what makes the host's own copy of the music
+            // follow the tile. Gating it in the bot could not: the bot's view of
+            // the map is a snapshot, and a rebuilt mixer invalidates it.
+            let monitor_gain = monitor_peer.as_ref().map_or(1.0, |id| {
+                peer_mix_gain(
+                    vols.get(id).copied().unwrap_or(1.0),
+                    mutes.contains(id),
+                    deafened,
+                )
+            });
             mono_mixed_buf.clear();
             for _ in 0..needed_48k_mono {
                 let mut sum = 0.0_f32;
                 if loopback {
                     if let Some(lb) = loopback_stream.as_mut() {
-                        sum += lb.pop_sample();
+                        let s = lb.pop_sample();
+                        diag_loopback_peak = diag_loopback_peak.max(s.abs());
+                        sum += s;
                     }
                 }
                 for (pid, peer) in peers.iter_mut() {
@@ -1659,15 +1709,45 @@ fn rx_loop(
                         mutes.contains(pid),
                         deafened,
                     );
-                    sum += peer.pop_sample() * v;
-                }
-                if let Some(s) = monitor_buf.pop_front() {
+                    // The sample *after* the gain: a muted peer that still
+                    // contributes is the whole question this answers.
+                    let s = peer.pop_sample() * v;
+                    let e = diag_peers.entry(pid.clone()).or_insert(0.0);
+                    *e = e.max(s.abs());
                     sum += s;
                 }
+                if let Some(s) = monitor_buf.pop_front() {
+                    let g = s * monitor_gain;
+                    diag_monitor_peak = diag_monitor_peak.max(g.abs());
+                    sum += g;
+                }
                 if let Some(cue) = earcon_buf.pop_front() {
+                    diag_earcon_peak = diag_earcon_peak.max(cue.abs());
                     sum += cue;
                 }
                 mono_mixed_buf.push(sum.clamp(-1.0, 1.0));
+            }
+
+            // One line per 5 s, from inside the mix block so the volume map, the
+            // mute set and the monitor tag are the exact values this block used.
+            if last_diag.elapsed() >= Duration::from_secs(5) {
+                last_diag = Instant::now();
+                tracing::info!(
+                    peers = ?diag_peers,
+                    monitor_peer = ?monitor_peer,
+                    monitor_gain,
+                    monitor_peak = diag_monitor_peak,
+                    loopback_peak = diag_loopback_peak,
+                    earcon_peak = diag_earcon_peak,
+                    volumes = ?vols,
+                    mutes = ?mutes,
+                    deafened,
+                    "mix sources (5 s window)"
+                );
+                diag_peers.clear();
+                diag_monitor_peak = 0.0;
+                diag_loopback_peak = 0.0;
+                diag_earcon_peak = 0.0;
             }
 
             native_mono_buf.clear();

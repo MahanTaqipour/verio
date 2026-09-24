@@ -34,6 +34,10 @@ export function StatusBanner({ text, isError = false, onDismiss, className }: St
       aria-live={isError ? "assertive" : "polite"}
       className={cn(
         "flex items-center gap-3 rounded-sm border bg-surface-2 py-2.5 pr-2 pl-3.5",
+        // Session 29d: the banner drops in rather than appearing at full height.
+        // `animate-rise` is opacity + a 4px settle, so it never changes the layout
+        // it sits in — the room below is measured by the probes and must not move.
+        "animate-rise",
         isError ? "border-danger/35" : "border-border-2",
         className,
       )}

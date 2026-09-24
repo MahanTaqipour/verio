@@ -72,7 +72,6 @@ import { MicLevelMeter, type LevelMeterHandle } from "@/components/verio/level-m
 import {
   IconCheck,
   IconCopy,
-  IconEarOff,
   IconHeadphoneOff,
   IconLeave,
   IconMicOff,
@@ -247,14 +246,27 @@ function Chip({
   children,
   title,
   ariaLabel,
+  className,
 }: {
   tone: ChipTone;
   children: ReactNode;
   title?: string;
   ariaLabel?: string;
+  /**
+   * Session 29d: forwarded so a chip can opt into truncation — `max-w-full
+   * min-w-0` on the chip plus `truncate` on its label. The music chip is the one
+   * caller: a track title is a filename, so it is the only value a tile renders
+   * that has no upper bound.
+   */
+  className?: string;
 }) {
   return (
-    <StateChip tone={tone} title={title} ariaLabel={ariaLabel}>
+    <StateChip
+      tone={tone}
+      title={title}
+      ariaLabel={ariaLabel}
+      className={className}
+    >
       {children}
     </StateChip>
   );
@@ -317,7 +329,11 @@ function PeerTile({
     <Panel
       padding="sm"
       className={cn(
-        "flex flex-col gap-2",
+        // `h-full` so every tile in a row is the same size. The grid cell already
+        // stretches, but the panel inside it stayed content-sized — so the moment
+        // one tile's chips wrapped, that tile alone stood taller than its
+        // neighbours and the row jumped.
+        "flex h-full flex-col gap-2",
         // The only per-tile emphasis. A speaking tile lifts by border colour and
         // a 4% accent wash — no glow, no shadow, no scale.
         speaking && "border-accent/35 bg-linear-to-b from-accent/4 to-transparent",
@@ -343,7 +359,11 @@ function PeerTile({
                 Host
               </Chip>
             )}
-            {speaking && <Chip tone="accent">Speaking</Chip>}
+            {/* Session 29d: there is no "Speaking" chip. The border colour and the
+                4% accent wash above already say it, and the chip was a *second*
+                signal for one state — one that added a row, so the tile grew the
+                moment somebody spoke. The tile now keeps its size and only its
+                border changes. */}
             {/* Icon-only chips. The glyph carries the state, so the accessible
                 name has to come from `ariaLabel` — every icon in the module is
                 `aria-hidden`, so without it these would be silent to a screen
@@ -377,10 +397,19 @@ function PeerTile({
               // `accent` because a peer injecting music is actively putting
               // audio into the room — the same semantic as speaking, and the
               // same tone the music panel uses for "Sending to room".
-              <Chip tone="accent" title={musicTitle || "Playing music"}>
-                <span className="inline-flex items-center gap-1">
-                  <IconMusic size={14} />
-                  {musicTitle || "Music"}
+              //
+              // Session 29d: the title truncates. A track is a filename and a
+              // filename is arbitrarily long; a chip never wraps, so without a
+              // shrinkable label the text ran straight out of the card. The full
+              // value is still in `title`.
+              <Chip
+                tone="accent"
+                title={musicTitle || "Playing music"}
+                className="min-w-0 max-w-full"
+              >
+                <span className="flex min-w-0 items-center gap-1">
+                  <IconMusic size={14} className="shrink-0" />
+                  <span className="truncate">{musicTitle || "Music"}</span>
                 </span>
               </Chip>
             )}
@@ -435,13 +464,21 @@ function PeerTile({
               locallyMuted ? "text-warn" : "text-text-faint hover:text-text-dim",
             )}
           >
-            <IconEarOff size={14} />
+            {/* Session 29d: a speaker, not an ear. The ear glyph named the organ
+                rather than the act and sat confusingly close to the deafen pair;
+                this control silences one peer for *this* listener, which is what a
+                crossed-out speaker already means everywhere else in the app. */}
+            <IconVolumeOff size={14} />
           </button>
           {/* Session 29: the room-wide mute, beside — not merged with — the local
-              one. They are two owners of one verb: the ear button changes what
+              one. They are two owners of one verb: the speaker button changes what
               *this* user hears, this one silences the peer for everyone. They
               are separate buttons because someone who wants to stop hearing a
-              person must not be able to silence them for the room by accident. */}
+              person must not be able to silence them for the room by accident.
+              Session 29d: this one is a muted microphone, because that is what it
+              does — it takes that person's voice out of everybody's mix — and
+              because two identical speakers side by side said nothing about which
+              scope each had. */}
           {canRoomMute && (
             <button
               type="button"
@@ -460,7 +497,7 @@ function PeerTile({
                 roomMuted ? "text-danger" : "text-text-faint hover:text-text-dim",
               )}
             >
-              <IconVolumeOff size={14} />
+              <IconMicOff size={14} />
             </button>
           )}
         </div>
@@ -605,7 +642,9 @@ export function Room({
               "grid-cols-1 sm:grid-cols-3 xl:grid-cols-4",
             )}
           >
-            <li>
+            {/* Session 29d: a tile fades in as it arrives. Opacity only — the
+                grid measures these, so the entrance must not touch geometry. */}
+            <li className="animate-fade">
               <PeerTile
                 name={nickname}
                 speaking={self.speaking}
@@ -619,7 +658,7 @@ export function Room({
             </li>
 
             {peers.map((p) => (
-              <li key={p.uuid}>
+              <li key={p.uuid} className="animate-fade">
                 <PeerTile
                   name={p.name}
                   speaking={p.speaking}

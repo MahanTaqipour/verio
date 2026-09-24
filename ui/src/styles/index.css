@@ -196,6 +196,53 @@
   --duration-fast: 140ms;
   --duration-slow: 200ms;
   --ease-verio: ease;
+  /* Session 29d: entrance animations, and only entrances.
+     Every *state* change in the app already transitions — that is what
+     `--default-transition-duration` above is for, and the components opt in with
+     `transition-colors` / `transition-[width]`. What was missing was the moment an
+     element appears: a banner, a peer tile, a panel. Those popped in at full size,
+     which reads as a glitch rather than as something arriving.
+
+     Two rules govern the set. Nothing here animates *continuously* — design.md
+     permits that for the speaking indicator alone — and every animation is
+     `both`-filled so the element is at its final state before the animation starts
+     and after it ends, never mid-way in a way that could be measured.
+
+     `--animate-*` is Tailwind v4's theme hook, so each name below becomes a real
+     utility. That matters: Session 27 used `animate-speak-ring` when no
+     `--animate-speak-ring` existed, and the class silently did nothing. */
+  --animate-rise: verio-rise var(--duration-slow) var(--ease-verio) both;
+  --animate-fade: verio-fade var(--duration-fast) var(--ease-verio) both;
+  --animate-lift: verio-lift var(--duration-slow) var(--ease-verio) both;
+
+  @keyframes verio-rise {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes verio-fade {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes verio-lift {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
 
   /* --- Elevation ---------------------------------------------------------
      design.md permits exactly one shadow, for floating overlays only. Cards,
@@ -375,5 +422,28 @@
 @utility press {
   &:active:not(:disabled) {
     transform: translateY(1px);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Reduced motion (Session 29d)
+   --------------------------------------------------------------------------
+   Every animation and transition in this app is decorative. Nothing here carries
+   meaning that the reduced-motion state would lose: the speaking indicator is a
+   border colour, the mic meter is written from JS on every frame and is already
+   `transition-none` on purpose, and the progress bar only reports a number that
+   is also printed as text. So collapsing all of it is safe, and it is the only
+   correct answer for a user who has told their system not to move things.
+
+   0.01ms rather than `none`: a zero-duration animation still fires
+   `animationend`, so anything that waits for that event keeps working. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

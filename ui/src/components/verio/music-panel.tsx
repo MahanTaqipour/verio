@@ -173,7 +173,8 @@ export function MusicPanel({
     <Panel
       role="region"
       aria-label="Music player"
-      className={cn("flex flex-col gap-4", className)}
+      // Session 29d: the panel lifts into place instead of snapping open.
+      className={cn("animate-lift flex flex-col gap-4", className)}
     >
       <header className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">

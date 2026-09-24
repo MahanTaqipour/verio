@@ -30,7 +30,6 @@ import {
   CircleDot,
   Clock,
   Copy,
-  EarOff,
   ExternalLink,
   FileAudio,
   FolderOpen,
@@ -142,11 +141,12 @@ export const IconHeadphones = makeIcon(Headphones, "headphones");
    Headphones, not ears. An ear glyph names the organ where the state is about
    the act of not listening, and it read as a second, unrelated control next to
    the mic. `IconEar` was deleted in Session 27: the dock's deafen button was its
-   only consumer, and it now uses this pair. `IconEarOff` survives because the
-   peer tile's local-mute button is a different idea — silencing one peer for
-   yourself, not deafening yourself — and it keeps its own ear glyph. */
+   only consumer, and it now uses this pair. `IconEarOff` was deleted in Session
+   29d for the same reason: the peer tile's local-mute button is a different idea
+   — silencing one peer for yourself, not deafening yourself — but an ear glyph
+   names the organ where the state is about the act, so it read as a second deafen
+   control. That button is a speaker now (`IconVolumeOff`), which is what it does. */
 export const IconHeadphoneOff = makeIcon(HeadphoneOff, "headphoneOff");
-export const IconEarOff = makeIcon(EarOff, "earOff");
 export const IconLeave = makeIcon(PhoneOff, "leave");
 export const IconUsers = makeIcon(Users, "users");
 export const IconVolume = makeIcon(Volume2, "volume");

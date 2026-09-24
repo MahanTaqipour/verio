@@ -244,7 +244,10 @@ export function Dock({
           onClick={onOpenMusicPanel}
           title={music.title ? `${music.title} — ${music.path ?? ""}` : "Music"}
           className={cn(
-            "flex min-w-0 shrink items-center gap-2.5 rounded-sm border border-border bg-surface px-3 py-2",
+            // Session 29d: the strip fades in when a track starts rather than
+            // popping into the bar. Opacity only, because `dock-metrics.mjs`
+            // measures this bar's height and budget.
+            "animate-fade flex min-w-0 shrink items-center gap-2.5 rounded-sm border border-border bg-surface px-3 py-2",
             "text-left transition-colors ease-verio",
             "hover:border-border-2 hover:bg-surface-2",
             // Container query, not a viewport breakpoint: what matters is how
@@ -268,30 +271,34 @@ export function Dock({
       )}
 
       {/* ── Call controls ─────────────────────────────────────────────────── */}
+      {/* Icon-only, on the user's instruction. The word was redundant next to an
+          icon that already says it, and the hotkey chip beside it carries the part
+          the icon cannot. The accessible name is therefore explicit rather than
+          inherited from text that is no longer rendered — an icon-only control with
+          no name is unusable with a screen reader, and `dock-metrics.mjs` finds
+          these by their title, which is unchanged. */}
       <div className="flex shrink-0 items-center gap-2">
         <Button
           variant="secondary"
           className={cn(DOCK_BUTTON, muted && "border-warn/30 bg-warn/6 text-warn")}
           onClick={onToggleMute}
           aria-pressed={muted}
+          aria-label="Toggle mute"
           title={`Toggle mute (${muteHotkey})`}
           icon={muted ? <IconMicOff size={16} /> : <IconMic size={16} />}
           trailingIcon={<KbdChip decorative>{shortKey(muteHotkey)}</KbdChip>}
-        >
-          Mic
-        </Button>
+        />
 
         <Button
           variant="secondary"
           className={cn(DOCK_BUTTON, deafened && "border-danger/35 bg-danger/8 text-danger")}
           onClick={onToggleDeafen}
           aria-pressed={deafened}
+          aria-label="Toggle deafen"
           title={`Toggle deafen (${deafenHotkey})`}
           icon={deafened ? <IconHeadphoneOff size={16} /> : <IconHeadphones size={16} />}
           trailingIcon={<KbdChip decorative>{shortKey(deafenHotkey)}</KbdChip>}
-        >
-          Deafen
-        </Button>
+        />
 
         <IconButton label="Settings" variant="secondary" size="lg" onClick={onOpenSettings}>
           <IconSettings size={16} />

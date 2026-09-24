@@ -32,10 +32,12 @@ use std::time::Duration;
 
 use verio_discovery::{Identity, VpsSignaling};
 use verio_dsp::codec::OpusEncoderWrapper;
-use verio_dsp::RNNOISE_FRAME;
+use verio_dsp::{RNNOISE_FRAME, SAMPLE_RATE};
 use verio_transport::{
     spawn_relay_session_with_candidates, unix_ms, ControlMessage, PeerHandle, TransportEvent,
 };
+
+use crate::pipeline::MonitorSink;
 
 use crate::hotkeys::TxState;
 use crate::pipeline::{monitor_contributes, LiveControls, MusicSource};
@@ -83,7 +85,7 @@ pub struct BotConfig {
     pub tx_state: Arc<TxState>,
     /// Where the host's own copy of the music goes. A slot rather than a sender
     /// because a pipeline restart replaces it, exactly like the room's mute sink.
-    pub monitor_tx: Arc<Mutex<Option<Sender<Vec<f32>>>>>,
+    pub monitor_tx: Arc<Mutex<Option<MonitorSink>>>,
     pub events: Sender<BotEvent>,
 }
 
@@ -236,6 +238,9 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
         let tx_state = Arc::clone(&cfg.tx_state);
         let monitor_tx = Arc::clone(&cfg.monitor_tx);
         let host_user_id = cfg.host_user_id.clone();
+        // Session 29d: this session's own id, which the mixer looks the host's
+        // level for the Music tile up under. It travels with every monitor chunk.
+        let session_id = session_id.to_string();
         // Re-announced with every `Hello`, so a peer who joined after the bot did
         // still learns the host's decision without a message of its own.
         let force_stop = cfg.force_stop;
@@ -251,6 +256,7 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
                         controls,
                         tx_state,
                         monitor_tx,
+                        session_id,
                         host_user_id,
                         force_stop,
                     });
@@ -381,13 +387,16 @@ struct EncodeLoop {
     music: Arc<MusicSource>,
     controls: Arc<LiveControls>,
     tx_state: Arc<TxState>,
-    monitor_tx: Arc<Mutex<Option<Sender<Vec<f32>>>>>,
+    monitor_tx: Arc<Mutex<Option<MonitorSink>>>,
     /// Re-sent with every announcement so a peer who missed the registration
     /// `Hello` still learns which person this bot belongs to.
     host_user_id: String,
     /// Session 29b Force Stop: re-sent with every announcement too, so a peer who
     /// joined after the bot learns the host's decision, and a peer whose first
     /// `Hello` was lost is corrected within one announce interval rather than never.
+    /// This session's own id — the key the mixer looks the host's level for the
+    /// Music tile up under, and the tag put on every monitor chunk.
+    session_id: String,
     force_stop: bool,
 }
 
@@ -416,6 +425,19 @@ fn encode_loop(cfg: EncodeLoop) {
     let mut last_announce = std::time::Instant::now() - ANNOUNCE_INTERVAL;
     let mut announced_title = String::new();
     let mut applied_kbps = 0u32;
+
+    // Session 29c fix: real-time pacing.
+    //
+    // The voice pipeline is paced by the capture device, which hands it 48 kHz
+    // audio whether or not anyone is listening. The bot has no capture device — it
+    // pulls from a file — so nothing paced this loop and it decoded as fast as the
+    // CPU allowed: a six-minute track reached the room in a few seconds, and the
+    // host heard the same impossible speed through the monitor.
+    //
+    // A deadline rather than a flat `sleep(10ms)`, because encoding takes a
+    // variable amount of time and sleeping a whole frame on top of it would run
+    // slow by exactly that amount.
+    let mut next_frame = std::time::Instant::now();
 
     loop {
         if cfg.stop.load(Ordering::Relaxed) {
@@ -468,12 +490,20 @@ fn encode_loop(cfg: EncodeLoop) {
         let volume = cfg.music.volume();
         let chunk: Vec<f32> = buf[..n].iter().map(|s| s * volume).collect();
 
-        // The host's own copy. Gated exactly like the pipeline's monitor: on, not
-        // deafened, and music actually playing.
+        // The host's own copy. Gated on the two things this session actually
+        // knows — the user's monitor preference and whether they are deafened —
+        // and *tagged* with this session's id, so the mixer can apply the host's
+        // level for the Music tile, the room-wide mute, and deafen using the one
+        // rule it already applies to remote peers.
+        //
+        // The level is deliberately not read here. A bot can only ever hold a
+        // snapshot of the volume map, and `restart_pipeline` builds a fresh one, so
+        // a snapshot goes silently stale — which is exactly how the tile's slider
+        // and its mute button came to be inert on the host's own machine.
         if monitor_contributes(cfg.music.monitor(), cfg.tx_state.is_deafened(), true) {
             let sink = cfg.monitor_tx.lock().ok().and_then(|g| g.clone());
             if let Some(tx) = sink {
-                let _ = tx.send(chunk.clone());
+                let _ = tx.send((Some(cfg.session_id.clone()), chunk.clone()));
             }
         }
 
@@ -481,6 +511,18 @@ fn encode_loop(cfg: EncodeLoop) {
             Ok(Some(packet)) => cfg.handle.send_audio(unix_ms(), packet),
             Ok(None) => {}
             Err(e) => tracing::error!("music bot: opus encode failed: {e}"),
+        }
+
+        // Advance the deadline by exactly the audio just produced, then sleep to
+        // it. Falling behind (a slow decode) resyncs instead of sprinting: the debt
+        // is dropped rather than repaid as a burst, which would be the same
+        // fast-forward bug in miniature.
+        next_frame += Duration::from_secs_f64(n as f64 / f64::from(SAMPLE_RATE));
+        let now = std::time::Instant::now();
+        if next_frame > now {
+            std::thread::sleep(next_frame - now);
+        } else {
+            next_frame = now;
         }
     }
     tracing::info!("music bot: encode loop stopped");

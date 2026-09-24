@@ -92,10 +92,15 @@ export function StateChip({
     className,
   );
 
+  // `min-w-0` on the label so a caller can opt into truncation — `max-w-full` on
+  // the chip plus `truncate` on the text. Without it the label's automatic minimum
+  // size is its whole content width, and since a chip never wraps
+  // (`whitespace-nowrap` is its own rule) a long value runs straight out of its
+  // card. That is exactly what a long music filename did.
   const body = (
     <>
       {leading}
-      <span>{children}</span>
+      <span className="min-w-0">{children}</span>
       {trailing}
     </>
   );

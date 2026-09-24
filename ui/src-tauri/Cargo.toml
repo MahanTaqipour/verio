@@ -10,6 +10,12 @@ path = "src/lib.rs"
 
 [build-dependencies]
 tauri-build = { workspace = true }
+# The same fix as the `indexmap` entry under [dependencies], and it has to be
+# repeated here: schemars reaches indexmap 1.9.3 through `tauri-build`, which is a
+# *build*-dependency, and cargo resolves build-dependency features in a separate
+# set from normal ones. Enabling `std` in only one of the two graphs leaves the
+# other probing — and this environment's probe fails.
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 verio-app = { path = "../../crates/verio-app" }
@@ -24,3 +30,21 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rfd = { workspace = true }
+# Not used by this crate directly. It is here to turn on indexmap's `std` feature,
+# which nothing else in the graph does.
+#
+# indexmap 1.9.3 declares no default features, so `std` is off unless somebody asks
+# for it — and `schemars 0.8.22` (pulled in through tauri-utils) depends on it as
+# `features = ["serde-1"]` only. With `std` off, indexmap's build script *probes*
+# for std using autocfg, and when that probe fails it selects the no-std variant,
+# which has no default for its `S` parameter. schemars then fails to compile:
+#
+#   schemars-0.8.22/src/lib.rs:12:32: error[E0107]:
+#     struct takes 3 generic arguments but 2 were supplied
+#     pub type Map<K, V> = indexmap::IndexMap<K, V>;
+#
+# Asking for `std` here takes indexmap's documented fast path instead — the build
+# script sees `CARGO_FEATURE_STD` and emits `has_std` without probing — so the
+# build no longer depends on a compile-time probe of the toolchain. This is not a
+# claim that std is missing: this is a Windows/msvc target that links std fine.
+indexmap = { version = "1.9", features = ["std"] }

@@ -119,9 +119,7 @@ struct Bridge {
     /// monitor channel — the same reason the room takes its mute gate as a sink.
     /// Without this, changing the output device while hosting would silently end
     /// the host's local monitor.
-    bot_monitor: std::sync::Arc<
-        Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
-    >,
+    bot_monitor: std::sync::Arc<Mutex<Option<verio_app::pipeline::MonitorSink>>>,
 }
 
 /// Session 29b: whether this client is hosting the music bot.
@@ -166,6 +164,16 @@ fn stop_bot(app: &AppHandle, bridge: &Bridge) {
     if let Some(bot) = bot {
         tracing::info!(session = %bot.session_id(), "music bot: stopping");
         bot.stop();
+        // Session 29c fix: stop the player *with* the session, and before the bus
+        // goes back. Handing the bus back while the player was still `playing` let
+        // the voice pipeline take it and mix the track into the outgoing voice
+        // frame and the local monitor — so a bot that ended left the music audibly
+        // running with no tile in the room to stop it, and leaving the room left the
+        // host hearing their own music with no call in progress.
+        //
+        // Only when a bot was actually running: a listener who never hosted keeps
+        // their own local player across a leave.
+        bridge.music.stop();
     }
     // Handed back unconditionally: leaving the bus owned by a bot that no longer
     // exists would leave the voice session deaf to its own music player, and the
@@ -729,6 +737,13 @@ fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> 
             let taken = bot_slot.lock().expect("bot lock").take();
             if let Some(bot) = taken {
                 bot.stop();
+                // Session 29c fix: the player is stopped with the session, for the
+                // same reason as in `stop_bot`. A bot that ended on its own — a
+                // remote stop, a dropped relay, the queue running out — released the
+                // bus while the player was still `playing`, and the voice pipeline
+                // took it back and mixed the track into the outgoing voice frame.
+                // The tile left the room; the music did not stop.
+                music.stop();
             }
             music.set_bot_owned(false);
             let bridge = tauri::Manager::state::<Bridge>(&watcher_app);
@@ -945,17 +960,30 @@ fn send_room_state(bridge: &Bridge) {
         .send_state(speaking, muted, deafened, music, title);
 }
 
+/// Play the cue for a mute/deafen transition.
+///
+/// Session 29c fix. The Tauri commands and the global shortcuts flip the *same*
+/// state, so they have to make the same sound — and while this lived inline in the
+/// two commands, a global shortcut toggled mute in silence while the button played
+/// the cue. Two copies of a rule is how they drift; one function is how they cannot.
+fn play_toggle_earcon(bridge: &Bridge, kind: verio_app::EarconKind) {
+    if let Some(pipe) = bridge.pipeline.lock().expect("pipeline lock").as_ref() {
+        pipe.play_earcon(kind);
+    }
+}
+
 #[tauri::command]
 fn toggle_mute(app: AppHandle, bridge: State<Bridge>) -> AudioState {
     bridge.tx.toggle_mute();
     let is_muted = bridge.tx.is_muted();
-    if let Some(pipe) = bridge.pipeline.lock().expect("pipeline lock").as_ref() {
-        pipe.play_earcon(if is_muted {
+    play_toggle_earcon(
+        &bridge,
+        if is_muted {
             verio_app::EarconKind::MuteOn
         } else {
             verio_app::EarconKind::Unmute
-        });
-    }
+        },
+    );
     send_room_state(&bridge);
     emit_audio_state(&app, &bridge);
     get_audio_state(bridge)
@@ -965,17 +993,17 @@ fn toggle_mute(app: AppHandle, bridge: State<Bridge>) -> AudioState {
 fn toggle_deafen(app: AppHandle, bridge: State<Bridge>) -> AudioState {
     bridge.tx.toggle_deafen();
     let is_deafened = bridge.tx.is_deafened();
-    if let Some(pipe) = bridge.pipeline.lock().expect("pipeline lock").as_ref() {
-        // `Undeafen`, not `Unmute`. Until Session 27 the deafen-off branch
-        // played the mute-off cue, so deafen and undeafen were not the
-        // distinguishable pair they read as — you could not tell by ear
-        // whether you had unmuted or undeafened.
-        pipe.play_earcon(if is_deafened {
+    // `Undeafen`, not `Unmute`. Until Session 27 the deafen-off branch played the
+    // mute-off cue, so deafen and undeafen were not the distinguishable pair they
+    // read as — you could not tell by ear whether you had unmuted or undeafened.
+    play_toggle_earcon(
+        &bridge,
+        if is_deafened {
             verio_app::EarconKind::Deafen
         } else {
             verio_app::EarconKind::Undeafen
-        });
-    }
+        },
+    );
     send_room_state(&bridge);
     emit_audio_state(&app, &bridge);
     get_audio_state(bridge)
@@ -1076,8 +1104,19 @@ fn leave_room(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
 
 #[tauri::command]
 fn set_peer_volume(peer_id: String, volume: f32, bridge: State<Bridge>) -> Result<(), String> {
+    // Logged because this is the only place a per-peer level is written and the
+    // key has to match what the mixer calls that peer. When a tile's slider looks
+    // right but the audio does not change, this id is the first thing to compare
+    // against the mixer's own `peer_id`.
+    tracing::info!(peer = %peer_id, volume = %volume, "set_peer_volume");
     if let Some(pipe) = bridge.pipeline.lock().expect("pipeline lock").as_ref() {
         pipe.set_peer_volume(peer_id, volume);
+    } else {
+        // Was a silent no-op: the tile's slider would move, the audio would not
+        // change, and nothing anywhere said why. There is no pipeline to hold a
+        // level when the app is not in a call, so this is a real possibility
+        // rather than an impossible branch.
+        tracing::warn!(peer = %peer_id, "set_peer_volume dropped: no pipeline");
     }
     Ok(())
 }
@@ -1885,6 +1924,18 @@ fn handle_shortcut_event(app: &AppHandle, action: HotkeyAction, state: ShortcutS
         HotkeyAction::Mute => {
             if pressed {
                 let muted = bridge.tx.toggle_mute();
+                // Session 29c fix: the shortcut and the button flip the same state,
+                // so they make the same sound. This path used to change mute in
+                // silence — the state changed, the cue never played, and the two
+                // ways of muting felt like different features.
+                play_toggle_earcon(
+                    &bridge,
+                    if muted {
+                        verio_app::EarconKind::MuteOn
+                    } else {
+                        verio_app::EarconKind::Unmute
+                    },
+                );
                 tracing::info!(muted, "hotkey: mute toggle");
                 send_room_state(&bridge);
                 emit_audio_state(app, &bridge);
@@ -1893,6 +1944,16 @@ fn handle_shortcut_event(app: &AppHandle, action: HotkeyAction, state: ShortcutS
         HotkeyAction::Deafen => {
             if pressed {
                 let (deafened, muted) = bridge.tx.toggle_deafen();
+                // The same fix, and the same defect was here too: the shortcut
+                // changed deafen silently.
+                play_toggle_earcon(
+                    &bridge,
+                    if deafened {
+                        verio_app::EarconKind::Deafen
+                    } else {
+                        verio_app::EarconKind::Undeafen
+                    },
+                );
                 tracing::info!(deafened, muted, "hotkey: deafen toggle");
                 send_room_state(&bridge);
                 emit_audio_state(app, &bridge);

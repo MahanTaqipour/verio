@@ -481,7 +481,9 @@ export function Settings({
       role="dialog"
       aria-modal="true"
       aria-label="Settings"
-      className="fixed inset-0 z-100 flex bg-bg"
+      // Session 29d: fade only. This overlay covers the window, so translating it
+      // would slide the whole surface rather than settle it.
+      className="animate-fade fixed inset-0 z-100 flex bg-bg"
     >
       {/* Nav rail */}
       <nav
