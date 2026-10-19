@@ -5601,6 +5601,7 @@ dependencies = [
  "verio-audio",
  "verio-discovery",
  "verio-transport",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

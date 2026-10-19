@@ -127,7 +127,18 @@ pub enum RoomEvent {
         /// inventing a name.
         by: String,
     },
+    /// Session 31: ephemeral in-call room chat message.
+    ChatReceived {
+        id: String,
+        sender_user_id: String,
+        sender_name: String,
+        text: String,
+        timestamp_ms: u64,
+    },
 }
+
+/// Session 31: max characters allowed in a single chat message.
+pub const MAX_CHAT_CHARS: usize = 500;
 
 /// Session 12: one remote participant. The relay fans out to every peer in the
 /// room, so a single session carries audio for all of them and each datagram is
@@ -231,6 +242,8 @@ pub struct RoomManager {
     mute_sink: Option<Arc<Mutex<std::collections::HashSet<String>>>>,
     /// Session 28: the local store, so a mute outlives the process.
     db: Db,
+    /// Session 31: recent chat message IDs for deduplicating UDP double-sends (bounded at 128).
+    recent_chat_ids: std::collections::VecDeque<String>,
 }
 
 struct ActiveSession {
@@ -261,6 +274,7 @@ impl RoomManager {
             room_mutes: std::collections::HashMap::new(),
             mute_sink: None,
             db,
+            recent_chat_ids: std::collections::VecDeque::with_capacity(128),
         };
         room.restore_mutes();
         room.spawn_audio_pump();
@@ -537,6 +551,7 @@ impl RoomManager {
         self.peer_seen.clear();
         self.room_code = None;
         self.transport_mode = None;
+        self.recent_chat_ids.clear();
         let _ = reason;
     }
 
@@ -688,6 +703,50 @@ impl RoomManager {
             return Err("Join a room before stopping its music.".into());
         };
         active.handle.send_control(ControlMessage::MusicStop);
+        Ok(())
+    }
+
+    /// Session 31: send an ephemeral in-call chat message (max 500 characters).
+    ///
+    /// Double-sends over UDP for loss resilience; deduplicated by ID on receipt.
+    pub fn send_chat(&mut self, text: String) -> Result<(), String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("chat message cannot be empty".into());
+        }
+        let bounded: String = trimmed.chars().take(MAX_CHAT_CHARS).collect();
+        let active = self.active.lock().expect("active lock");
+        let Some(active) = active.as_ref() else {
+            return Err("Join a room before sending chat messages.".into());
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let timestamp_ms = verio_transport::unix_ms();
+
+        if self.recent_chat_ids.len() >= 128 {
+            self.recent_chat_ids.pop_front();
+        }
+        self.recent_chat_ids.push_back(id.clone());
+
+        let msg = ControlMessage::Chat {
+            id: id.clone(),
+            text: bounded.clone(),
+            timestamp_ms,
+        };
+
+        // Double-send over UDP relay for packet loss resilience
+        active.handle.send_control(msg.clone());
+        active.handle.send_control(msg);
+
+        // Emit locally for our own UI
+        self.emit(RoomEvent::ChatReceived {
+            id,
+            sender_user_id: self.identity.user_id.clone(),
+            sender_name: self.identity.name.clone(),
+            text: bounded,
+            timestamp_ms,
+        });
+
         Ok(())
     }
 
@@ -1503,6 +1562,42 @@ fn spawn_transport_pump(
                             .unwrap_or_default();
                         m.emit(RoomEvent::MusicStopRequested { by });
                     }
+                    TransportEvent::Control {
+                        peer,
+                        message:
+                            ControlMessage::Chat {
+                                id,
+                                text,
+                                timestamp_ms,
+                            },
+                    } => {
+                        let mut m = room.lock().expect("room lock");
+                        let actor = resolve_peer(&peer, &peer_id);
+                        m.mark_peer_seen(&actor);
+
+                        if m.recent_chat_ids.contains(&id) {
+                            continue;
+                        }
+                        if m.recent_chat_ids.len() >= 128 {
+                            m.recent_chat_ids.pop_front();
+                        }
+                        m.recent_chat_ids.push_back(id.clone());
+
+                        let (sender_user_id, sender_name) = m
+                            .peers
+                            .get(&actor)
+                            .map(|p| (p.user_id.clone(), p.name.clone()))
+                            .unwrap_or_else(|| (String::new(), "Anonymous".to_string()));
+
+                        let bounded: String = text.chars().take(MAX_CHAT_CHARS).collect();
+                        m.emit(RoomEvent::ChatReceived {
+                            id,
+                            sender_user_id,
+                            sender_name,
+                            text: bounded,
+                            timestamp_ms,
+                        });
+                    }
                     TransportEvent::Rtt { ms } => {
                         let m = room.lock().expect("room lock");
                         m.emit(RoomEvent::Rtt { ms });
@@ -2177,6 +2272,51 @@ mod tests {
         m.remove_peer(&uuid(1));
 
         assert_eq!(m.state(), RoomState::Idle);
+    }
+
+    #[test]
+    fn chat_rejects_empty_or_whitespace() {
+        let (mut m, _rx) = manager();
+        assert_eq!(
+            m.send_chat("".into()),
+            Err("chat message cannot be empty".into())
+        );
+        assert_eq!(
+            m.send_chat("   ".into()),
+            Err("chat message cannot be empty".into())
+        );
+        assert_eq!(
+            m.send_chat("\t\n".into()),
+            Err("chat message cannot be empty".into())
+        );
+    }
+
+    #[test]
+    fn chat_rejects_when_not_in_room() {
+        let (mut m, _rx) = manager();
+        assert_eq!(
+            m.send_chat("hello".into()),
+            Err("Join a room before sending chat messages.".into())
+        );
+    }
+
+    #[test]
+    fn chat_recent_ids_bounded_at_128() {
+        let (mut m, _rx) = manager();
+        for i in 0..200 {
+            let id = format!("msg-{i}");
+            if m.recent_chat_ids.len() >= 128 {
+                m.recent_chat_ids.pop_front();
+            }
+            m.recent_chat_ids.push_back(id);
+        }
+        assert_eq!(m.recent_chat_ids.len(), 128);
+        assert!(!m.recent_chat_ids.contains(&"msg-0".to_string()));
+        assert!(m.recent_chat_ids.contains(&"msg-199".to_string()));
+
+        // Teardown clears ephemeral chat IDs
+        m.teardown_session("test");
+        assert!(m.recent_chat_ids.is_empty());
     }
 }
 

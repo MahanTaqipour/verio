@@ -68,6 +68,20 @@ export const NUMPAD_CODES = new Set([
   "NumpadEqual",
 ]);
 
+export const OEM_PUNCTUATION_CODES: Record<string, string> = {
+  Slash: "/",
+  Period: ".",
+  Comma: ",",
+  Semicolon: ";",
+  Quote: "'",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Minus: "-",
+  Equal: "=",
+  Backquote: "`",
+};
+
 /**
  * The main key's name, or `null` when the event carries no usable main key.
  *
@@ -78,6 +92,9 @@ export function mainKeyName(e: KeyEventLike): string | null {
   if (NUMPAD_CODES.has(e.code)) {
     return e.code;
   }
+  if (e.code in OEM_PUNCTUATION_CODES) {
+    return OEM_PUNCTUATION_CODES[e.code];
+  }
   if (e.code.startsWith("Key")) {
     return e.code.slice(3).toUpperCase();
   }
@@ -86,6 +103,9 @@ export function mainKeyName(e: KeyEventLike): string | null {
   }
   if (e.code === "Space") {
     return "Space";
+  }
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(e.code)) {
+    return e.code;
   }
   if (e.key.length === 1) {
     return e.key.toUpperCase();

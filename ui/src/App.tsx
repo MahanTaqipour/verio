@@ -19,6 +19,7 @@ import { MusicPanel } from "./components/verio/music-panel";
 import { Lobby } from "./components/verio/lobby";
 import { Settings, type HotkeyAction } from "./components/verio/settings";
 import { Room } from "./components/verio/room";
+import { type ChatMessage } from "./components/verio/chat-panel";
 import { StatusBanner } from "./components/verio/toast";
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,27 @@ export default function App() {
   const [capturingAction, setCapturingAction] = useState<HotkeyAction | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ text: string; isError?: boolean } | null>(null);
 
+  // Session 31: ephemeral in-call chat
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const isChatOpenRef = useRef(isChatOpen);
+  useEffect(() => {
+    isChatOpenRef.current = isChatOpen;
+  }, [isChatOpen]);
+
+  const selfUserIdRef = useRef(selfUserId);
+  useEffect(() => {
+    selfUserIdRef.current = selfUserId;
+  }, [selfUserId]);
+
+  const nicknameRef = useRef(settings?.nickname);
+  useEffect(() => {
+    nicknameRef.current = settings?.nickname;
+  }, [settings?.nickname]);
+
+  const seenChatIds = useRef(new Set<string>());
+
   // Imperative handle for the real-time mic meter. `input_level` arrives at
   // ~20 Hz; this writes `style.width` on a ref and causes zero React renders.
   // Do not convert it to state — see components/verio/level-meter.tsx.
@@ -279,6 +301,10 @@ export default function App() {
         setRttMs(null);
         setDiagnostics(null);
         setIsDiagnosticsOpen(false);
+        setChatMessages([]);
+        setUnreadChatCount(0);
+        setIsChatOpen(false);
+        seenChatIds.current.clear();
       }
     }).then((u) => unlistens.push(u));
 
@@ -403,6 +429,37 @@ export default function App() {
       setStatusMsg({ text: ev.payload, isError: true });
     }).then((u) => unlistens.push(u));
 
+    listen<{
+      id: string;
+      sender_user_id: string;
+      sender_name: string;
+      text: string;
+      timestamp_ms: number;
+    }>("chat_message", (ev) => {
+      const msg = ev.payload;
+      if (seenChatIds.current.has(msg.id)) return;
+      seenChatIds.current.add(msg.id);
+
+      const isSelf =
+        msg.sender_user_id === "self" ||
+        (selfUserIdRef.current !== "" && msg.sender_user_id === selfUserIdRef.current) ||
+        msg.sender_name === (nicknameRef.current || "You");
+      const newMsg: ChatMessage = {
+        id: msg.id,
+        senderUserId: msg.sender_user_id,
+        senderName: isSelf ? "You" : msg.sender_name,
+        text: msg.text,
+        timestampMs: msg.timestamp_ms,
+        isSelf,
+      };
+      setChatMessages((prev) => [...prev, newMsg]);
+      if (!isChatOpenRef.current && !isSelf) {
+        setUnreadChatCount((prev) => prev + 1);
+        const preview = msg.text.length > 40 ? msg.text.slice(0, 40) + "..." : msg.text;
+        setStatusMsg({ text: `${msg.sender_name}: ${preview}` });
+      }
+    }).then((u) => unlistens.push(u));
+
     return () => {
       for (const u of unlistens) u();
     };
@@ -462,6 +519,9 @@ export default function App() {
       e.stopPropagation();
 
       if (e.key === "Escape") {
+        try {
+          await invoke("cancel_hotkey_capture");
+        } catch {}
         setCapturingAction(null);
         return;
       }
@@ -523,6 +583,15 @@ export default function App() {
   }, [capturingAction, handleKeyDown]);
 
   // Actions
+  const handleBeginCapture = async (action: HotkeyAction) => {
+    try {
+      await invoke("prepare_hotkey_capture", { action });
+    } catch (e) {
+      console.warn("prepare_hotkey_capture failed:", e);
+    }
+    setCapturingAction(action);
+  };
+
   const handleToggleMute = async () => {
     const updated = await invoke<AudioState>("toggle_mute");
     setAudioState(updated);
@@ -681,9 +750,33 @@ export default function App() {
       setRoomCode(null);
       setPeers([]);
       setRoomState("idle");
+      setChatMessages([]);
+      setUnreadChatCount(0);
+      setIsChatOpen(false);
+      seenChatIds.current.clear();
       setStatusMsg({ text: "Left call." });
     } catch (e: any) {
       console.error(e);
+    }
+  };
+
+  const handleToggleChat = () => {
+    setIsChatOpen((prev) => {
+      const next = !prev;
+      if (next) setUnreadChatCount(0);
+      return next;
+    });
+  };
+
+  const handleCloseChat = () => {
+    setIsChatOpen(false);
+  };
+
+  const handleSendChatMessage = async (text: string) => {
+    try {
+      await invoke("send_chat_message", { text });
+    } catch (e: any) {
+      setStatusMsg({ text: `Could not send message: ${e}`, isError: true });
     }
   };
 
@@ -959,6 +1052,12 @@ export default function App() {
                 onToggleRoomMute={handleToggleRoomMute}
                 selfUserId={selfUserId}
                 botHostUserId={botHostUserId}
+                chatOpen={isChatOpen}
+                unreadChatCount={unreadChatCount}
+                onToggleChat={handleToggleChat}
+                chatMessages={chatMessages}
+                onSendMessage={(text) => void handleSendChatMessage(text)}
+                onCloseChat={handleCloseChat}
               />
 
               {/* Live network diagnostics — opened from the header's status chip,
@@ -1210,7 +1309,7 @@ export default function App() {
           onClose={() => setIsSettingsOpen(false)}
           onSelectVoiceActivity={() => void handleSelectVoiceActivity()}
           onSelectPushToTalk={() => void handleSelectPushToTalk()}
-          onBeginCapture={setCapturingAction}
+          onBeginCapture={(a) => void handleBeginCapture(a)}
           onClearHotkey={(a) => void handleClearHotkey(a)}
           onSetInputDevice={(n) => void handleSetInputDevice(n)}
           onSetOutputDevice={(n) => void handleSetOutputDevice(n)}

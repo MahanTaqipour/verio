@@ -85,6 +85,8 @@ export interface MockTransport {
   setMicLevel(enabled: boolean): void;
   /** Emit a short input_level sweep to exercise the imperative meter. */
   pulseMicLevel(): void;
+  /** Simulate incoming chat message from a peer. */
+  simulateIncomingChat(text?: string, senderName?: string): void;
   /** Count of commands handled, for a quick sanity read. */
   readonly commandCount: number;
 }
@@ -390,6 +392,31 @@ export function installMockTransport(scenarioId: string): MockTransport {
         if (action === "mute" || action === "deafen" || action === "ptt") {
           state.settings.hotkeys[action] = combo;
         }
+        return null;
+      }
+      case "prepare_hotkey_capture": {
+        const action = String(args.action ?? "");
+        return state.settings.hotkeys[action as keyof typeof state.settings.hotkeys] ?? "";
+      }
+      case "cancel_hotkey_capture":
+        return null;
+      case "send_chat_message": {
+        const text = String(args.text ?? "").trim();
+        if (!text) {
+          throw new Error("Chat message cannot be empty");
+        }
+        if (text.length > 500) {
+          throw new Error("Chat message exceeds 500 characters");
+        }
+        const id = "mock-chat-" + Math.random().toString(36).slice(2, 9);
+        const timestamp_ms = Date.now();
+        void emit("chat_message", {
+          id,
+          sender_user_id: state.room.self_user_id || "self",
+          sender_name: state.settings.nickname || "You",
+          text,
+          timestamp_ms,
+        });
         return null;
       }
       case "set_voice_quality":
@@ -910,6 +937,17 @@ export function installMockTransport(scenarioId: string): MockTransport {
         if (n >= 24) window.clearInterval(id);
       }, 50);
       timers.push(id);
+    },
+    simulateIncomingChat(text = "Hello from peer!", senderName = "Dan") {
+      const id = "mock-peer-chat-" + Math.random().toString(36).slice(2, 9);
+      const timestamp_ms = Date.now();
+      void emit("chat_message", {
+        id,
+        sender_user_id: `user-${senderName.toLowerCase()}`,
+        sender_name: senderName,
+        text,
+        timestamp_ms,
+      });
     },
   };
 

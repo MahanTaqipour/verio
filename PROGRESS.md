@@ -5403,8 +5403,52 @@ Verified (real command output):
 - Mutation testing:
   - Mutated `PeakLimiter` (bypassed limiting) -> `cargo test --test audio_pipeline_remediation test_dynamic_range_and_overdrive_protection` FAILED (`sample 1.0908976 exceeded peak limiter ceiling 0.945`). Reverted byte-exact via `git hash-object` (`2d2bead9b3ebb4fc12e8a957edf750401129078b`).
   - Mutated `soft_limit_sample` (bypassed limiting) -> `cargo test --test audio_pipeline_remediation test_multi_peer_mixer_linearity_and_headroom` FAILED (assertion `left == right` failed: left: 1160, right: 0). Reverted byte-exact via `git hash-object` (`2d2bead9b3ebb4fc12e8a957edf750401129078b`).
-- `pnpm tauri build --no-bundle`: Succeeded, produced `target\release\verio.exe`.
+### Session 31 (2026-10-20) — Non-Blocking Game-Proof Hotkeys, Server Main Root Room `1111`, and Ephemeral Room Chat
 
+Goal:
+1. Replace Win32 `RegisterHotKey` (which swallows keys globally and fails in games using raw input) with a dedicated 10 ms background thread polling `GetAsyncKeyState` without key interception. Support punctuation (`/`, `.`, `,`, `;`, `'`, `[`, `]`, `\`, `-`, `=`, `` ` ``), function keys (`F1`–`F24`), and numpad.
+2. Add `--main-root <VALUE>` / `-mr <VALUE>` CLI flags to `verio-server`, reserve `"1111"` from random room code generation, pre-create room `"1111"` if active, and keep `"1111"` alive even when all peers leave.
+3. Add ephemeral in-call room chat via `ControlMessage::Chat`, `RoomEvent::ChatReceived`, `RoomManager::send_chat` (max 500 chars, dedup bounded at 128 IDs, double-send UDP reliability), Tauri command `send_chat_message` & event `"chat_message"`, room header toggle with unread badge pill (`bg-accent text-bg mono-num`), and `<ChatPanel>` drawer (auto-scroll, markdown links/code, copy message, char counter). Never persist chat to DB/disk; reset on call leave.
 
+Work done:
+1. **Non-Blocking, Game-Proof Hotkeys (Part 1)**:
+   - `ui/src-tauri/Cargo.toml`: Added `Win32_UI_Input_KeyboardAndMouse` to `windows-sys`.
+   - `ui/src-tauri/src/lib.rs`: Removed `global_shortcut` registration on Windows; spawned `verio-hotkey-poller` thread polling every 10 ms via `GetAsyncKeyState`. Implemented edge detection (triggered on key transition to down), full key mapping for punctuation, numpad, letters, numbers, and function keys (`F1`–`F24`). Added `prepare_hotkey_capture` and `cancel_hotkey_capture` commands to pause the poller during UI rebinds.
+   - `ui/src/lib/hotkey.ts`: Added `OEM_PUNCTUATION_CODES` mapping `Slash`, `Period`, `Comma`, `Semicolon`, `Quote`, `BracketLeft`, `BracketRight`, `Backslash`, `Minus`, `Equal`, and `Backquote`.
+   - `ui/tests/hotkey.test.ts`: Added unit tests for punctuation/OEM keys; all 13 tests passing.
+2. **Server Main Root Room `1111` (Part 2)**:
+   - `crates/verio-server/src/main.rs`: Added `MAIN_ROOT_ROOM = "1111"`. Added CLI parser for `--main-root <active|inactive>` / `-mr <active|inactive>`. Excluded `"1111"` from random room code generation always. Initialized `"1111"` on startup when flag is active, and kept `"1111"` alive in `remove_peer_from_room` when all peers leave.
+3. **Ephemeral In-Call Room Chat (Part 3)**:
+   - `crates/verio-transport/src/lib.rs`: Added `ControlMessage::Chat { id, text, timestamp_ms }`.
+   - `crates/verio-app/src/room.rs`: Added `MAX_CHAT_CHARS = 500`, `RoomEvent::ChatReceived`, `recent_chat_ids: VecDeque<String>` (bounded 128), `RoomManager::send_chat`, receive event handling with deduplication.
+   - `crates/soak-harness/src/room_soak.rs`: Handled `ChatReceived`.
+   - `ui/src-tauri/src/lib.rs`: Added `send_chat_message` command, emitting `"chat_message"` Tauri events on `ChatReceived`.
+   - `ui/src/components/verio/icons.tsx`: Exported `IconMessageSquare` and `IconSend`.
+   - `ui/src/components/verio/chat-panel.tsx`: Implemented drawer with header, ephemeral tag, close button, auto-scrolling message list with consecutive grouping (<2 min), markdown links/code, copy button, composer footer with 0/500 counter and Send button.
+   - `ui/src/components/verio/room.tsx`: Added Chat toggle button with unread count pill badge (`bg-accent text-bg mono-num`), and rendered `<ChatPanel>` side-by-side with the participant grid. Used `aria-expanded` on the disclosure toggle.
+   - `ui/src/App.tsx`: Added chat state, unread count tracking, auto-clear on leave/idle, `selfUserIdRef` & `seenChatIds` deduplication, and wired `send_chat_message`.
+   - `ui/src/dev/mock/invoke.ts`: Handled `send_chat_message` command and added `simulateIncomingChat` helper on `MockTransport`.
 
-
+Verified (real command output):
+- `cargo clippy --workspace --all-targets -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test --workspace --exclude verio`: Exit code 0 (150 passed; 0 failed)
+- `cargo test -p verio --lib`: Exit code 0 (6 passed; 0 failed)
+- `pnpm tsc --noEmit` & `pnpm test`: Exit code 0 (13 passed; 0 failed)
+- `pnpm build`: Exit code 0 (built in 7.62s)
+- Node workspace browser verification scripts:
+  - `verify-room.mjs`: `ALL ROOM CHECKS PASSED` (all sections A through H, including chat toggle, counter 22/500, unread badge, ephemeral reset)
+  - `verify-settings.mjs`: `ALL CHECKS PASSED`
+  - `verify-music.mjs`: `all states render, all controls wired, no overflow, no console errors`
+  - `check-phantom-classes.mjs`: `PHANTOM: none — every class token resolves to a rule`
+  - `check-collisions.mjs`: `LEAK: clean`, `MIX: clean`
+  - `dead-css.mjs`: `DEAD: none`, `ORPHAN KEYFRAMES: none`
+  - `dead-modules.mjs`: `unreachable: 0`
+- Mutation testing:
+  - Mutated `remove_peer_from_room` in `crates/verio-server/src/main.rs` to always close empty rooms -> `cargo test -p verio-server test_main_root_retained_when_empty` FAILED (`1111 must be kept alive even when empty`). Reverted byte-exact via `git hash-object` (`8bf987fe186c3e0594b9aec40a485f79ba48a46e`).
+  - Mutated `send_chat` in `crates/verio-app/src/room.rs` to bypass empty check -> `cargo test -p verio-app chat_rejects_empty_or_whitespace` FAILED (`left: Err("Join a room before sending chat messages.")`, `right: Err("chat message cannot be empty")`). Reverted byte-exact via `git hash-object` (`384ed6fe5466ad0b98de9db7ef480420d3313a2e`).
+  - Mutated `OEM_PUNCTUATION_CODES.Slash` in `ui/src/lib/hotkey.ts` to `"WRONG"` -> `pnpm test` FAILED (`'WRONG' !== '/'`). Reverted byte-exact via `git hash-object` (`a0fb9e06e084a9e556e756c348ca70a1d4cc2fe5`).
+  - Mutated chat toggle button count assertion in `verify-room.mjs` to `=== 99` -> `verify-room.mjs` FAILED (`chat toggle button is present in room header`, `1 ROOM CHECK(S) FAILED`). Reverted byte-exact via `git hash-object` (`4eeb033087182abc435244f0620edce1d395399d`).
+- Release binaries built:
+  - Windows client: `target\release\verio.exe` (20,603,392 bytes)
+  - Windows server: `target\release\verio-server.exe` (1,857,024 bytes)
+  - Linux musl server: `target\x86_64-unknown-linux-musl\release\verio-server` (2,844,464 bytes)

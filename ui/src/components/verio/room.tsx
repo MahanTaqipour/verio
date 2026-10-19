@@ -74,11 +74,13 @@ import {
   IconCopy,
   IconHeadphoneOff,
   IconLeave,
+  IconMessageSquare,
   IconMicOff,
   IconMusic,
   IconUsers,
   IconVolumeOff,
 } from "@/components/verio/icons";
+import { ChatPanel, type ChatMessage } from "@/components/verio/chat-panel";
 import { cn } from "@/lib/utils";
 
 /** The fields `PeerInfo` actually carries. Nothing is added here. */
@@ -141,6 +143,12 @@ export interface RoomProps {
    * one person, and this is what says which of them is in charge of the music.
    */
   botHostUserId: string;
+  chatOpen?: boolean;
+  unreadChatCount?: number;
+  onToggleChat?: () => void;
+  chatMessages?: ChatMessage[];
+  onSendMessage?: (text: string) => void;
+  onCloseChat?: () => void;
   className?: string;
 }
 
@@ -522,6 +530,12 @@ export function Room({
   onToggleRoomMute,
   selfUserId,
   botHostUserId,
+  chatOpen = false,
+  unreadChatCount = 0,
+  onToggleChat,
+  chatMessages = [],
+  onSendMessage,
+  onCloseChat,
   className,
 }: RoomProps) {
   // `peers` is remote only, so the participant count is peers + you. The legacy
@@ -582,15 +596,36 @@ export function Room({
           )}
         </div>
 
-        <Button
-          variant="danger-outline"
-          size="sm"
-          onClick={onLeave}
-          icon={<IconLeave size={14} />}
-          className="shrink-0"
-        >
-          Leave call
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {onToggleChat && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={onToggleChat}
+              icon={<IconMessageSquare size={14} />}
+              aria-label="Toggle room chat"
+              aria-expanded={chatOpen}
+              className={cn(chatOpen && "border-accent text-accent")}
+            >
+              <span>Chat</span>
+              {!chatOpen && unreadChatCount > 0 && (
+                <span className="rounded-full bg-accent px-1.5 py-0.5 text-10 font-mono mono-num font-medium text-bg leading-none">
+                  {unreadChatCount > 9 ? "9+" : unreadChatCount}
+                </span>
+              )}
+            </Button>
+          )}
+
+          <Button
+            variant="danger-outline"
+            size="sm"
+            onClick={onLeave}
+            icon={<IconLeave size={14} />}
+            className="shrink-0"
+          >
+            Leave call
+          </Button>
+        </div>
       </header>
 
       {/* Session 29: if the room has silenced us, say so — and say who did it.
@@ -628,90 +663,101 @@ export function Room({
         </Panel>
       )}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3">
-        <SectionLabel level={2} className="shrink-0">
-          In call — {count} {count === 1 ? "participant" : "participants"}
-        </SectionLabel>
+      <div className="flex min-h-0 flex-1 flex-row gap-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-3">
+          <SectionLabel level={2} className="shrink-0">
+            In call — {count} {count === 1 ? "participant" : "participants"}
+          </SectionLabel>
 
-        {/* The scrolling region. `max-w-256` matches the Lobby's column cap so a
-            wide window does not stretch a tile to 450px. */}
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <ul
-            className={cn(
-              "mx-auto grid w-full max-w-256 list-none gap-3",
-              "grid-cols-1 sm:grid-cols-3 xl:grid-cols-4",
-            )}
-          >
-            {/* Session 29d: a tile fades in as it arrives. Opacity only — the
-                grid measures these, so the entrance must not touch geometry. */}
-            <li className="animate-fade">
-              <PeerTile
-                name={nickname}
-                speaking={self.speaking}
-                muted={self.muted}
-                deafened={self.deafened}
-                isSelf
-                host={selfHosts}
-              >
-                <MicLevelMeter ref={micMeterRef} className="min-w-0 flex-1" />
-              </PeerTile>
-            </li>
-
-            {peers.map((p) => (
-              <li key={p.uuid} className="animate-fade">
+          {/* The scrolling region. `max-w-256` matches the Lobby's column cap so a
+              wide window does not stretch a tile to 450px. */}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <ul
+              className={cn(
+                "mx-auto grid w-full max-w-256 list-none gap-3",
+                "grid-cols-1 sm:grid-cols-3 xl:grid-cols-4",
+              )}
+            >
+              {/* Session 29d: a tile fades in as it arrives. Opacity only — the
+                  grid measures these, so the entrance must not touch geometry. */}
+              <li className="animate-fade">
                 <PeerTile
-                  name={p.name}
-                  speaking={p.speaking}
-                  muted={p.mute}
-                  deafened={p.deafen}
-                  isBot={p.is_bot}
-                  // The badge belongs to the *voice* card, so the bot's own tile
-                  // never carries it — even though it shares the id that selects it.
-                  host={
-                    !p.is_bot && p.user_id !== "" && p.user_id === botHostUserId
-                  }
-                  music={p.music}
-                  musicTitle={p.music_title}
-                  volume={peerVolumes[p.uuid] ?? 1}
-                  onVolume={(v) => onPeerVolume(p.uuid, v)}
-                  onToggleMute={() => onTogglePeerMute(p.uuid)}
-                  roomMuted={isRoomMutedId(p.user_id)}
-                  // Withheld, not disabled, when the persistent id has not
-                  // arrived: there is nothing a click could send yet.
-                  onToggleRoomMute={
-                    p.user_id
-                      ? () =>
-                          onToggleRoomMute(p.user_id, !isRoomMutedId(p.user_id))
-                      : undefined
-                  }
-                />
-              </li>
-            ))}
-
-            {humans.length === 0 && (
-              // A dashed slot, not a peer tile: it reads as "space waiting to be
-              // filled" rather than as a participant with no name.
-              <li>
-                <Panel
-                  padding="sm"
-                  className="flex h-full flex-col items-start gap-2 border-dashed"
+                  name={nickname}
+                  speaking={self.speaking}
+                  muted={self.muted}
+                  deafened={self.deafened}
+                  isSelf
+                  host={selfHosts}
                 >
-                  <div className="flex items-center gap-2.5">
-                    <span className="grid size-8 shrink-0 place-items-center rounded-full text-text-faint">
-                      <IconUsers size={14} />
-                    </span>
-                    <span className="text-13 text-text-dim">Waiting for others</span>
-                  </div>
-                  <span className="text-13 text-text-faint">
-                    Share room code{" "}
-                    <span className="mono-num text-text">{roomCode || "----"}</span> to
-                    invite someone.
-                  </span>
-                </Panel>
+                  <MicLevelMeter ref={micMeterRef} className="min-w-0 flex-1" />
+                </PeerTile>
               </li>
-            )}
-          </ul>
+
+              {peers.map((p) => (
+                <li key={p.uuid} className="animate-fade">
+                  <PeerTile
+                    name={p.name}
+                    speaking={p.speaking}
+                    muted={p.mute}
+                    deafened={p.deafen}
+                    isBot={p.is_bot}
+                    // The badge belongs to the *voice* card, so the bot's own tile
+                    // never carries it — even though it shares the id that selects it.
+                    host={
+                      !p.is_bot && p.user_id !== "" && p.user_id === botHostUserId
+                    }
+                    music={p.music}
+                    musicTitle={p.music_title}
+                    volume={peerVolumes[p.uuid] ?? 1}
+                    onVolume={(v) => onPeerVolume(p.uuid, v)}
+                    onToggleMute={() => onTogglePeerMute(p.uuid)}
+                    roomMuted={isRoomMutedId(p.user_id)}
+                    // Withheld, not disabled, when the persistent id has not
+                    // arrived: there is nothing a click could send yet.
+                    onToggleRoomMute={
+                      p.user_id
+                        ? () =>
+                            onToggleRoomMute(p.user_id, !isRoomMutedId(p.user_id))
+                        : undefined
+                    }
+                  />
+                </li>
+              ))}
+
+              {humans.length === 0 && (
+                // A dashed slot, not a peer tile: it reads as "space waiting to be
+                // filled" rather than as a participant with no name.
+                <li>
+                  <Panel
+                    padding="sm"
+                    className="flex h-full flex-col items-start gap-2 border-dashed"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <span className="grid size-8 shrink-0 place-items-center rounded-full text-text-faint">
+                        <IconUsers size={14} />
+                      </span>
+                      <span className="text-13 text-text-dim">Waiting for others</span>
+                    </div>
+                    <span className="text-13 text-text-faint">
+                      Share room code{" "}
+                      <span className="mono-num text-text">{roomCode || "----"}</span> to
+                      invite someone.
+                    </span>
+                  </Panel>
+                </li>
+              )}
+            </ul>
+          </div>
         </div>
+
+        {chatOpen && onSendMessage && onCloseChat && (
+          <ChatPanel
+            messages={chatMessages}
+            onSendMessage={onSendMessage}
+            onClose={onCloseChat}
+            className="w-72 shrink-0 sm:w-80"
+          />
+        )}
       </div>
     </div>
   );

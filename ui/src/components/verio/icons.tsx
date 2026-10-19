@@ -43,6 +43,7 @@ import {
   LogIn,
   LogOut,
   Maximize2,
+  MessageSquare,
   Mic,
   MicOff,
   Minimize2,
@@ -57,6 +58,7 @@ import {
   RefreshCw,
   Repeat,
   Search,
+  Send,
   Server,
   Settings,
   Shield,
@@ -189,6 +191,8 @@ export const IconLogIn = makeIcon(LogIn, "logIn");
 export const IconLogOut = makeIcon(LogOut, "logOut");
 export const IconClock = makeIcon(Clock, "clock");
 export const IconDot = makeIcon(CircleDot, "dot");
+export const IconMessageSquare = makeIcon(MessageSquare, "messageSquare");
+export const IconSend = makeIcon(Send, "send");
 
 // --- Status ----------------------------------------------------------------
 export const IconAlert = makeIcon(AlertTriangle, "alert");

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -120,6 +120,26 @@ struct Bridge {
     /// Without this, changing the output device while hosting would silently end
     /// the host's local monitor.
     bot_monitor: std::sync::Arc<Mutex<Option<verio_app::pipeline::MonitorSink>>>,
+    /// Session 31: non-blocking hardware hotkey state.
+    hotkeys: Arc<Mutex<HotkeyPollerState>>,
+}
+
+/// Session 31: hardware hotkey binding for non-blocking polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyBinding {
+    pub vk: i32,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub win: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct HotkeyPollerState {
+    pub mute: Option<HotkeyBinding>,
+    pub deafen: Option<HotkeyBinding>,
+    pub ptt: Option<HotkeyBinding>,
+    pub paused: bool,
 }
 
 /// Session 29b: whether this client is hosting the music bot.
@@ -419,15 +439,14 @@ fn set_nickname(
     Ok(())
 }
 
-/// Called when the UI enters hotkey-capture mode: unregisters the action's
-/// current global binding so pressing the old combo mid-capture cannot fire
-/// the action. Returns the previous binding so Escape can restore it.
+/// Called when the UI enters hotkey-capture mode: pauses the hotkey poller
+/// so pressing keys mid-capture cannot fire actions.
 #[tauri::command]
 fn prepare_hotkey_capture(
     action: String,
-    app: AppHandle,
     bridge: State<Bridge>,
 ) -> Result<String, String> {
+    bridge.hotkeys.lock().expect("hotkeys lock").paused = true;
     let hotkeys = bridge.settings.get().hotkeys;
     let old = match action.as_str() {
         "mute" => hotkeys.mute,
@@ -435,11 +454,15 @@ fn prepare_hotkey_capture(
         "ptt" => hotkeys.ptt,
         other => return Err(format!("unknown hotkey action: {other}")),
     };
-    if let Ok(sc) = parse_binding(&old) {
-        app.global_shortcut().unregister(sc).ok();
-        tracing::info!(action = %action, binding = %old, "hotkey unregistered for capture");
-    }
+    tracing::info!(action = %action, binding = %old, "hotkey poller paused for capture");
     Ok(old)
+}
+
+/// Called when the user cancels hotkey capture: unpauses the poller.
+#[tauri::command]
+fn cancel_hotkey_capture(bridge: State<Bridge>) {
+    bridge.hotkeys.lock().expect("hotkeys lock").paused = false;
+    tracing::info!("hotkey poller unpaused");
 }
 
 #[tauri::command]
@@ -460,16 +483,18 @@ fn set_hotkey(
         other => return Err(format!("unknown hotkey action: {other}")),
     };
     // Validate BEFORE saving so a bad combo never sticks.
-    if !combo.is_empty() {
-        parse_binding(&combo)?;
-    }
+    let new_binding = if !combo.is_empty() {
+        Some(parse_binding(&combo)?)
+    } else {
+        None
+    };
     let hotkeys = bridge.settings.get().hotkeys;
     // The current binding of `field` plus the two bindings it must not collide
     // with (a combo may only ever be bound to one action).
-    let (old_combo, other_bindings): (&str, [(&str, &str); 2]) = match field {
-        "mute" => (&hotkeys.mute, [("deafen", &hotkeys.deafen), ("ptt", &hotkeys.ptt)]),
-        "deafen" => (&hotkeys.deafen, [("mute", &hotkeys.mute), ("ptt", &hotkeys.ptt)]),
-        _ => (&hotkeys.ptt, [("mute", &hotkeys.mute), ("deafen", &hotkeys.deafen)]),
+    let other_bindings: [(&str, &str); 2] = match field {
+        "mute" => [("deafen", &hotkeys.deafen), ("ptt", &hotkeys.ptt)],
+        "deafen" => [("mute", &hotkeys.mute), ("ptt", &hotkeys.ptt)],
+        _ => [("mute", &hotkeys.mute), ("deafen", &hotkeys.deafen)],
     };
     if !combo.is_empty() {
         for (other, bound) in other_bindings {
@@ -481,33 +506,18 @@ fn set_hotkey(
         }
     }
 
-    let gs = app.global_shortcut();
-    // Unregister the old binding first (idempotent if it was already gone).
-    if let Ok(sc) = parse_binding(old_combo) {
-        gs.unregister(sc).ok();
-        tracing::info!(binding = %old_combo, "hotkey unregistered");
-    }
-    if !combo.is_empty() {
-        let sc = parse_binding(&combo)?;
-        gs.unregister(sc).ok(); // stale registration from a previous run, if any
-        let action_enum = match field {
-            "mute" => HotkeyAction::Mute,
-            "deafen" => HotkeyAction::Deafen,
-            _ => HotkeyAction::Ptt,
-        };
-        gs.on_shortcut(sc, move |app, _s, event| {
-            handle_shortcut_event(app, action_enum, event.state());
-        })
-        .map_err(|e| format!("register hotkey {combo:?}: {e}"))?;
-        // Verify with the plugin so a silently-failed registration is an
-        // error instead of a binding that exists only in settings.
-        if !gs.is_registered(sc) {
-            return Err(format!("hotkey {combo:?} did not register (taken by another app?)"));
+    // Update poller bindings and unpause
+    {
+        let mut hp = bridge.hotkeys.lock().expect("hotkeys lock");
+        hp.paused = false;
+        match field {
+            "mute" => hp.mute = new_binding,
+            "deafen" => hp.deafen = new_binding,
+            _ => hp.ptt = new_binding,
         }
-        tracing::info!(binding = %combo, action = %field, "hotkey registered");
     }
 
-    // Persist only after the registration path succeeded.
+    // Persist only after validation
     bridge.settings.update(|s| match field {
         "mute" => s.hotkeys.mute = combo.clone(),
         "deafen" => s.hotkeys.deafen = combo.clone(),
@@ -519,6 +529,12 @@ fn set_hotkey(
     bridge.tx.set_ptt_mode(!updated.hotkeys.ptt.is_empty());
     emit_audio_state(&app, &bridge);
     Ok(())
+}
+
+/// Session 31: send an ephemeral in-call chat message.
+#[tauri::command]
+fn send_chat_message(text: String, bridge: State<Bridge>) -> Result<(), String> {
+    bridge.room.lock().expect("room lock").send_chat(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1368,8 @@ pub fn run() {
             set_debug_wavs,
             set_hotkey,
             prepare_hotkey_capture,
+            cancel_hotkey_capture,
+            send_chat_message,
             toggle_mute,
             toggle_deafen,
             get_room_state,
@@ -1580,6 +1598,7 @@ pub fn run() {
             };
 
             // --- bridge state (pipeline is started/restarted via helper) ---
+            let hotkey_state = Arc::new(Mutex::new(HotkeyPollerState::default()));
             let bridge = Bridge {
                 settings,
                 tx: std::sync::Arc::new(TxState::new()),
@@ -1604,6 +1623,7 @@ pub fn run() {
                 // Session 29b: IDLE until somebody presses play for the room.
                 bot: std::sync::Arc::new(Mutex::new(None)),
                 bot_monitor: std::sync::Arc::new(Mutex::new(None)),
+                hotkeys: Arc::clone(&hotkey_state),
             };
 
             // Session 13: push music status to the UI (~4 Hz while playing, and
@@ -1813,6 +1833,24 @@ pub fn run() {
                                         serde_json::json!({ "mode": mode }),
                                     );
                                 }
+                                RoomEvent::ChatReceived {
+                                    id,
+                                    sender_user_id,
+                                    sender_name,
+                                    text,
+                                    timestamp_ms,
+                                } => {
+                                    let _ = fwd_app.emit(
+                                        "chat_message",
+                                        serde_json::json!({
+                                            "id": id,
+                                            "sender_user_id": sender_user_id,
+                                            "sender_name": sender_name,
+                                            "text": text,
+                                            "timestamp_ms": timestamp_ms,
+                                        }),
+                                    );
+                                }
                                 RoomEvent::Rtt { ms } => {
                                     let _ = fwd_app.emit(
                                         "rtt_updated",
@@ -1831,6 +1869,11 @@ pub fn run() {
             }
 
             restart_pipeline(app.handle(), &bridge);
+            spawn_hotkey_poller(
+                app.handle().clone(),
+                Arc::clone(&hotkey_state),
+                Arc::clone(&bridge.tx),
+            );
             if let Err(e) = register_hotkeys(app.handle()) {
                 // Non-fatal: the app still runs; UI shows hotkeys as unbound.
                 tracing::error!("hotkey registration failed at startup: {e}");
@@ -1994,41 +2037,335 @@ fn normalize_combo(raw: &str) -> String {
     normalized_parts.join("+")
 }
 
-/// Parse a stored binding string ("Ctrl+Shift+M", "B", "Shift+B", etc.) into a shortcut.
-fn parse_binding(combo: &str) -> Result<Shortcut, String> {
+pub const VK_BACK: i32 = 0x08;
+pub const VK_TAB: i32 = 0x09;
+pub const VK_RETURN: i32 = 0x0D;
+pub const VK_SHIFT: i32 = 0x10;
+pub const VK_CONTROL: i32 = 0x11;
+pub const VK_MENU: i32 = 0x12; // Alt
+pub const VK_CAPITAL: i32 = 0x14; // CapsLock
+pub const VK_ESCAPE: i32 = 0x1B;
+pub const VK_SPACE: i32 = 0x20;
+pub const VK_PRIOR: i32 = 0x21; // Page Up
+pub const VK_NEXT: i32 = 0x22; // Page Down
+pub const VK_END: i32 = 0x23;
+pub const VK_HOME: i32 = 0x24;
+pub const VK_LEFT: i32 = 0x25;
+pub const VK_UP: i32 = 0x26;
+pub const VK_RIGHT: i32 = 0x27;
+pub const VK_DOWN: i32 = 0x28;
+pub const VK_INSERT: i32 = 0x2D;
+pub const VK_DELETE: i32 = 0x2E;
+pub const VK_LWIN: i32 = 0x5B;
+pub const VK_RWIN: i32 = 0x5C;
+pub const VK_NUMPAD0: i32 = 0x60;
+pub const VK_NUMPAD1: i32 = 0x61;
+pub const VK_NUMPAD2: i32 = 0x62;
+pub const VK_NUMPAD3: i32 = 0x63;
+pub const VK_NUMPAD4: i32 = 0x64;
+pub const VK_NUMPAD5: i32 = 0x65;
+pub const VK_NUMPAD6: i32 = 0x66;
+pub const VK_NUMPAD7: i32 = 0x67;
+pub const VK_NUMPAD8: i32 = 0x68;
+pub const VK_NUMPAD9: i32 = 0x69;
+pub const VK_MULTIPLY: i32 = 0x6A;
+pub const VK_ADD: i32 = 0x6B;
+pub const VK_SUBTRACT: i32 = 0x6D;
+pub const VK_DECIMAL: i32 = 0x6E;
+pub const VK_DIVIDE: i32 = 0x6F;
+pub const VK_F1: i32 = 0x70;
+pub const VK_OEM_NEC_EQUAL: i32 = 0x92;
+pub const VK_OEM_1: i32 = 0xBA; // ;:
+pub const VK_OEM_PLUS: i32 = 0xBB; // =+
+pub const VK_OEM_COMMA: i32 = 0xBC; // ,<
+pub const VK_OEM_MINUS: i32 = 0xBD; // -_
+pub const VK_OEM_PERIOD: i32 = 0xBE; // .>
+pub const VK_OEM_2: i32 = 0xBF; // /?
+pub const VK_OEM_3: i32 = 0xC0; // `~
+pub const VK_OEM_4: i32 = 0xDB; // [{
+pub const VK_OEM_5: i32 = 0xDC; // \|
+pub const VK_OEM_6: i32 = 0xDD; // ]}
+pub const VK_OEM_7: i32 = 0xDE; // '"
+
+fn parse_virtual_key(key: &str) -> Option<i32> {
+    let lower = key.to_ascii_lowercase();
+    match lower.as_str() {
+        // Punctuation & symbols
+        "/" | "slash" => Some(VK_OEM_2),
+        "." | "period" => Some(VK_OEM_PERIOD),
+        "," | "comma" => Some(VK_OEM_COMMA),
+        ";" | "semicolon" => Some(VK_OEM_1),
+        "'" | "quote" => Some(VK_OEM_7),
+        "[" | "bracketleft" => Some(VK_OEM_4),
+        "]" | "bracketright" => Some(VK_OEM_6),
+        "\\" | "backslash" => Some(VK_OEM_5),
+        "-" | "minus" => Some(VK_OEM_MINUS),
+        "=" | "equal" => Some(VK_OEM_PLUS),
+        "`" | "backquote" => Some(VK_OEM_3),
+
+        // Space & control keys
+        "space" => Some(VK_SPACE),
+        "tab" => Some(VK_TAB),
+        "backspace" => Some(VK_BACK),
+        "enter" | "return" => Some(VK_RETURN),
+        "escape" | "esc" => Some(VK_ESCAPE),
+        "capslock" => Some(VK_CAPITAL),
+        "insert" => Some(VK_INSERT),
+        "delete" | "del" => Some(VK_DELETE),
+        "home" => Some(VK_HOME),
+        "end" => Some(VK_END),
+        "pageup" => Some(VK_PRIOR),
+        "pagedown" => Some(VK_NEXT),
+        "arrowup" | "up" => Some(VK_UP),
+        "arrowdown" | "down" => Some(VK_DOWN),
+        "arrowleft" | "left" => Some(VK_LEFT),
+        "arrowright" | "right" => Some(VK_RIGHT),
+
+        // Numpad
+        "numpad0" => Some(VK_NUMPAD0),
+        "numpad1" => Some(VK_NUMPAD1),
+        "numpad2" => Some(VK_NUMPAD2),
+        "numpad3" => Some(VK_NUMPAD3),
+        "numpad4" => Some(VK_NUMPAD4),
+        "numpad5" => Some(VK_NUMPAD5),
+        "numpad6" => Some(VK_NUMPAD6),
+        "numpad7" => Some(VK_NUMPAD7),
+        "numpad8" => Some(VK_NUMPAD8),
+        "numpad9" => Some(VK_NUMPAD9),
+        "numpadmultiply" => Some(VK_MULTIPLY),
+        "numpadadd" => Some(VK_ADD),
+        "numpadsubtract" => Some(VK_SUBTRACT),
+        "numpaddecimal" => Some(VK_DECIMAL),
+        "numpaddivide" => Some(VK_DIVIDE),
+        "numpadenter" => Some(VK_RETURN),
+        "numpadequal" => Some(VK_OEM_NEC_EQUAL),
+
+        // Single alphanumeric characters
+        s if s.len() == 1 => {
+            let ch = s.chars().next().unwrap();
+            if ch.is_ascii_lowercase() {
+                Some(ch.to_ascii_uppercase() as i32)
+            } else if ch.is_ascii_digit() {
+                Some(ch as i32)
+            } else {
+                None
+            }
+        }
+
+        // Function keys F1..F24
+        s if s.starts_with('f') => {
+            if let Ok(num) = s[1..].parse::<i32>() {
+                if (1..=24).contains(&num) {
+                    Some(VK_F1 + (num - 1))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        _ => None,
+    }
+}
+
+/// Parse a stored binding string ("Ctrl+Shift+M", "B", "/", "Ctrl+/", etc.) into a HotkeyBinding.
+fn parse_binding(combo: &str) -> Result<HotkeyBinding, String> {
     let norm = normalize_combo(combo);
     if norm.is_empty() {
         return Err("empty hotkey binding".to_string());
     }
-    norm
-        .parse::<Shortcut>()
-        .map_err(|e| format!("invalid hotkey binding {combo:?} (normalized: {norm:?}): {e}"))
+
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut win = false;
+    let mut main_vk: Option<i32> = None;
+
+    for part in norm.split('+') {
+        match part {
+            "Ctrl" => {
+                if ctrl {
+                    return Err("duplicate Ctrl modifier".to_string());
+                }
+                ctrl = true;
+            }
+            "Shift" => {
+                if shift {
+                    return Err("duplicate Shift modifier".to_string());
+                }
+                shift = true;
+            }
+            "Alt" => {
+                if alt {
+                    return Err("duplicate Alt modifier".to_string());
+                }
+                alt = true;
+            }
+            "Super" => {
+                if win {
+                    return Err("duplicate Super modifier".to_string());
+                }
+                win = true;
+            }
+            other => {
+                if main_vk.is_some() {
+                    return Err(format!("multiple main keys specified: {combo:?}"));
+                }
+                let vk = parse_virtual_key(other)
+                    .ok_or_else(|| format!("unrecognized key {other:?} in combo {combo:?}"))?;
+                main_vk = Some(vk);
+            }
+        }
+    }
+
+    let vk = main_vk.ok_or_else(|| format!("no main key in hotkey combo {combo:?}"))?;
+    Ok(HotkeyBinding {
+        vk,
+        ctrl,
+        shift,
+        alt,
+        win,
+    })
 }
 
-/// (Re)register all hotkeys from settings.
+#[cfg(windows)]
+fn is_key_down(vk: i32) -> bool {
+    unsafe {
+        (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) as u16 & 0x8000) != 0
+    }
+}
+
+#[cfg(windows)]
+fn check_binding_down(binding: &HotkeyBinding) -> bool {
+    let ctrl_down = is_key_down(VK_CONTROL);
+    let shift_down = is_key_down(VK_SHIFT);
+    let alt_down = is_key_down(VK_MENU);
+    let win_down = is_key_down(VK_LWIN) || is_key_down(VK_RWIN);
+
+    if binding.ctrl != ctrl_down {
+        return false;
+    }
+    if binding.shift != shift_down {
+        return false;
+    }
+    if binding.alt != alt_down {
+        return false;
+    }
+    if binding.win != win_down {
+        return false;
+    }
+
+    is_key_down(binding.vk)
+}
+
+#[cfg(windows)]
+fn spawn_hotkey_poller(
+    app: AppHandle,
+    state: Arc<Mutex<HotkeyPollerState>>,
+    bridge_tx: Arc<TxState>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("verio-hotkey-poller".into())
+        .spawn(move || {
+            let mut prev_mute = false;
+            let mut prev_deafen = false;
+            let mut prev_ptt = false;
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+
+                let (mute_b, deafen_b, ptt_b, paused) = {
+                    let guard = state.lock().expect("hotkey poller lock");
+                    (
+                        guard.mute.clone(),
+                        guard.deafen.clone(),
+                        guard.ptt.clone(),
+                        guard.paused,
+                    )
+                };
+
+                if paused {
+                    if prev_ptt {
+                        prev_ptt = false;
+                        bridge_tx.set_ptt_held(false);
+                        let bridge = tauri::Manager::state::<Bridge>(&app);
+                        send_room_state(&bridge);
+                        emit_audio_state(&app, &bridge);
+                    }
+                    prev_mute = false;
+                    prev_deafen = false;
+                    continue;
+                }
+
+                // Check Mute (rising edge)
+                let mute_down = mute_b.as_ref().is_some_and(check_binding_down);
+                if mute_down && !prev_mute {
+                    handle_shortcut_event(&app, HotkeyAction::Mute, ShortcutState::Pressed);
+                }
+                prev_mute = mute_down;
+
+                // Check Deafen (rising edge)
+                let deafen_down = deafen_b.as_ref().is_some_and(check_binding_down);
+                if deafen_down && !prev_deafen {
+                    handle_shortcut_event(&app, HotkeyAction::Deafen, ShortcutState::Pressed);
+                }
+                prev_deafen = deafen_down;
+
+                // Check PTT (level transition)
+                let ptt_down = ptt_b.as_ref().is_some_and(check_binding_down);
+                if ptt_down != prev_ptt {
+                    prev_ptt = ptt_down;
+                    bridge_tx.set_ptt_held(ptt_down);
+                    let bridge = tauri::Manager::state::<Bridge>(&app);
+                    send_room_state(&bridge);
+                    emit_audio_state(&app, &bridge);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!("spawn hotkey poller failed: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_hotkey_poller(
+    _app: AppHandle,
+    _state: Arc<Mutex<HotkeyPollerState>>,
+    _bridge_tx: Arc<TxState>,
+) {
+}
+
+/// (Re)load all hotkeys from settings into the hardware poller.
 fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
     let bridge: State<Bridge> = app.state();
     let hotkeys = bridge.settings.get().hotkeys;
-    let gs = app.global_shortcut();
 
-    let bindings = [
-        (HotkeyAction::Mute, hotkeys.mute),
-        (HotkeyAction::Deafen, hotkeys.deafen),
-        (HotkeyAction::Ptt, hotkeys.ptt),
-    ];
-    for (action, combo) in bindings {
-        if combo.is_empty() {
-            tracing::info!(action = ?action, "hotkey disabled (empty binding)");
-            continue;
-        }
-        let shortcut = parse_binding(&combo)?;
-        gs.unregister(shortcut).ok(); // idempotent if not registered
-        gs.on_shortcut(shortcut, move |app, _sc, event| {
-            handle_shortcut_event(app, action, event.state());
-        })
-        .map_err(|e| format!("register hotkey {combo:?}: {e}"))?;
-        tracing::info!(action = ?action, binding = %combo, "hotkey registered");
+    let mute = if !hotkeys.mute.is_empty() {
+        Some(parse_binding(&hotkeys.mute)?)
+    } else {
+        None
+    };
+    let deafen = if !hotkeys.deafen.is_empty() {
+        Some(parse_binding(&hotkeys.deafen)?)
+    } else {
+        None
+    };
+    let ptt = if !hotkeys.ptt.is_empty() {
+        Some(parse_binding(&hotkeys.ptt)?)
+    } else {
+        None
+    };
+
+    {
+        let mut hp = bridge.hotkeys.lock().expect("hotkeys lock");
+        hp.mute = mute;
+        hp.deafen = deafen;
+        hp.ptt = ptt;
+        hp.paused = false;
     }
+
+    tracing::info!("hotkeys loaded into hardware poller");
     Ok(())
 }
 
@@ -2048,6 +2385,40 @@ mod tests {
         assert!(parse_binding("Ctrl+B").is_ok(), "Ctrl+B failed");
         assert!(parse_binding("Space").is_ok(), "Space failed");
         assert!(parse_binding("B").is_ok(), "B failed");
+    }
+
+    #[test]
+    fn punctuation_and_oem_bindings_parse() {
+        for (combo, expected_vk) in [
+            ("/", VK_OEM_2),
+            (".", VK_OEM_PERIOD),
+            (",", VK_OEM_COMMA),
+            (";", VK_OEM_1),
+            ("'", VK_OEM_7),
+            ("[", VK_OEM_4),
+            ("]", VK_OEM_6),
+            ("\\", VK_OEM_5),
+            ("-", VK_OEM_MINUS),
+            ("=", VK_OEM_PLUS),
+            ("`", VK_OEM_3),
+        ] {
+            let res = parse_binding(combo).unwrap_or_else(|e| panic!("failed to parse {combo}: {e}"));
+            assert_eq!(res.vk, expected_vk);
+            assert!(!res.ctrl && !res.shift && !res.alt && !res.win);
+
+            let with_ctrl = parse_binding(&format!("Ctrl+{combo}")).unwrap();
+            assert_eq!(with_ctrl.vk, expected_vk);
+            assert!(with_ctrl.ctrl && !with_ctrl.shift && !with_ctrl.alt && !with_ctrl.win);
+        }
+    }
+
+    #[test]
+    fn function_keys_parse() {
+        for i in 1..=24 {
+            let name = format!("F{i}");
+            let res = parse_binding(&name).unwrap();
+            assert_eq!(res.vk, VK_F1 + (i - 1));
+        }
     }
 
     /// Contract test with the frontend. `ui/src/lib/hotkey.ts` builds numpad
@@ -2094,3 +2465,4 @@ mod tests {
         assert!(parse_binding("Ctrl+NumpadAdd").is_ok());
     }
 }
+

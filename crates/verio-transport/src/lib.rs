@@ -248,6 +248,12 @@ pub enum ControlMessage {
     /// relay stamps, so the message neither repeats it nor gets to lie about it.
     /// A stop is an event rather than state, so it cannot be folded into `State`.
     MusicStop,
+    /// Session 31: Ephemeral in-call room chat.
+    Chat {
+        id: String,
+        text: String,
+        timestamp_ms: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

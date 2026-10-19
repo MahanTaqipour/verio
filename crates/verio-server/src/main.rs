@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, RwLock};
 
 const DEFAULT_TCP_PORT: u16 = 8443;
 const DEFAULT_UDP_PORT: u16 = 8444;
+pub const MAIN_ROOT_ROOM: &str = "1111";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerIdentity {
@@ -118,6 +119,7 @@ struct AppState {
 pub struct ServerConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
+    pub main_root: bool,
 }
 
 pub fn parse_args_from<I, T>(args: I) -> Result<Option<ServerConfig>, String>
@@ -128,6 +130,7 @@ where
     let mut iter = args.into_iter();
     let mut tcp_port = None;
     let mut udp_port = None;
+    let mut main_root = false;
 
     while let Some(arg) = iter.next() {
         let s = arg.as_ref();
@@ -139,6 +142,7 @@ where
                      Options:\n  \
                        -p, --port <PORT>        TCP port for WebSocket signaling [default: 8443]\n  \
                        -u, --udp-port <PORT>    UDP port for fallback voice relay [default: 8444 (or TCP port + 1)]\n  \
+                       -mr, --main-root <VALUE> Main root room 1111 (active | inactive) [default: inactive]\n  \
                        -h, --help               Print help information"
                 );
                 return Ok(None);
@@ -163,6 +167,20 @@ where
                     .map_err(|e| format!("invalid port '{}': {e}", val.as_ref()))?;
                 udp_port = Some(port);
             }
+            "-mr" | "--main-root" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| format!("missing main-root value for {s}"))?;
+                match val.as_ref().to_ascii_lowercase().as_str() {
+                    "active" => main_root = true,
+                    "inactive" => main_root = false,
+                    other => {
+                        return Err(format!(
+                            "invalid --main-root value '{other}': expected 'active' or 'inactive'"
+                        ));
+                    }
+                }
+            }
             opt if opt.starts_with("-p=") || opt.starts_with("--port=") => {
                 let val = opt.split_once('=').unwrap().1;
                 let port = val
@@ -176,6 +194,18 @@ where
                     .parse::<u16>()
                     .map_err(|e| format!("invalid port '{val}': {e}"))?;
                 udp_port = Some(port);
+            }
+            opt if opt.starts_with("-mr=") || opt.starts_with("--main-root=") => {
+                let val = opt.split_once('=').unwrap().1;
+                match val.to_ascii_lowercase().as_str() {
+                    "active" => main_root = true,
+                    "inactive" => main_root = false,
+                    other => {
+                        return Err(format!(
+                            "invalid --main-root value '{other}': expected 'active' or 'inactive'"
+                        ));
+                    }
+                }
             }
             other => {
                 return Err(format!("unknown option '{other}'. Run with --help for usage."));
@@ -195,6 +225,7 @@ where
     Ok(Some(ServerConfig {
         tcp_port: final_tcp,
         udp_port: final_udp,
+        main_root,
     }))
 }
 
@@ -214,6 +245,17 @@ async fn main() {
     let state = AppState {
         rooms: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    if config.main_root {
+        let mut rooms = state.rooms.write().await;
+        rooms.insert(
+            MAIN_ROOT_ROOM.to_string(),
+            Room {
+                peers: HashMap::new(),
+            },
+        );
+        tracing::info!(room = %MAIN_ROOT_ROOM, "main root room initialized (permanent)");
+    }
     let relay_hub = SharedRelayHub::default();
 
     // Spawn Fallback UDP Relay on configured UDP port
@@ -298,12 +340,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let peer_id = identity.uuid.clone();
                 let mut rooms = state.rooms.write().await;
 
-                // Generate random 4-digit code (1000..=9999)
+                // Generate random 4-digit code (1000..=9999) excluding MAIN_ROOT_ROOM
                 let mut rng = rand::thread_rng();
                 let mut code;
                 loop {
                     code = format!("{:04}", rng.gen_range(1000..=9999));
-                    if !rooms.contains_key(&code) {
+                    if code != MAIN_ROOT_ROOM && !rooms.contains_key(&code) {
                         break;
                     }
                 }
@@ -466,7 +508,11 @@ async fn remove_peer_from_room(state: &AppState, room_code: &str, peer_id: &str)
         }
 
         if r.peers.is_empty() {
-            is_empty = true;
+            if room_code != MAIN_ROOT_ROOM {
+                is_empty = true;
+            } else {
+                tracing::info!(room = %room_code, "main root room 1111 is empty but kept alive");
+            }
         }
     }
     if is_empty {
@@ -542,9 +588,9 @@ impl SharedRelayHub {
     pub async fn prune_stale(&self) {
         let mut rooms = self.rooms.write().await;
         let now = std::time::Instant::now();
-        rooms.retain(|_room, clients| {
+        rooms.retain(|room, clients| {
             clients.retain(|_uuid, client| now.duration_since(client.last_seen) < std::time::Duration::from_secs(60));
-            !clients.is_empty()
+            room == MAIN_ROOT_ROOM || !clients.is_empty()
         });
     }
 }
@@ -763,4 +809,50 @@ mod tests {
         assert!(parse_args_from(["-p"]).is_err());
         assert!(parse_args_from(["--unknown-flag"]).is_err());
     }
+
+    #[test]
+    fn test_parse_args_main_root() {
+        let cfg = parse_args_from(["-mr", "active"]).unwrap().unwrap();
+        assert!(cfg.main_root);
+
+        let cfg = parse_args_from(["--main-root", "active"]).unwrap().unwrap();
+        assert!(cfg.main_root);
+
+        let cfg = parse_args_from(["-mr=active"]).unwrap().unwrap();
+        assert!(cfg.main_root);
+
+        let cfg = parse_args_from(["--main-root=active"]).unwrap().unwrap();
+        assert!(cfg.main_root);
+
+        let cfg = parse_args_from(["-mr", "inactive"]).unwrap().unwrap();
+        assert!(!cfg.main_root);
+
+        let cfg = parse_args_from(["--main-root=inactive"]).unwrap().unwrap();
+        assert!(!cfg.main_root);
+
+        assert!(parse_args_from(["-mr", "unknown"]).is_err());
+        assert!(parse_args_from(["--main-root=foo"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_main_root_retained_when_empty() {
+        let state = AppState {
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+        };
+        {
+            let mut rooms = state.rooms.write().await;
+            rooms.insert(
+                MAIN_ROOT_ROOM.to_string(),
+                Room {
+                    peers: HashMap::new(),
+                },
+            );
+        }
+
+        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "peer-1").await;
+
+        let rooms = state.rooms.read().await;
+        assert!(rooms.contains_key(MAIN_ROOT_ROOM), "1111 must be kept alive even when empty");
+    }
 }
+

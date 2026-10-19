@@ -346,7 +346,9 @@ fn spawn_event_collector(
                 // Session 29b: the soak has no music bot, so no stop is ever
                 // requested. Named rather than waved through for the same reason as
                 // the mute above.
-                | RoomEvent::MusicStopRequested { .. } => {}
+                | RoomEvent::MusicStopRequested { .. }
+                // Session 31: ephemeral in-call chat is not exercised in the audio soak.
+                | RoomEvent::ChatReceived { .. } => {}
             }
         }
     });

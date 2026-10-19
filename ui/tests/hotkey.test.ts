@@ -136,3 +136,18 @@ test("mainKeyName returns null only when there is nothing usable", () => {
   assert.equal(mainKeyName(ev({ code: "Space", key: " " })), "Space");
   assert.equal(mainKeyName(ev({ code: "F12", key: "F12" })), "F12");
 });
+
+test("punctuation and OEM keys capture correctly", () => {
+  assert.equal(comboFromEvent(ev({ code: "Slash", key: "/" })), "/");
+  assert.equal(comboFromEvent(ev({ code: "Slash", key: "/", ctrlKey: true })), "Ctrl+/");
+  assert.equal(comboFromEvent(ev({ code: "Period", key: "." })), ".");
+  assert.equal(comboFromEvent(ev({ code: "Comma", key: "," })), ",");
+  assert.equal(comboFromEvent(ev({ code: "Backquote", key: "`" })), "`");
+  assert.equal(comboFromEvent(ev({ code: "Minus", key: "-" })), "-");
+  assert.equal(comboFromEvent(ev({ code: "Equal", key: "=" })), "=");
+  assert.equal(comboFromEvent(ev({ code: "BracketLeft", key: "[" })), "[");
+  assert.equal(comboFromEvent(ev({ code: "BracketRight", key: "]" })), "]");
+  assert.equal(comboFromEvent(ev({ code: "Backslash", key: "\\" })), "\\");
+  assert.equal(comboFromEvent(ev({ code: "Quote", key: "'" })), "'");
+});
+

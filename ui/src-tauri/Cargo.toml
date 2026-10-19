@@ -48,3 +48,8 @@ rfd = { workspace = true }
 # build no longer depends on a compile-time probe of the toolchain. This is not a
 # claim that std is missing: this is a Windows/msvc target that links std fine.
 indexmap = { version = "1.9", features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
