@@ -353,18 +353,22 @@ export function Settings({
             >
               <Control>
                 <Slider
-                  min={0}
-                  max={30}
-                  step={1}
+                  min={-12}
+                  max={12}
+                  step={0.5}
                   value={settings?.input_gain_db ?? 0}
-                  fillPercent={((settings?.input_gain_db ?? 0) / 30) * 100}
-                  valueText={`${Math.round(settings?.input_gain_db ?? 0)} decibels`}
+                  fillPercent={(((settings?.input_gain_db ?? 0) + 12) / 24) * 100}
+                  valueText={`${(settings?.input_gain_db ?? 0) > 0.001 ? "+" : ""}${Math.abs(settings?.input_gain_db ?? 0) < 0.001 ? "0.0" : (settings?.input_gain_db ?? 0).toFixed(1)} decibels`}
                   onChange={(e) => onSetInputGain(parseFloat(e.target.value))}
                   aria-label="Input gain in decibels"
                   className="w-32"
                 />
-                <span className="mono-num w-12 shrink-0 text-right text-13 text-text-dim">
-                  +{Math.round(settings?.input_gain_db ?? 0)} dB
+                <span className="mono-num w-16 shrink-0 text-right text-13 text-text-dim">
+                  {(settings?.input_gain_db ?? 0) > 0.001 ? "+" : ""}
+                  {Math.abs(settings?.input_gain_db ?? 0) < 0.001
+                    ? "0.0"
+                    : (settings?.input_gain_db ?? 0).toFixed(1)}{" "}
+                  dB
                 </span>
               </Control>
             </SettingsRow>
@@ -394,12 +398,12 @@ export function Settings({
               <Select
                 auto
                 aria-label="Voice encoder bitrate"
-                value={String(settings?.voice_bitrate_kbps ?? 32)}
+                value={String(settings?.voice_bitrate_kbps ?? 48)}
                 onChange={(e) => onSetVoiceQuality(parseInt(e.target.value, 10))}
               >
                 {VOICE_RATES.map((k) => (
                   <option key={k} value={k}>
-                    {k} kbps{k === 32 ? " (default)" : ""}
+                    {k} kbps{k === 48 ? " (default)" : ""}
                   </option>
                 ))}
               </Select>
@@ -412,12 +416,12 @@ export function Settings({
               <Select
                 auto
                 aria-label="Music encoder bitrate"
-                value={String(settings?.music_bitrate_kbps ?? 96)}
+                value={String(settings?.music_bitrate_kbps ?? 128)}
                 onChange={(e) => onSetMusicQuality(parseInt(e.target.value, 10))}
               >
                 {MUSIC_RATES.map((k) => (
                   <option key={k} value={k}>
-                    {k} kbps{k === 96 ? " (default)" : ""}
+                    {k} kbps{k === 128 ? " (default)" : ""}
                   </option>
                 ))}
               </Select>

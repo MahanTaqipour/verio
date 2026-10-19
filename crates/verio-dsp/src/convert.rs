@@ -15,16 +15,27 @@ pub fn mixdown_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
     }
 }
 
-/// Naive linear-interpolation resampler with carry-over state between calls.
+#[inline]
+fn catmull_rom(y_prev: f32, y0: f32, y1: f32, y2: f32, t: f32) -> f32 {
+    let a = -0.5 * y_prev + 1.5 * y0 - 1.5 * y1 + 0.5 * y2;
+    let b = y_prev - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
+    let c = -0.5 * y_prev + 0.5 * y1;
+    let d = y0;
+    (((a * t + b) * t + c) * t + d).clamp(-1.0, 1.0)
+}
+
+/// 4-point Hermite cubic-interpolation resampler with carry-over state between calls.
 /// Only used for device-fallback conversion (non-48 kHz native devices); the
 /// preferred path opens devices at exactly 48 kHz and bypasses this entirely.
 pub struct LinearResampler {
     /// Samples to advance in the input stream per output sample.
     step: f64,
     pos: f64,
-    prev: f32,
+    buf: Vec<f32>,
     primed: bool,
 }
+
+pub type CubicResampler = LinearResampler;
 
 impl LinearResampler {
     /// `from_rate` = device native rate, `to_rate` = 48 kHz.
@@ -33,7 +44,7 @@ impl LinearResampler {
         Self {
             step: f64::from(from_rate) / f64::from(to_rate),
             pos: 0.0,
-            prev: 0.0,
+            buf: Vec::with_capacity(1024),
             primed: false,
         }
     }
@@ -45,21 +56,34 @@ impl LinearResampler {
             out.extend_from_slice(input);
             return;
         }
-        for &s in input {
-            if !self.primed {
-                self.prev = s;
-                self.primed = true;
-                // pos stays at 0; first output sample is emitted with the next
-                // input sample available for interpolation.
-            }
-            let base = self.prev;
-            let delta = s - base;
-            while self.pos < 1.0 {
-                out.push(base + delta * self.pos as f32);
+
+        if !self.primed && !input.is_empty() {
+            // Pad 2 history points before the first real sample
+            self.buf.push(input[0]);
+            self.buf.push(input[0]);
+            self.primed = true;
+        }
+
+        self.buf.extend_from_slice(input);
+
+        let mut read_idx = 0;
+        while read_idx + 3 < self.buf.len() {
+            if self.pos < 1.0 {
+                let y_prev = self.buf[read_idx];
+                let y0 = self.buf[read_idx + 1];
+                let y1 = self.buf[read_idx + 2];
+                let y2 = self.buf[read_idx + 3];
+                let sample = catmull_rom(y_prev, y0, y1, y2, self.pos as f32);
+                out.push(sample);
                 self.pos += self.step;
+            } else {
+                read_idx += 1;
+                self.pos -= 1.0;
             }
-            self.pos -= 1.0;
-            self.prev = s;
+        }
+
+        if read_idx > 0 {
+            self.buf.drain(..read_idx);
         }
     }
 }

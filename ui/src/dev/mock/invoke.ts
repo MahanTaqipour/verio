@@ -374,8 +374,8 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return null;
       case "set_input_gain":
         state.settings.input_gain_db = Math.min(
-          30,
-          Math.max(0, Number(args.gainDb ?? 0)),
+          12,
+          Math.max(-12, Number(args.gainDb ?? 0)),
         );
         return null;
       case "set_noise_suppression":
@@ -393,10 +393,10 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return null;
       }
       case "set_voice_quality":
-        state.settings.voice_bitrate_kbps = Number(args.kbps ?? 32);
+        state.settings.voice_bitrate_kbps = Number(args.kbps ?? 48);
         return null;
       case "set_music_quality":
-        state.settings.music_bitrate_kbps = Number(args.kbps ?? 96);
+        state.settings.music_bitrate_kbps = Number(args.kbps ?? 128);
         return null;
       case "set_vps_address":
         state.settings.vps_address = String(args.address ?? "").trim();

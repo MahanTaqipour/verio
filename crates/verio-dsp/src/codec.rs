@@ -31,7 +31,7 @@ impl OpusEncoderWrapper {
             Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
                 .map_err(|e| opus_err("encoder init", e))?;
         inner
-            .set_bitrate(Bitrate::BitsPerSecond(32_000))
+            .set_bitrate(Bitrate::BitsPerSecond(48_000))
             .map_err(|e| opus_err("set bitrate", e))?;
         inner
             .set_complexity(5)
@@ -42,6 +42,27 @@ impl OpusEncoderWrapper {
         inner
             .set_encoder_ctl_request(OPUS_SET_DTX_REQUEST, 1)
             .map_err(|e| opus_err("enable DTX", e))?;
+        Ok(Self {
+            inner,
+            accum: Vec::with_capacity(OPUS_FRAME),
+        })
+    }
+
+    /// High-fidelity music encoder in fullband CELT mode (Application::Audio),
+    /// DTX disabled, complexity 8.
+    pub fn new_music(bitrate_bps: i32) -> Result<Self, String> {
+        let mut inner =
+            Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
+                .map_err(|e| opus_err("music encoder init", e))?;
+        inner
+            .set_bitrate(Bitrate::BitsPerSecond(bitrate_bps))
+            .map_err(|e| opus_err("music set bitrate", e))?;
+        inner
+            .set_complexity(8)
+            .map_err(|e| opus_err("music set complexity", e))?;
+        inner
+            .set_encoder_ctl_request(OPUS_SET_DTX_REQUEST, 0)
+            .map_err(|e| opus_err("music disable DTX", e))?;
         Ok(Self {
             inner,
             accum: Vec::with_capacity(OPUS_FRAME),
@@ -143,13 +164,18 @@ impl OpusDecoderWrapper {
             None => self.inner.decode_float(None::<&[u8]>, &mut out, false), // PLC
         };
         match result {
-            Ok(_) => Ok(out),
+            Ok(n) => {
+                out.truncate(n);
+                Ok(out)
+            }
             Err(e) => {
                 // Anything unexpected → full PLC concealment instead of failing.
                 tracing::warn!("opus decode failed ({e:?}), falling back to PLC");
-                self.inner
+                let n = self
+                    .inner
                     .decode_float(None::<&[u8]>, &mut out, false)
                     .map_err(|e| opus_err("PLC", e))?;
+                out.truncate(n);
                 Ok(out)
             }
         }
@@ -161,12 +187,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_one_chunk_produces_packet() {
+    fn encode_two_chunks_accumulate_to_20ms_packet() {
         let mut enc = OpusEncoderWrapper::new().expect("encoder");
+        assert!(enc.push(&[0.0; 480]).expect("push 1").is_none());
         let pkt = enc
             .push(&[0.0; 480])
-            .expect("push")
-            .expect("10 ms frame → immediate packet");
+            .expect("push 2")
+            .expect("20 ms frame -> packet");
         assert!(!pkt.is_empty());
     }
 
@@ -199,8 +226,24 @@ mod tests {
         assert_eq!(decoded.len(), OPUS_FRAME);
         let peak = decoded.iter().cloned().fold(0.0_f32, f32::max);
         assert!(peak > 0.05, "decoded peak {peak}");
-        // Lost packet → FEC/PLC concealment, still 480 samples.
+        // Lost packet → FEC/PLC concealment, still OPUS_FRAME samples.
         let concealed = dec.decode(None).expect("conceal");
         assert_eq!(concealed.len(), OPUS_FRAME);
+    }
+
+    #[test]
+    fn music_encoder_passes_12khz_celt_tone() {
+        let mut enc = OpusEncoderWrapper::new_music(128_000).expect("music encoder");
+        let mut dec = OpusDecoderWrapper::new().expect("decoder");
+        // 12 kHz tone at 48 kHz has 4 samples per cycle
+        let tone: Vec<f32> = (0..OPUS_FRAME)
+            .map(|i| (i as f32 * 2.0 * std::f32::consts::PI * 12_000.0 / 48_000.0).sin() * 0.5)
+            .collect();
+        let pkt = enc.push(&tone).expect("push").expect("music packet");
+        let decoded = dec.decode(Some(&pkt)).expect("decode");
+        assert_eq!(decoded.len(), OPUS_FRAME);
+        let peak = decoded.iter().cloned().fold(0.0_f32, f32::max);
+        // SILK drops >8 kHz, but CELT (Application::Audio) at 128 kbps preserves 12 kHz tone with strong energy
+        assert!(peak > 0.2, "12 kHz tone peak {peak} was attenuated");
     }
 }

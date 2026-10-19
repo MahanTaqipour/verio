@@ -21,6 +21,7 @@ dist-ssr/
 *.swp
 *.swo
 *~
+.workbuddy-ai/
 
 # OS
 .DS_Store

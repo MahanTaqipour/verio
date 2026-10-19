@@ -30,6 +30,6 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// One RNNoise frame: 10 ms at 48 kHz.
 pub const RNNOISE_FRAME: usize = 480;
 /// One Opus frame: 10 ms at 48 kHz (aligned with RNNoise 10 ms frames, no rechunking).
-pub const OPUS_FRAME: usize = 480;
+pub const OPUS_FRAME: usize = 960;
 
 

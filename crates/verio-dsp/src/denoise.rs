@@ -37,7 +37,7 @@ impl RnNoise {
     pub fn process(&mut self, chunk: &[f32]) -> (Vec<f32>, f32) {
         assert_eq!(chunk.len(), RNNOISE_FRAME);
         for (dst, src) in self.scaled.iter_mut().zip(chunk.iter()) {
-            *dst = src * 32768.0;
+            *dst = (src * 32768.0).clamp(-32767.0, 32767.0);
         }
         let mut denoised_scaled = vec![0.0_f32; RNNOISE_FRAME];
         let vad = self.state.process_frame(&mut denoised_scaled, &self.scaled);

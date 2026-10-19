@@ -125,8 +125,8 @@ impl Default for Settings {
             music_monitor: false,
             music_force_stop: true,
             music_last_dir: None,
-            voice_bitrate_kbps: 32,
-            music_bitrate_kbps: 96,
+            voice_bitrate_kbps: 48,
+            music_bitrate_kbps: 128,
         }
     }
 }
@@ -134,7 +134,7 @@ impl Default for Settings {
 impl Settings {
     /// Clamp free-form fields to valid ranges after a load or update.
     pub fn sanitize(&mut self) {
-        self.input_gain_db = self.input_gain_db.clamp(0.0, 30.0);
+        self.input_gain_db = self.input_gain_db.clamp(-12.0, 12.0);
         if self.nickname.len() > 64 {
             self.nickname.truncate(64);
         }
@@ -181,7 +181,38 @@ impl SettingsStore {
     /// first time. The persister thread is started either way.
     #[must_use]
     pub fn load(db: Db, legacy_dir: &Path) -> Self {
-        let settings = import_legacy(&db, legacy_dir);
+        let mut settings = import_legacy(&db, legacy_dir);
+        let mut migrated = false;
+        if settings.input_gain_db > 6.0 {
+            tracing::warn!(
+                old = settings.input_gain_db,
+                "migrated legacy high input_gain_db to 0.0 dB unity"
+            );
+            settings.input_gain_db = 0.0;
+            migrated = true;
+        }
+        if settings.voice_bitrate_kbps == 32 {
+            tracing::info!(
+                old = settings.voice_bitrate_kbps,
+                "migrated legacy voice_bitrate_kbps from 32 to 48 kbps"
+            );
+            settings.voice_bitrate_kbps = 48;
+            migrated = true;
+        }
+        if settings.music_bitrate_kbps == 96 {
+            tracing::info!(
+                old = settings.music_bitrate_kbps,
+                "migrated legacy music_bitrate_kbps from 96 to 128 kbps"
+            );
+            settings.music_bitrate_kbps = 128;
+            migrated = true;
+        }
+        settings.sanitize();
+        if migrated {
+            if let Err(e) = save_settings(&db, &settings) {
+                tracing::warn!("failed to persist migrated settings: {e}");
+            }
+        }
         tracing::info!(settings = ?settings, "settings loaded");
         let inner = Arc::new(Mutex::new(settings));
 
@@ -391,7 +422,37 @@ mod tests {
             ..Settings::default()
         };
         s.sanitize();
-        assert!((s.input_gain_db - 30.0).abs() < 1e-6);
+        assert!((s.input_gain_db - 12.0).abs() < 1e-6);
+
+        let mut s2 = Settings {
+            input_gain_db: -55.0,
+            ..Settings::default()
+        };
+        s2.sanitize();
+        assert!((s2.input_gain_db - (-12.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_high_input_gain_and_bitrates_are_migrated_on_load() {
+        let dir = temp_dir("migration");
+        let legacy = Settings {
+            nickname: "Mahan".into(),
+            input_gain_db: 15.0,
+            voice_bitrate_kbps: 32,
+            music_bitrate_kbps: 96,
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            serde_json::to_string(&legacy).expect("serialize"),
+        )
+        .expect("write legacy");
+
+        let store = SettingsStore::load(open(&dir), &dir);
+        assert_eq!(store.get().input_gain_db, 0.0);
+        assert_eq!(store.get().voice_bitrate_kbps, 48);
+        assert_eq!(store.get().music_bitrate_kbps, 128);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -468,7 +529,7 @@ mod tests {
         let dir = temp_dir("import");
         let legacy = Settings {
             nickname: "Mahan".into(),
-            input_gain_db: 12.5,
+            input_gain_db: 4.5,
             ..Settings::default()
         };
         std::fs::write(
@@ -479,7 +540,7 @@ mod tests {
 
         let store = SettingsStore::load(open(&dir), &dir);
         assert_eq!(store.get().nickname, "Mahan");
-        assert!((store.get().input_gain_db - 12.5).abs() < 1e-6);
+        assert!((store.get().input_gain_db - 4.5).abs() < 1e-6);
 
         // The JSON is no longer the store, and must not look like it still is.
         assert!(!dir.join(LEGACY_SETTINGS_FILE_NAME).exists());

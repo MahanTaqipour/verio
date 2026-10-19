@@ -204,7 +204,7 @@ function settings(over: Partial<Settings> = {}): Settings {
     nickname: LOCAL_NICKNAME,
     input_device: null,
     output_device: null,
-    input_gain_db: 6,
+    input_gain_db: 0,
     noise_suppression: true,
     loopback: false,
     debug_wavs: false,
@@ -213,8 +213,8 @@ function settings(over: Partial<Settings> = {}): Settings {
     vps_address: DEFAULT_VPS,
     transport_mode: "auto",
     host_port: 8444,
-    voice_bitrate_kbps: 32,
-    music_bitrate_kbps: 96,
+    voice_bitrate_kbps: 48,
+    music_bitrate_kbps: 128,
     // Session 29b Force Stop: `Settings::default()` has this on, so the fixture
     // does too — a mock defaulting to `false` would hide the feature in every
     // screenshot and every browser check.

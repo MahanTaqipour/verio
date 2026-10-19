@@ -358,7 +358,7 @@ fn set_output_device(
 // (Tauri maps camelCase JS keys onto snake_case Rust arguments). It used to be
 // `db`, which made every invoke fail and the slider snap back.
 fn set_input_gain(gain_db: f64, bridge: State<Bridge>) -> Result<(), String> {
-    let gain_db = gain_db.clamp(0.0, 30.0) as f32;
+    let gain_db = gain_db.clamp(-12.0, 12.0) as f32;
     bridge.settings.update(|s| s.input_gain_db = gain_db);
     bridge.controls.set_gain_db(gain_db);
     Ok(())
@@ -1525,7 +1525,6 @@ pub fn run() {
                 room_tx,
                 db.clone(),
             )));
-            room.lock().expect("room lock").spawn_audio_pump();
 
             // Signaling listener. Best-effort: on one PC the SECOND instance
             // loses the port race and acts as connector only.

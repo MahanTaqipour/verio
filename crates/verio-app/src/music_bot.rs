@@ -407,7 +407,8 @@ struct EncodeLoop {
 /// collapse sustained music into near-silent packets, which is the same reason the
 /// voice pipeline disables it while music plays.
 fn encode_loop(cfg: EncodeLoop) {
-    let mut encoder = match OpusEncoderWrapper::new() {
+    let initial_kbps = cfg.controls.music_kbps();
+    let mut encoder = match OpusEncoderWrapper::new_music((initial_kbps * 1000) as i32) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("music bot: encoder init failed: {e}");
@@ -424,7 +425,7 @@ fn encode_loop(cfg: EncodeLoop) {
     let mut buf = [0.0_f32; RNNOISE_FRAME];
     let mut last_announce = std::time::Instant::now() - ANNOUNCE_INTERVAL;
     let mut announced_title = String::new();
-    let mut applied_kbps = 0u32;
+    let mut applied_kbps = initial_kbps;
 
     // Session 29c fix: real-time pacing.
     //
@@ -467,11 +468,9 @@ fn encode_loop(cfg: EncodeLoop) {
             continue;
         }
 
-        // Session 14's quality tiers, re-read every pass so a settings change
-        // lands. Voice and music share one Opus configuration here: the plan for
-        // this session is to reuse the voice bitrate and revisit it only if the
-        // music sounds thin.
-        let want_kbps = cfg.controls.voice_kbps();
+        // Wire music_bitrate_kbps so the Settings Music Quality dropdown
+        // actually controls the music bot's Opus bitrate.
+        let want_kbps = cfg.controls.music_kbps();
         if want_kbps != applied_kbps {
             match encoder.set_bitrate_bps((want_kbps * 1000) as i32) {
                 Ok(()) => applied_kbps = want_kbps,

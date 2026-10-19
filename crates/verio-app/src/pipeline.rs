@@ -27,7 +27,7 @@ use verio_dsp::convert::LinearResampler;
 use verio_dsp::denoise::RnNoise;
 use verio_dsp::earcon::{cue, EarconKind};
 use verio_dsp::music::MusicDecoder;
-use verio_dsp::util::{db_to_linear, rms_dbfs};
+use verio_dsp::util::{db_to_linear, rms_dbfs, soft_limit_sample, PeakLimiter};
 use verio_dsp::vad::SpeakingGate;
 use verio_dsp::wav::WavWriter;
 use verio_dsp::{RNNOISE_FRAME, SAMPLE_RATE};
@@ -119,7 +119,7 @@ impl LiveControls {
 
     pub fn set_gain_db(&self, db: f32) {
         self.gain_db
-            .store(db.clamp(0.0, 30.0).to_bits(), Ordering::Relaxed);
+            .store(db.clamp(-12.0, 12.0).to_bits(), Ordering::Relaxed);
     }
 
     #[must_use]
@@ -570,6 +570,7 @@ fn processing_loop(
     let mut converter = InputConverter::new(spec.channels, spec.sample_rate);
     let mut rnnoise = RnNoise::new();
     let mut vad_gate = SpeakingGate::default();
+    let mut peak_limiter = PeakLimiter::default();
     let mut encoder = match OpusEncoderWrapper::new() {
         Ok(e) => e,
         Err(e) => {
@@ -658,9 +659,10 @@ fn processing_loop(
                 }
             }
 
-            // Input gain (pre-RNNoise), live-adjustable.
+            // Input gain (pre-RNNoise), live-adjustable, protected by envelope limiter.
             let gain = db_to_linear(controls.gain_db());
-            let gained: Vec<f32> = chunk.iter().map(|s| s * gain).collect();
+            let mut gained: Vec<f32> = chunk.iter().map(|s| s * gain).collect();
+            peak_limiter.process_in_place(&mut gained);
 
             // RNNoise: denoise (when enabled) + voice probability always.
             let (denoised, vad) = rnnoise.process(&gained);
@@ -705,7 +707,7 @@ fn processing_loop(
                 let mic_gain = if tx_state.effective_transmission() { 1.0 } else { 0.0 };
                 for i in 0..RNNOISE_FRAME {
                     mixed_buf[i] =
-                        (encode_input[i] * mic_gain + music_buf[i] * vol).clamp(-1.0, 1.0);
+                        soft_limit_sample(encode_input[i] * mic_gain + music_buf[i] * vol);
                 }
                 using_music = true;
             }
@@ -1622,9 +1624,6 @@ fn rx_loop(
             if let Some(lb) = loopback_stream.as_mut() {
                 lb.push_packet(0, 0, &pkt);
             }
-            if loopback_wav.is_some() && !check_wav_full(&mut loopback_wav, true, &event_tx) {
-                // WAV write handled if needed
-            }
         }
 
         // 2. Drain remote network audio packets
@@ -1725,7 +1724,13 @@ fn rx_loop(
                     diag_earcon_peak = diag_earcon_peak.max(cue.abs());
                     sum += cue;
                 }
-                mono_mixed_buf.push(sum.clamp(-1.0, 1.0));
+                mono_mixed_buf.push(soft_limit_sample(sum));
+            }
+
+            if loopback_wav.is_some() && !check_wav_full(&mut loopback_wav, true, &event_tx) {
+                if let Some((w, _)) = &mut loopback_wav {
+                    let _ = w.write_f32(&mono_mixed_buf);
+                }
             }
 
             // One line per 5 s, from inside the mix block so the volume map, the

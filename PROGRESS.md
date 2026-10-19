@@ -5360,5 +5360,51 @@ as committed:
 Part C is complete, verified and committed. Session 29 is **closed**: Part A (room-wide mute) as
 `babe484`, Part B (the music bot) as `4259c14`, Part C as this commit. Per the plan, stop here.
 
+### Session 30b (2026-10-19) — Audio Pipeline, WO Mic Protection & High-Fidelity Music Bot Overhaul
+
+Goal: Address root causes of "boosted, low quality, processed" voice and music thinness across 8 distinct tasks without touching the STUN envelope, relay framing, or two-tier identity.
+
+Work done:
+1. **Gain Slider & DB Migration** (`ui/src/components/verio/settings.tsx`, `crates/verio-app/src/settings.rs`, `ui/src/dev/mock/invoke.ts`, `ui/src/dev/mock/fixtures.ts`):
+   - Changed Input Gain slider from `0..+30 dB` to `-12..+12 dB` (step 0.5 dB, 0 dB center).
+   - Added DB migration on load: auto-resets `input_gain_db > 6.0` to `0.0 dB`.
+   - Upgraded default voice bitrate from 32 to 48 kbps (migrates `32 -> 48`), and default music bitrate from 96 to 128 kbps (migrates `96 -> 128`).
+2. **Pre-RNNoise Envelope Limiter & Clamp** (`crates/verio-dsp/src/util.rs`, `crates/verio-dsp/src/denoise.rs`, `crates/verio-app/src/pipeline.rs`):
+   - Added `PeakLimiter` (-0.5 dBFS ceiling, instant attack, 50 ms release @ 48 kHz) immediately after user gain.
+   - Clamped RNNoise input scaling to `[-32767.0, 32767.0]` in `RnNoise::process` so WO Mic AGC bursts never saturate the neural network GRU or cause float overflow in Opus.
+3. **Soft-Knee Mixer Limiter** (`crates/verio-dsp/src/util.rs`, `crates/verio-app/src/pipeline.rs`):
+   - Replaced hard `.clamp(-1.0, 1.0)` with piecewise cubic C1-continuous `soft_limit_sample`: 100% linear up to -3.01 dBFS (0.7071), smooth saturation to -0.10 dBFS hard ceiling (0.9885).
+4. **20 ms Opus Voice Frames & 48 kbps Default** (`crates/verio-dsp/src/lib.rs`, `crates/verio-dsp/src/codec.rs`, `crates/verio-app/src/settings.rs`):
+   - Set `OPUS_FRAME = 960` (20 ms @ 48 kHz).
+   - In `OpusDecoderWrapper::decode`, truncated output buffer to returned length `n`, transparently supporting both 10 ms and 20 ms packets.
+5. **High-Fidelity Music Bot Overhaul** (`crates/verio-dsp/src/codec.rs`, `crates/verio-app/src/music_bot.rs`):
+   - Added `OpusEncoderWrapper::new_music(bitrate_bps)` configured for `Application::Audio` (fullband CELT mode), complexity 8, DTX disabled, 20 ms frames.
+   - Wired `LiveControls::music_kbps()` to dynamic bitrate adjustment in `music_bot.rs`.
+6. **4-Point Cubic Resampler** (`crates/verio-dsp/src/convert.rs`):
+   - Upgraded `LinearResampler` to 4-point Hermite / Catmull-Rom cubic interpolation with 3-sample history buffer.
+7. **Removed Duplicate spawn_audio_pump** (`ui/src-tauri/src/lib.rs`):
+   - Removed redundant `room.lock().expect("room lock").spawn_audio_pump();` at line 1528 (`RoomManager::new` already invokes it).
+8. **Restored loopback_out.wav Writer** (`crates/verio-app/src/pipeline.rs`):
+   - Restored `w.write_f32(&mono_mixed_buf)`.
+
+Verified (real command output):
+- `cargo clippy --workspace --all-targets -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test --workspace --exclude verio`: Exit code 0 (149 passed; 0 failed)
+- `cargo test -p verio --lib`: Exit code 0 (4 passed; 0 failed)
+- `pnpm tsc --noEmit` & `pnpm test`: Exit code 0 (12 passed; 0 failed)
+- `pnpm build`: Exit code 0 (built in 10.29s)
+- Node workspace verification scripts:
+  - `verify-settings.mjs`: `ALL CHECKS PASSED`
+  - `verify-room.mjs`: `ALL ROOM CHECKS PASSED`
+  - `verify-music.mjs`: `all states render, all controls wired, no overflow, no console errors`
+  - `verify-contents-wrapper.mjs`: `40 configuration(s) layout-neutral`
+  - `verify-embedded-assets.mjs` & `verify-harness.mjs`: `8 passed, 0 failed`
+  - `verify-header-isolation.mjs`: `14 shots checked, 0 layout shifts`
+- Mutation testing:
+  - Mutated `PeakLimiter` (bypassed limiting) -> `cargo test --test audio_pipeline_remediation test_dynamic_range_and_overdrive_protection` FAILED (`sample 1.0908976 exceeded peak limiter ceiling 0.945`). Reverted byte-exact via `git hash-object` (`2d2bead9b3ebb4fc12e8a957edf750401129078b`).
+  - Mutated `soft_limit_sample` (bypassed limiting) -> `cargo test --test audio_pipeline_remediation test_multi_peer_mixer_linearity_and_headroom` FAILED (assertion `left == right` failed: left: 1160, right: 0). Reverted byte-exact via `git hash-object` (`2d2bead9b3ebb4fc12e8a957edf750401129078b`).
+- `pnpm tauri build --no-bundle`: Succeeded, produced `target\release\verio.exe`.
+
+
 
 
