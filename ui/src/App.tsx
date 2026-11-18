@@ -36,7 +36,7 @@ type TransportModeSetting = "auto" | "cloud_relay" | "peer_host" | "direct_p2p";
 
 export interface TransportDiagnostics {
   mode: string;
-  remote_endpoint: string | null;
+  endpoint: string | null;
   local_addr: string | null;
   packets_sent: number;
   packets_recv: number;
@@ -46,7 +46,7 @@ export interface TransportDiagnostics {
   rtt_ms: number | null;
   ice_state: string | null;
   status: string;
-  last_error: string | null;
+  error: string | null;
   // Session 7: relay instrumentation
   relay_packets_sent: number;
   relay_packets_recv: number;
@@ -282,22 +282,37 @@ export default function App() {
       })
       .catch((e) => console.error("get_room_state failed", e));
 
+    let disposed = false;
     const unlistens: Array<() => void> = [];
+    const subscribe = <T,>(
+      event: string,
+      handler: Parameters<typeof listen<T>>[1]
+    ) => {
+      void listen<T>(event, handler).then((u) => {
+        if (disposed) {
+          u();
+        } else {
+          unlistens.push(u);
+        }
+      });
+    };
 
     // Mic level is subscribed separately via `useMicLevelStream` above.
 
-    listen<boolean>("speaking_changed", (ev) => {
+    subscribe<boolean>("speaking_changed", (ev) => {
       setAudioState((prev) => ({ ...prev, speaking: ev.payload }));
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<AudioState>("audio_state_changed", (ev) => {
+    subscribe<AudioState>("audio_state_changed", (ev) => {
       setAudioState(ev.payload);
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<RoomState>("room_state", (ev) => {
+    subscribe<RoomState>("room_state", (ev) => {
       setRoomState(ev.payload);
       if (ev.payload === "idle" || ev.payload === "closed") {
+        setRoomCode("");
         setPeers([]);
+        setRoomMutes({});
         setRttMs(null);
         setDiagnostics(null);
         setIsDiagnosticsOpen(false);
@@ -306,78 +321,75 @@ export default function App() {
         setIsChatOpen(false);
         seenChatIds.current.clear();
       }
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{ code: string }>("room_created", (ev) => {
+    subscribe<{ code: string }>("room_created", (ev) => {
       setRoomCode(ev.payload.code);
       setStatusMsg({ text: `Room #${ev.payload.code} created. Share code to connect.` });
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{ code: string }>("room_joined", (ev) => {
+    subscribe<{ code: string }>("room_joined", (ev) => {
       setRoomCode(ev.payload.code);
       setStatusMsg({ text: `Connected to room #${ev.payload.code}.` });
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{
+    subscribe<{
       name: string;
       uuid?: string;
       user_id?: string;
       is_bot?: boolean;
       force_stop?: boolean;
       arrived?: boolean;
-    }>(
-      "peer_connected",
-      (ev) => {
-        const uuid = ev.payload.uuid || ev.payload.name;
-        setPeers((prev) => {
-          const rest = prev.filter((p) => p.uuid !== uuid);
-          const existing = prev.find((p) => p.uuid === uuid);
-          return [
-            ...rest,
-            {
-              uuid,
-              // Session 29: the persistent id, which the tile needs to offer a
-              // room-wide mute. A peer whose `Hello` has not arrived yet sends
-              // none — `|| existing?.user_id` keeps an id we already learned
-              // rather than letting an empty one erase it, the same rule the
-              // Rust roster follows.
-              user_id: ev.payload.user_id || existing?.user_id || "",
-              name: ev.payload.name,
-              speaking: existing?.speaking ?? false,
-              mute: existing?.mute ?? false,
-              deafen: existing?.deafen ?? false,
-              music: existing?.music ?? false,
-              music_title: existing?.music_title ?? "",
-              // Session 29b: same one-way rule as the Rust roster — a bot
-              // declaration is never withdrawn, because the signalling server
-              // cannot carry it at all and would send `false` for every peer.
-              is_bot: Boolean(ev.payload.is_bot || existing?.is_bot),
-              // Session 29b Force Stop: the same one-way rule, and for the same
-              // reason — only a relay `Hello` can carry this, so a signalling
-              // event's `false` must not revoke a decision we already learned.
-              force_stop: Boolean(ev.payload.force_stop || existing?.force_stop),
-            },
-          ].sort((a, b) => a.uuid.localeCompare(b.uuid));
-        });
-        // `arrived === false` means the roster is telling us who is *already*
-        // here — the peers listed when we join a populated room, or a peer
-        // renaming themselves. The peer belongs in the list either way, but
-        // saying they "joined the call" would be a claim the app cannot support.
-        if (ev.payload.arrived !== false) {
-          setStatusMsg({ text: `${ev.payload.name} joined the call.` });
-        }
+    }>("peer_connected", (ev) => {
+      const uuid = ev.payload.uuid || ev.payload.name;
+      setPeers((prev) => {
+        const rest = prev.filter((p) => p.uuid !== uuid);
+        const existing = prev.find((p) => p.uuid === uuid);
+        return [
+          ...rest,
+          {
+            uuid,
+            // Session 29: the persistent id, which the tile needs to offer a
+            // room-wide mute. A peer whose `Hello` has not arrived yet sends
+            // none — `|| existing?.user_id` keeps an id we already learned
+            // rather than letting an empty one erase it, the same rule the
+            // Rust roster follows.
+            user_id: ev.payload.user_id || existing?.user_id || "",
+            name: ev.payload.name,
+            speaking: existing?.speaking ?? false,
+            mute: existing?.mute ?? false,
+            deafen: existing?.deafen ?? false,
+            music: existing?.music ?? false,
+            music_title: existing?.music_title ?? "",
+            // Session 29b: same one-way rule as the Rust roster — a bot
+            // declaration is never withdrawn, because the signalling server
+            // cannot carry it at all and would send `false` for every peer.
+            is_bot: Boolean(ev.payload.is_bot || existing?.is_bot),
+            // Session 29b Force Stop: the same one-way rule, and for the same
+            // reason — only a relay `Hello` can carry this, so a signalling
+            // event's `false` must not revoke a decision we already learned.
+            force_stop: Boolean(ev.payload.force_stop || existing?.force_stop),
+          },
+        ].sort((a, b) => a.uuid.localeCompare(b.uuid));
+      });
+      // `arrived === false` means the roster is telling us who is *already*
+      // here — the peers listed when we join a populated room, or a peer
+      // renaming themselves. The peer belongs in the list either way, but
+      // saying they "joined the call" would be a claim the app cannot support.
+      if (ev.payload.arrived !== false) {
+        setStatusMsg({ text: `${ev.payload.name} joined the call.` });
       }
-    ).then((u) => unlistens.push(u));
+    });
 
-    listen<{ reason: string; peer_id?: string | null }>("peer_disconnected", (ev) => {
+    subscribe<{ reason: string; peer_id?: string | null }>("peer_disconnected", (ev) => {
       const gone = ev.payload.peer_id;
       if (gone) {
         setPeers((prev) => prev.filter((p) => p.uuid !== gone));
       }
       setStatusMsg({ text: `Peer disconnected: ${ev.payload.reason}` });
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{
+    subscribe<{
       peer_id?: string;
       speaking: boolean;
       mute: boolean;
@@ -401,9 +413,9 @@ export default function App() {
             : p
         )
       );
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{ target_user_id: string; muted: boolean; by: string }>(
+    subscribe<{ target_user_id: string; muted: boolean; by: string }>(
       "peer_muted",
       (ev) => {
         const { target_user_id, muted, by } = ev.payload;
@@ -417,19 +429,29 @@ export default function App() {
         // why they are silent; announcing to the room who muted whom would turn
         // a friend-group control into a public event.
       }
-    ).then((u) => unlistens.push(u));
+    );
 
-    listen<{ ms: number }>("rtt_updated", (ev) => {
+    subscribe<{ ms: number }>("rtt_updated", (ev) => {
       setRttMs(Math.round(ev.payload.ms));
-    }).then((u) => unlistens.push(u));
+    });
 
     // music_status_changed is subscribed by useMusic.
 
-    listen<string>("room_error", (ev) => {
+    subscribe<string>("room_error", (ev) => {
       setStatusMsg({ text: ev.payload, isError: true });
-    }).then((u) => unlistens.push(u));
+    });
 
-    listen<{
+    subscribe<string>("audio_error", (ev) => {
+      setStatusMsg({ text: ev.payload, isError: true });
+    });
+
+    subscribe<{ by: string; acted: boolean }>("music_stop_requested", (ev) => {
+      if (ev.payload.acted) {
+        setStatusMsg({ text: `${ev.payload.by} stopped the music.` });
+      }
+    });
+
+    subscribe<{
       id: string;
       sender_user_id: string;
       sender_name: string;
@@ -441,9 +463,9 @@ export default function App() {
       seenChatIds.current.add(msg.id);
 
       const isSelf =
-        msg.sender_user_id === "self" ||
-        (selfUserIdRef.current !== "" && msg.sender_user_id === selfUserIdRef.current) ||
-        msg.sender_name === (nicknameRef.current || "You");
+        selfUserIdRef.current !== "" &&
+        msg.sender_user_id !== "" &&
+        msg.sender_user_id === selfUserIdRef.current;
       const newMsg: ChatMessage = {
         id: msg.id,
         senderUserId: msg.sender_user_id,
@@ -458,9 +480,10 @@ export default function App() {
         const preview = msg.text.length > 40 ? msg.text.slice(0, 40) + "..." : msg.text;
         setStatusMsg({ text: `${msg.sender_name}: ${preview}` });
       }
-    }).then((u) => unlistens.push(u));
+    });
 
     return () => {
+      disposed = true;
       for (const u of unlistens) u();
     };
   }, []);
@@ -761,11 +784,11 @@ export default function App() {
   };
 
   const handleToggleChat = () => {
-    setIsChatOpen((prev) => {
-      const next = !prev;
-      if (next) setUnreadChatCount(0);
-      return next;
-    });
+    const next = !isChatOpenRef.current;
+    setIsChatOpen(next);
+    if (next) {
+      setUnreadChatCount(0);
+    }
   };
 
   const handleCloseChat = () => {
@@ -1142,7 +1165,11 @@ export default function App() {
                         now says so. */}
                     <TelemetryRow
                       label="Remote endpoint"
-                      value={diagnostics?.remote_endpoint || "Not reported"}
+                      value={
+                        diagnostics?.endpoint && diagnostics.endpoint !== "none"
+                          ? diagnostics.endpoint
+                          : "Not reported"
+                      }
                     />
 
                     <TelemetryRow
@@ -1151,10 +1178,10 @@ export default function App() {
                     />
                   </TelemetryList>
 
-                  {diagnostics?.last_error && (
+                  {diagnostics?.error && (
                     <div className="flex items-start gap-2 rounded-sm border border-danger/35 bg-danger/8 p-3">
                       <IconError size={14} className="mt-0.5 shrink-0 text-danger" />
-                      <span className="text-13 text-danger">{diagnostics.last_error}</span>
+                      <span className="text-13 text-danger">{diagnostics.error}</span>
                     </div>
                   )}
                 </aside>
@@ -1303,10 +1330,22 @@ export default function App() {
           settings={settings}
           devices={devices}
           capturingAction={capturingAction}
+          onCancelCapture={() => {
+            if (capturingAction) {
+              void invoke("cancel_hotkey_capture").catch(console.error);
+              setCapturingAction(null);
+            }
+          }}
           vpsAddress={vpsAddressInput}
           onVpsAddressChange={setVpsAddressInput}
           onSaveVpsAddress={() => void handleSaveVpsAddress()}
-          onClose={() => setIsSettingsOpen(false)}
+          onClose={() => {
+            if (capturingAction) {
+              void invoke("cancel_hotkey_capture").catch(console.error);
+              setCapturingAction(null);
+            }
+            setIsSettingsOpen(false);
+          }}
           onSelectVoiceActivity={() => void handleSelectVoiceActivity()}
           onSelectPushToTalk={() => void handleSelectPushToTalk()}
           onBeginCapture={(a) => void handleBeginCapture(a)}

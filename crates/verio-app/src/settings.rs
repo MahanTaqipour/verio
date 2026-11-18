@@ -135,8 +135,8 @@ impl Settings {
     /// Clamp free-form fields to valid ranges after a load or update.
     pub fn sanitize(&mut self) {
         self.input_gain_db = self.input_gain_db.clamp(-12.0, 12.0);
-        if self.nickname.len() > 64 {
-            self.nickname.truncate(64);
+        if self.nickname.chars().count() > 64 {
+            self.nickname = self.nickname.chars().take(64).collect();
         }
         if self.signaling_port == 0 {
             self.signaling_port = verio_discovery::DEFAULT_SIGNALING_PORT;
@@ -146,12 +146,9 @@ impl Settings {
         }
         self.direct_recent.truncate(5);
         for addr in &mut self.direct_recent {
-            if addr.len() > 128 {
-                addr.truncate(128);
+            if addr.chars().count() > 128 {
+                *addr = addr.chars().take(128).collect();
             }
-        }
-        if self.hotkeys.ptt == "Ctrl+Shift+Space" {
-            self.hotkeys.ptt.clear();
         }
     }
 
@@ -651,5 +648,24 @@ mod tests {
         let store = SettingsStore::load(db, &dir);
         assert_eq!(store.get(), Settings::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_truncates_utf8_on_char_boundaries_and_keeps_ctrl_shift_space() {
+        let mut s = Settings {
+            nickname: "😀".repeat(80),
+            direct_recent: vec!["🌐".repeat(150)],
+            hotkeys: HotkeySettings {
+                ptt: "Ctrl+Shift+Space".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        s.sanitize();
+
+        assert_eq!(s.nickname.chars().count(), 64);
+        assert_eq!(s.direct_recent[0].chars().count(), 128);
+        assert_eq!(s.hotkeys.ptt, "Ctrl+Shift+Space");
     }
 }

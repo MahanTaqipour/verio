@@ -107,8 +107,18 @@ export function useMusicBot({
   }, [say]);
 
   const hosting = state.hosting;
+  const hostingRef = useRef(hosting);
+  hostingRef.current = hosting;
+
+  const startInFlightRef = useRef<Promise<void> | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const playPause = useCallback(async () => {
+    if (startInFlightRef.current) {
+      // Avoid toggling or double-starting while an in-flight bot join is underway.
+      return;
+    }
+
     if (music.status?.playing) {
       // A pause keeps the bot alive on purpose: the session survives so the queue
       // can be resumed without rejoining the room as a new peer.
@@ -119,35 +129,73 @@ export function useMusicBot({
     // Starting. The room gets to answer before any audio does — otherwise a
     // refusal would leave this client playing through the pre-29b path, mixing
     // music into the voice stream where nothing in the UI can show or stop it.
-    if (inCall && !hosting && botPeerPresent) {
+    if (inCall && !hostingRef.current && botPeerPresent) {
       say("Music is already playing in this room.", true);
       return;
     }
 
-    await music.playPause();
-
-    if (!inCall || hosting) return;
-
-    try {
-      await invoke("music_bot_start");
-    } catch (e) {
-      // The player is already running, so leaving it would broadcast through a
-      // path the room cannot see. Put it back and report why.
-      await music.stop();
-      say(`${e}`, true);
+    if (!music.hasTrack) {
+      await music.playPause();
+      return;
     }
-  }, [botPeerPresent, hosting, inCall, music, say]);
+
+    if (!inCall || hostingRef.current) {
+      await music.playPause();
+      return;
+    }
+
+    stopRequestedRef.current = false;
+    const runStart = (async () => {
+      await music.playPause();
+      if (stopRequestedRef.current) {
+        await music.stop();
+        return;
+      }
+
+      try {
+        await invoke("music_bot_start");
+      } catch (e) {
+        // The player is already running, so leaving it would broadcast through a
+        // path the room cannot see. Put it back and report why.
+        await music.stop();
+        say(`${e}`, true);
+        return;
+      }
+
+      if (stopRequestedRef.current) {
+        await music.stop();
+        await invoke("music_bot_stop").catch(console.error);
+      }
+    })();
+
+    startInFlightRef.current = runStart;
+    try {
+      await runStart;
+    } finally {
+      if (startInFlightRef.current === runStart) {
+        startInFlightRef.current = null;
+      }
+    }
+  }, [botPeerPresent, inCall, music, say]);
 
   const stop = useCallback(async () => {
+    stopRequestedRef.current = true;
+    const inFlight = startInFlightRef.current;
+
     // Playback first, deliberately. The pipeline takes the music bus back the
     // moment the bot lets go, so ending playback *before* releasing the bus closes
     // the window in which the voice session could pull a chunk and mix it into the
     // outgoing voice frame.
     await music.stop();
-    if (hosting) {
+
+    if (inFlight) {
+      await inFlight.catch(() => {});
+    }
+
+    if (hostingRef.current || inFlight !== null) {
       await invoke("music_bot_stop").catch(console.error);
     }
-  }, [hosting, music]);
+  }, [music]);
 
   return { state, playPause, stop };
 }

@@ -483,7 +483,13 @@ impl PeerHandle {
     }
 
     pub fn send_control(&self, msg: ControlMessage) {
-        let _ = self.tx.send(PeerCommand::Control(msg));
+        let _ = self.try_send_control(msg);
+    }
+
+    pub fn try_send_control(&self, msg: ControlMessage) -> Result<(), String> {
+        self.tx
+            .send(PeerCommand::Control(msg))
+            .map_err(|_| "transport control channel closed".to_string())
     }
 
     pub fn disconnect(&self) {
@@ -854,6 +860,13 @@ pub fn spawn_session(
     std::thread::Builder::new()
         .name("verio-transport".into())
         .spawn(move || {
+            let ping_salt = {
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish()
+                    & 0xFFFF_FFFF_0000_0000
+            };
             let mut driver = Driver {
                 rtc,
                 socket,
@@ -868,6 +881,9 @@ pub fn spawn_session(
                 seq: 0,
                 last_audio_send: None,
                 last_ping: None,
+                ping_salt,
+                ping_seq: 0,
+                pending_ping: None,
                 outbox: Vec::new(),
                 disconnecting: false,
                 disconnected_since: None,
@@ -908,6 +924,9 @@ struct Driver {
     disconnected_since: Option<Instant>,
     diagnostics: Arc<std::sync::RwLock<TransportDiagnostics>>,
     last_recv_instant: Option<Instant>,
+    ping_salt: u64,
+    ping_seq: u64,
+    pending_ping: Option<(u64, Instant)>,
 }
 
 impl Driver {
@@ -915,6 +934,7 @@ impl Driver {
     /// `Output::Timeout`, then wait for socket input / the deadline.
     fn run(&mut self) -> String {
         let mut buf = Vec::new();
+        let mut zero_waits: u32 = 0;
         loop {
             if let Err(reason) = self.apply_commands() {
                 return reason;
@@ -955,17 +975,18 @@ impl Driver {
                 .wait_duration(now)
                 .min(str0m_wait)
                 .min(str0m_wait2);
-            if wait.is_zero() {
+            if wait.is_zero() && zero_waits < 4 {
+                zero_waits += 1;
                 if let Err(e) = self.rtc.handle_input(Input::Timeout(Instant::now())) {
                     tracing::debug!("str0m timeout handling error: {e}");
                 }
                 continue;
             }
+            zero_waits = 0;
 
-            // Cap the blocking read at 10 ms: the audio pump hands frames to the
-            // cmd channel asynchronously, and without this cap the driver would
-            // only pick them up when the next network packet happens to arrive.
-            let sock_wait = wait.min(Duration::from_millis(10));
+            // Cap the blocking read at [1ms, 10ms]: a sub-millisecond Duration rounds
+            // down to 0 ms in Winsock SO_RCVTIMEO, which Windows treats as INFINITE.
+            let sock_wait = wait.clamp(Duration::from_millis(1), Duration::from_millis(10));
             if let Err(e) = self.socket.set_read_timeout(Some(sock_wait)) {
                 return format!("socket: {e}");
             }
@@ -1024,24 +1045,38 @@ impl Driver {
 
     /// Consume commands from the app side and apply them as mutations.
     fn apply_commands(&mut self) -> Result<(), String> {
-        while let Ok(cmd) = self.cmds.try_recv() {
-            match cmd {
-                PeerCommand::Audio { capture_ts_ms, opus } => {
-                    tracing::debug!(
-                        delay_ms = unix_ms().saturating_sub(capture_ts_ms),
-                        "audio cmd picked up (feed→driver delay)"
-                    );
-                    self.send_audio_frame(&opus, capture_ts_ms);
-                }
-                PeerCommand::Control(msg) => {
-                    self.queue_control(msg);
-                }
-                PeerCommand::Disconnect => {
+        loop {
+            match self.cmds.try_recv() {
+                Ok(cmd) => match cmd {
+                    PeerCommand::Audio {
+                        capture_ts_ms,
+                        opus,
+                    } => {
+                        tracing::debug!(
+                            delay_ms = unix_ms().saturating_sub(capture_ts_ms),
+                            "audio cmd picked up (feed→driver delay)"
+                        );
+                        self.send_audio_frame(&opus, capture_ts_ms);
+                    }
+                    PeerCommand::Control(msg) => {
+                        self.queue_control(msg);
+                    }
+                    PeerCommand::Disconnect => {
+                        if !self.disconnecting {
+                            tracing::info!("disconnect requested");
+                            self.rtc.disconnect();
+                            self.disconnecting = true;
+                        }
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    tracing::debug!("peer command channel disconnected; stopping driver");
                     if !self.disconnecting {
-                        tracing::info!("disconnect requested");
                         self.rtc.disconnect();
                         self.disconnecting = true;
                     }
+                    return Err("command channel disconnected".into());
                 }
             }
         }
@@ -1126,7 +1161,10 @@ impl Driver {
         };
         if ping_due {
             self.last_ping = Some(Instant::now());
-            self.queue_control(ControlMessage::Ping { t: unix_ms() });
+            self.ping_seq = self.ping_seq.wrapping_add(1);
+            let ping_id = self.ping_salt | (self.ping_seq & 0xFFFF_FFFF);
+            self.pending_ping = Some((ping_id, Instant::now()));
+            self.queue_control(ControlMessage::Ping { t: ping_id });
         }
         Ok(())
     }
@@ -1282,11 +1320,16 @@ impl Driver {
                     self.queue_control(ControlMessage::Pong { t });
                 }
                 Ok(ControlMessage::Pong { t }) => {
-                    let ms = unix_ms().saturating_sub(t) as f64;
-                    if let Ok(mut d) = self.diagnostics.write() {
-                        d.rtt_ms = Some(ms);
+                    if let Some((expected, sent_at)) = self.pending_ping {
+                        if t == expected {
+                            self.pending_ping = None;
+                            let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                            if let Ok(mut d) = self.diagnostics.write() {
+                                d.rtt_ms = Some(ms);
+                            }
+                            let _ = self.events.send(TransportEvent::Rtt { ms });
+                        }
                     }
-                    let _ = self.events.send(TransportEvent::Rtt { ms });
                 }
                 Ok(msg) => {
                     let _ = self.events.send(TransportEvent::Control {
@@ -1612,44 +1655,30 @@ pub fn spawn_relay_session_with_candidates(
             let mut seq: u32 = 0;
             let mut last_heartbeat = Instant::now();
             let mut last_ping = Instant::now();
-            // Session 12: with several peers in the room every peer echoes our
-            // ping, so remember which ping is ours and ignore the rest.
-            let mut last_ping_t: u64 = 0;
+            // Session 12 + 32A: tag each ping with a per-sender UUID salt + counter,
+            // and measure RTT via monotonic `Instant` so multi-peer Pong echoes and
+            // wall-clock steps cannot corrupt RTT.
+            let ping_salt = u64::from_le_bytes(local_uuid_bytes[..8].try_into().unwrap_or([0; 8]))
+                & 0xFFFF_FFFF_0000_0000;
+            let mut ping_seq: u64 = 0;
+            let mut pending_ping: Option<(u64, Instant)> = None;
             let mut last_recv_time: Option<Instant> = None;
             let mut active_relay_addr = primary_addr;
             let mut recv_buf = [0u8; 2048];
 
             let reason = loop {
                 // 1. Drain commands from audio pump / app
-                let mut disconnect = false;
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        PeerCommand::Audio { capture_ts_ms, opus } => {
-                            seq = seq.wrapping_add(1);
-                            let audio_data = encode_audio_packet(seq, capture_ts_ms, &opus);
-                            let mut pkt = Vec::with_capacity(21 + audio_data.len());
-                            pkt.extend_from_slice(&prefix);
-                            pkt.push(RELAY_TAG_AUDIO);
-                            pkt.extend_from_slice(&audio_data);
-                            let framed = wrap_stun_envelope(&pkt);
-                            let _ = socket.send_to(&framed, active_relay_addr);
-                            log_relay_packet(
-                                "send",
-                                &room_log,
-                                &local_uuid_short,
-                                active_relay_addr,
-                                framed.len(),
-                                "audio",
-                                &mut tx_log,
-                            );
-                            bump_relay_sent(&diag_clone, framed.len());
-                        }
-                        PeerCommand::Control(msg) => {
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                let mut pkt = Vec::with_capacity(21 + json.len());
+                let mut exit_reason: Option<&'static str> = None;
+                loop {
+                    match cmd_rx.try_recv() {
+                        Ok(cmd) => match cmd {
+                            PeerCommand::Audio { capture_ts_ms, opus } => {
+                                seq = seq.wrapping_add(1);
+                                let audio_data = encode_audio_packet(seq, capture_ts_ms, &opus);
+                                let mut pkt = Vec::with_capacity(21 + audio_data.len());
                                 pkt.extend_from_slice(&prefix);
-                                pkt.push(RELAY_TAG_CONTROL);
-                                pkt.extend_from_slice(json.as_bytes());
+                                pkt.push(RELAY_TAG_AUDIO);
+                                pkt.extend_from_slice(&audio_data);
                                 let framed = wrap_stun_envelope(&pkt);
                                 let _ = socket.send_to(&framed, active_relay_addr);
                                 log_relay_packet(
@@ -1658,20 +1687,45 @@ pub fn spawn_relay_session_with_candidates(
                                     &local_uuid_short,
                                     active_relay_addr,
                                     framed.len(),
-                                    "control",
+                                    "audio",
                                     &mut tx_log,
                                 );
                                 bump_relay_sent(&diag_clone, framed.len());
                             }
-                        }
-                        PeerCommand::Disconnect => {
-                            disconnect = true;
+                            PeerCommand::Control(msg) => {
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let mut pkt = Vec::with_capacity(21 + json.len());
+                                    pkt.extend_from_slice(&prefix);
+                                    pkt.push(RELAY_TAG_CONTROL);
+                                    pkt.extend_from_slice(json.as_bytes());
+                                    let framed = wrap_stun_envelope(&pkt);
+                                    let _ = socket.send_to(&framed, active_relay_addr);
+                                    log_relay_packet(
+                                        "send",
+                                        &room_log,
+                                        &local_uuid_short,
+                                        active_relay_addr,
+                                        framed.len(),
+                                        "control",
+                                        &mut tx_log,
+                                    );
+                                    bump_relay_sent(&diag_clone, framed.len());
+                                }
+                            }
+                            PeerCommand::Disconnect => {
+                                exit_reason = Some("user disconnect");
+                                break;
+                            }
+                        },
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            exit_reason = Some("command channel disconnected");
                             break;
                         }
                     }
                 }
-                if disconnect {
-                    break "user disconnect".to_string();
+                if let Some(reason) = exit_reason {
+                    break reason.to_string();
                 }
 
                 // 2. Periodic timers
@@ -1710,9 +1764,10 @@ pub fn spawn_relay_session_with_candidates(
                 }
                 // 2s ping for RTT measurement
                 if now.duration_since(last_ping) >= PING_INTERVAL {
-                    let ping_t = unix_ms();
-                    last_ping_t = ping_t;
-                    let ping = ControlMessage::Ping { t: ping_t };
+                    ping_seq = ping_seq.wrapping_add(1);
+                    let ping_id = ping_salt | (ping_seq & 0xFFFF_FFFF);
+                    pending_ping = Some((ping_id, now));
+                    let ping = ControlMessage::Ping { t: ping_id };
                     if let Ok(json) = serde_json::to_string(&ping) {
                         let mut pkt = Vec::with_capacity(21 + json.len());
                         pkt.extend_from_slice(&prefix);
@@ -1827,11 +1882,15 @@ pub fn spawn_relay_session_with_candidates(
                                     }
                                 }
                                 Ok(ControlMessage::Pong { t }) => {
-                                    // Only our own ping is worth timing (see last_ping_t).
-                                    if t != last_ping_t {
+                                    // Only accept the Pong matching our latest pending ping_id.
+                                    let Some((expected, sent_at)) = pending_ping else {
+                                        return;
+                                    };
+                                    if t != expected {
                                         return;
                                     }
-                                    let ms = unix_ms().saturating_sub(t) as f64;
+                                    pending_ping = None;
+                                    let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
                                     if let Ok(mut d) = diag_clone.write() {
                                         d.rtt_ms = Some(ms);
                                     }
@@ -1853,11 +1912,21 @@ pub fn spawn_relay_session_with_candidates(
                 match socket.recv_from(&mut recv_buf) {
                     Ok((n, from)) => {
                         process_packet(n, from, &recv_buf[..n]);
-                        let _ = socket.set_read_timeout(Some(Duration::from_micros(1)));
-                        while let Ok((n, from)) = socket.recv_from(&mut recv_buf) {
-                            process_packet(n, from, &recv_buf[..n]);
+                        // Drain queued burst packets non-blockingly (capped at 32) instead
+                        // of using a sub-ms SO_RCVTIMEO which Winsock treats as INFINITE.
+                        if socket.set_nonblocking(true).is_ok() {
+                            let mut drained = 0usize;
+                            while drained < 32 {
+                                match socket.recv_from(&mut recv_buf) {
+                                    Ok((n, from)) => {
+                                        process_packet(n, from, &recv_buf[..n]);
+                                        drained += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = socket.set_nonblocking(false);
                         }
-                        let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
                     Err(e) => {
@@ -2300,6 +2369,296 @@ mod tests {
         handle_a.disconnect();
         handle_b.disconnect();
         host.stop();
+    }
+
+    #[test]
+    fn test_relay_driver_exits_when_peer_handle_dropped() {
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let id_a = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(101),
+            user_id: "u-a".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "A".into(),
+            version: "0.1.0".into(),
+        };
+        let id_b = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(102),
+            user_id: "u-b".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "B".into(),
+            version: "0.1.0".into(),
+        };
+        let silence = Arc::new(vec![0u8; 2]);
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_relay_session_with_candidates(
+            sink_addr,
+            Vec::new(),
+            "1111".into(),
+            id_a,
+            id_b,
+            silence,
+            tx,
+            "cloud_relay",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TransportEvent::Connected
+        ));
+
+        // Dropping PeerHandle without calling .disconnect() must still exit the driver thread cleanly.
+        drop(handle);
+
+        let ev = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match ev {
+            TransportEvent::Disconnected { reason } => {
+                assert!(
+                    reason.contains("command channel disconnected"),
+                    "unexpected exit reason: {reason}"
+                );
+            }
+            other => panic!("expected Disconnected on handle drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_direct_driver_exits_when_peer_handle_dropped() {
+        let mut setup_offer = SessionSetup::new(false).unwrap();
+        let mut setup_answer = SessionSetup::new(false).unwrap();
+        let (offer, pending) = setup_offer.make_offer().unwrap();
+        let answer = setup_answer.accept_offer(&offer).unwrap();
+        setup_offer.accept_answer(pending, &answer).unwrap();
+
+        let id_remote = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(201),
+            user_id: "u-r".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Remote".into(),
+            version: "0.1.0".into(),
+        };
+        let silence = Arc::new(vec![0u8; 2]);
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_session(setup_offer, id_remote, silence, tx).unwrap();
+        drop(setup_answer);
+        drop(handle);
+
+        let ev = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match ev {
+            TransportEvent::Disconnected { reason } => {
+                assert!(
+                    reason.contains("command channel disconnected"),
+                    "unexpected exit reason: {reason}"
+                );
+            }
+            other => panic!("expected Disconnected on direct handle drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_relay_driver_ignores_foreign_pong_and_measures_monotonic_rtt() {
+        let mock_relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = mock_relay.local_addr().unwrap();
+        mock_relay
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let local_id = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+            user_id: "u-local".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Local".into(),
+            version: "0.1.0".into(),
+        };
+        let remote_id = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(0x9999_AAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0001),
+            user_id: "u-remote".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Remote".into(),
+            version: "0.1.0".into(),
+        };
+        let remote_bytes = *remote_id.uuid.as_bytes();
+        let room_bytes = format_room_code_bytes("1111");
+
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let handle = spawn_relay_session(
+            relay_addr,
+            "1111".into(),
+            local_id,
+            remote_id,
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TransportEvent::Connected
+        ));
+
+        let mut buf = [0u8; 2048];
+        let mut client_addr = None;
+        let mut saw_ping = None;
+        let mut injected_bogus = false;
+        let mut seen_packets = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if let Ok((n, from)) = mock_relay.recv_from(&mut buf) {
+                client_addr = Some(from);
+                let inner: &[u8] = if n > 20
+                    && buf[0..2] == [0x00, 0x01]
+                    && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                {
+                    &buf[20..n]
+                } else {
+                    &buf[..n]
+                };
+                seen_packets.push((n, inner.len(), inner.get(20).copied()));
+                if !injected_bogus {
+                    // Inject a bogus foreign Pong { t: 42 } before real Ping arrives: must NEVER emit Rtt!
+                    injected_bogus = true;
+                    let bogus = serde_json::to_vec(&ControlMessage::Pong { t: 42 }).unwrap();
+                    let mut pkt = Vec::with_capacity(21 + bogus.len());
+                    pkt.extend_from_slice(&room_bytes);
+                    pkt.extend_from_slice(&remote_bytes);
+                    pkt.push(RELAY_TAG_CONTROL);
+                    pkt.extend_from_slice(&bogus);
+                    let _ = mock_relay.send_to(&pkt, from);
+                }
+                if inner.len() > 21 && inner[20] == RELAY_TAG_CONTROL {
+                    if let Ok(ControlMessage::Ping { t }) =
+                        serde_json::from_slice::<ControlMessage>(&inner[21..])
+                    {
+                        saw_ping = Some((from, t));
+                        break;
+                    }
+                }
+            }
+        }
+        let (target_addr, ping_t) = saw_ping.unwrap_or_else(|| {
+            panic!("relay driver must send Ping within 4s; seen={seen_packets:?}")
+        });
+        assert!(client_addr.is_some());
+
+        // Pump briefly to ensure the bogus Pong never produced an Rtt event.
+        std::thread::sleep(Duration::from_millis(50));
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let TransportEvent::Rtt { ms } = ev {
+                panic!("foreign/unmatched Pong must not emit Rtt (got {ms} ms)");
+            }
+        }
+
+        // Echo our exact ping_id back as Pong -> expect accurate monotonic RTT < 500 ms.
+        let echo = serde_json::to_vec(&ControlMessage::Pong { t: ping_t }).unwrap();
+        let mut pkt = Vec::with_capacity(21 + echo.len());
+        pkt.extend_from_slice(&room_bytes);
+        pkt.extend_from_slice(&remote_bytes);
+        pkt.push(RELAY_TAG_CONTROL);
+        pkt.extend_from_slice(&echo);
+        let sent_len = mock_relay.send_to(&pkt, target_addr).unwrap();
+
+        let rtt_deadline = Instant::now() + Duration::from_secs(1);
+        let mut measured = None;
+        let mut extra_events = Vec::new();
+        while Instant::now() < rtt_deadline {
+            if let Ok(ev) = ev_rx.recv_timeout(Duration::from_millis(50)) {
+                if let TransportEvent::Rtt { ms } = ev {
+                    measured = Some(ms);
+                    break;
+                }
+                extra_events.push(format!("{ev:?}"));
+            }
+        }
+        let diag_after = handle.diagnostics();
+        let ms = measured.unwrap_or_else(|| {
+            panic!(
+                "matching Pong must emit Rtt; sent_len={sent_len}, target_addr={target_addr}, diag={diag_after:?}, extra={extra_events:?}"
+            )
+        });
+        assert!(
+            (0.0..500.0).contains(&ms),
+            "monotonic RTT should be < 500ms, got {ms}"
+        );
+        assert_eq!(handle.diagnostics().rtt_ms, Some(ms));
+
+        handle.disconnect();
+    }
+
+    #[test]
+    fn test_direct_p2p_delivers_queued_control_before_channel_open() {
+        for run in 0..10 {
+            let mut setup_offer = SessionSetup::new(false).unwrap();
+            let mut setup_answer = SessionSetup::new(false).unwrap();
+            let (offer, pending) = setup_offer.make_offer().unwrap();
+            let answer = setup_answer.accept_offer(&offer).unwrap();
+            setup_offer.accept_answer(pending, &answer).unwrap();
+
+            let id_offer = verio_discovery::Identity {
+                uuid: verio_discovery::Uuid::from_u128(302),
+                user_id: "u-o".into(),
+                is_bot: false,
+                force_stop: false,
+                name: "Offer".into(),
+                version: "0.1.0".into(),
+            };
+            let id_answer = verio_discovery::Identity {
+                uuid: verio_discovery::Uuid::from_u128(301),
+                user_id: "u-a".into(),
+                is_bot: true,
+                force_stop: true,
+                name: "Bot".into(),
+                version: "0.1.0".into(),
+            };
+            let (tx_o, rx_o) = mpsc::channel();
+            let (tx_a, rx_a) = mpsc::channel();
+            let h_a = spawn_session(setup_answer, id_offer, Arc::new(vec![0u8; 2]), tx_a).unwrap();
+            let h_o = spawn_session(setup_offer, id_answer, Arc::new(vec![0u8; 2]), tx_o).unwrap();
+
+            h_a.send_control(ControlMessage::State {
+                speaking: false,
+                mute: false,
+                deafen: false,
+                music: true,
+                music_title: "Awake".into(),
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut got_track = false;
+            let mut seen = Vec::new();
+            while Instant::now() < deadline {
+                if let Ok(ev) = rx_o.recv_timeout(Duration::from_millis(25)) {
+                    if let TransportEvent::Control {
+                        message: ControlMessage::State { music_title, .. },
+                        ..
+                    } = &ev
+                    {
+                        if music_title == "Awake" {
+                            got_track = true;
+                            break;
+                        }
+                    }
+                    seen.push(format!("{ev:?}"));
+                }
+            }
+            let d_a = h_a.diagnostics();
+            let d_o = h_o.diagnostics();
+            let mut ev_a = Vec::new();
+            while let Ok(ev) = rx_a.try_recv() {
+                ev_a.push(format!("{ev:?}"));
+            }
+            assert!(
+                got_track,
+                "run {run} failed to deliver queued State; d_a={d_a:?}, d_o={d_o:?}, seen_o={seen:?}, ev_a={ev_a:?}"
+            );
+            h_a.disconnect();
+            h_o.disconnect();
+        }
     }
 }
 

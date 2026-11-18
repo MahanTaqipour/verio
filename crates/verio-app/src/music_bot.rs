@@ -201,37 +201,49 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
 
     // 4. The control pump: the only thing that can stop us from outside.
     {
-        let stop = Arc::clone(&stop);
-        let handle = handle.clone();
+        let stop_pump = Arc::clone(&stop);
+        let handle_pump = handle.clone();
         let events = cfg.events.clone();
         let session_id = session_id.to_string();
-        // Session 29b Force Stop: the pump is where a remote stop is *honoured*, so
-        // it is where the host's decision has to be enforced. Passing the value in
-        // rather than re-reading settings keeps the enforcement identical to the
-        // announcement, for the life of the session.
+        // Session 29b Force Stop: preserved as parameter for signature clarity;
+        // single-path enforcement now lives in the room event forwarder.
         let force_stop = cfg.force_stop;
-        threads.push(
-            std::thread::Builder::new()
-                .name("verio-bot-pump".into())
-                .spawn(move || {
-                    bot_pump(transport_rx, stop, handle, events, session_id, force_stop);
-                })
-                .map_err(|e| format!("spawn bot pump: {e}"))?,
-        );
+        match std::thread::Builder::new()
+            .name("verio-bot-pump".into())
+            .spawn(move || {
+                bot_pump(
+                    transport_rx,
+                    stop_pump,
+                    handle_pump,
+                    events,
+                    session_id,
+                    force_stop,
+                );
+            }) {
+            Ok(jh) => threads.push(jh),
+            Err(e) => {
+                cleanup_spawn_failure(&stop, &signaling_stop, &handle, threads);
+                return Err(format!("spawn bot pump: {e}"));
+            }
+        }
     }
 
     // 5. The signalling listener, so our `Leave` reaches the server immediately.
-    threads.push(
-        std::thread::Builder::new()
-            .name("verio-bot-signaling".into())
-            .spawn(move || session.run_listener(|_| {}))
-            .map_err(|e| format!("spawn bot signalling listener: {e}"))?,
-    );
+    match std::thread::Builder::new()
+        .name("verio-bot-signaling".into())
+        .spawn(move || session.run_listener(|_| {}))
+    {
+        Ok(jh) => threads.push(jh),
+        Err(e) => {
+            cleanup_spawn_failure(&stop, &signaling_stop, &handle, threads);
+            return Err(format!("spawn bot signalling listener: {e}"));
+        }
+    }
 
     // 6. The encode loop: decode → 48 kHz mono → Opus → the room.
     {
-        let stop = Arc::clone(&stop);
-        let handle = handle.clone();
+        let stop_enc = Arc::clone(&stop);
+        let handle_enc = handle.clone();
         let events = cfg.events.clone();
         let music = Arc::clone(&cfg.music);
         let controls = Arc::clone(&cfg.controls);
@@ -244,25 +256,28 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
         // Re-announced with every `Hello`, so a peer who joined after the bot did
         // still learns the host's decision without a message of its own.
         let force_stop = cfg.force_stop;
-        threads.push(
-            std::thread::Builder::new()
-                .name("verio-bot-encode".into())
-                .spawn(move || {
-                    encode_loop(EncodeLoop {
-                        stop,
-                        handle,
-                        events,
-                        music,
-                        controls,
-                        tx_state,
-                        monitor_tx,
-                        session_id,
-                        host_user_id,
-                        force_stop,
-                    });
-                })
-                .map_err(|e| format!("spawn bot encode loop: {e}"))?,
-        );
+        match std::thread::Builder::new()
+            .name("verio-bot-encode".into())
+            .spawn(move || {
+                encode_loop(EncodeLoop {
+                    stop: stop_enc,
+                    handle: handle_enc,
+                    events,
+                    music,
+                    controls,
+                    tx_state,
+                    monitor_tx,
+                    session_id,
+                    host_user_id,
+                    force_stop,
+                });
+            }) {
+            Ok(jh) => threads.push(jh),
+            Err(e) => {
+                cleanup_spawn_failure(&stop, &signaling_stop, &handle, threads);
+                return Err(format!("spawn bot encode loop: {e}"));
+            }
+        }
     }
 
     tracing::info!(
@@ -286,6 +301,20 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
         handle,
         threads: Mutex::new(threads),
     })
+}
+
+fn cleanup_spawn_failure(
+    stop: &AtomicBool,
+    signaling_stop: &AtomicBool,
+    handle: &PeerHandle,
+    threads: Vec<std::thread::JoinHandle<()>>,
+) {
+    stop.store(true, Ordering::Relaxed);
+    signaling_stop.store(true, Ordering::Relaxed);
+    handle.disconnect();
+    for jh in threads {
+        let _ = jh.join();
+    }
 }
 
 /// First 8 characters of a session id — enough to correlate a log line with a peer.
@@ -318,18 +347,23 @@ fn disconnect_ends_the_session(requested_stop: bool) -> bool {
 /// `force_stop` is the host's decision: `true` means "anyone may stop my music", so
 /// nothing is refused.
 #[must_use]
-fn remote_stop_is_refused(force_stop: bool) -> bool {
+pub fn remote_stop_is_refused(force_stop: bool) -> bool {
     !force_stop
 }
 
-/// Transport events for the bot session. The only one that matters is a stop.
+/// Transport events for the bot session.
+///
+/// Remote `ControlMessage::MusicStop` is handled in one deterministic path by
+/// `verio-room-forwarder` on the host's room session (`RoomEvent::MusicStopRequested`),
+/// preventing a race where `bot_pump` and the forwarder compete to tear down the
+/// bot and suppress the host toast notification.
 fn bot_pump(
     rx: mpsc::Receiver<TransportEvent>,
     stop: Arc<AtomicBool>,
     handle: PeerHandle,
     events: Sender<BotEvent>,
     session_id: String,
-    force_stop: bool,
+    _force_stop: bool,
 ) {
     while let Ok(ev) = rx.recv() {
         match ev {
@@ -337,29 +371,11 @@ fn bot_pump(
                 peer,
                 message: ControlMessage::MusicStop,
             } => {
-                // Session 29b Force Stop: enforced *here*, where the stop would take
-                // effect, not only in the UI that draws the button. Any peer can send
-                // this frame — including one that never saw a button, or one that
-                // ignores its own disabled state — so a check that lived only in the
-                // interface would be decoration.
-                if remote_stop_is_refused(force_stop) {
-                    tracing::info!(
-                        by = %peer,
-                        session = %short_id(&session_id),
-                        "music bot: stop refused — the host disabled Force Stop"
-                    );
-                    // Not a `break`: the session stays up and keeps playing. Refusing
-                    // is a no-op, and the room is never told anything happened.
-                    continue;
-                }
-                tracing::info!(by = %peer, session = %short_id(&session_id), "music bot: stop requested");
-                stop.store(true, Ordering::Relaxed);
-                // The bridge hears about it through the encode loop's exit, so the
-                // room returns to IDLE by the same path a local Stop takes.
-                let _ = events.send(BotEvent::Stopped {
-                    reason: "stopped by another peer".to_string(),
-                });
-                break;
+                tracing::debug!(
+                    by = %peer,
+                    session = %short_id(&session_id),
+                    "music bot: deferring remote MusicStop to single room-forwarder path"
+                );
             }
             TransportEvent::Disconnected { reason } => {
                 // See `disconnect_ends_the_session`: a stop we asked for arrives
@@ -425,6 +441,7 @@ fn encode_loop(cfg: EncodeLoop) {
     let mut buf = [0.0_f32; RNNOISE_FRAME];
     let mut last_announce = std::time::Instant::now() - ANNOUNCE_INTERVAL;
     let mut announced_title = String::new();
+    let mut announced_active: Option<bool> = None;
     let mut applied_kbps = initial_kbps;
 
     // Session 29c fix: real-time pacing.
@@ -446,12 +463,17 @@ fn encode_loop(cfg: EncodeLoop) {
         }
 
         // Announce on a timer so a peer who joined after us still learns what we
-        // are, and immediately whenever the track changes.
+        // are, and immediately whenever the track title or playing/paused state changes.
         let title = cfg.music.status().title.unwrap_or_default();
-        if last_announce.elapsed() >= ANNOUNCE_INTERVAL || title != announced_title {
+        let active = cfg.music.is_active();
+        if last_announce.elapsed() >= ANNOUNCE_INTERVAL
+            || title != announced_title
+            || announced_active != Some(active)
+        {
             last_announce = std::time::Instant::now();
             announced_title = title.clone();
-            send_announcements(&cfg, &title);
+            announced_active = Some(active);
+            send_announcements(&cfg, &title, active);
         }
 
         if !cfg.music.is_active() {
@@ -528,7 +550,7 @@ fn encode_loop(cfg: EncodeLoop) {
 }
 
 /// Tell the room who we are and what we are playing.
-fn send_announcements(cfg: &EncodeLoop, title: &str) {
+fn send_announcements(cfg: &EncodeLoop, title: &str, active: bool) {
     cfg.handle.send_control(ControlMessage::Hello {
         name: BOT_NAME.to_string(),
         version: crate::APP_VERSION.to_string(),
@@ -543,11 +565,11 @@ fn send_announcements(cfg: &EncodeLoop, title: &str) {
         force_stop: cfg.force_stop,
     });
     cfg.handle.send_control(ControlMessage::State {
-        // A bot never speaks and is never muted; it plays.
+        // A bot never speaks and is never muted; report true playing vs paused state.
         speaking: false,
         mute: false,
         deafen: false,
-        music: true,
+        music: active,
         music_title: title.to_string(),
     });
 }
@@ -598,5 +620,185 @@ mod tests {
             remote_stop_is_refused(false),
             "Force Stop off means another peer's request has to be ignored"
         );
+    }
+
+    #[test]
+    fn send_announcements_reflects_playing_vs_paused_state() {
+        let recv_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        recv_sock
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let bot_id = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(501),
+            user_id: "host-user".into(),
+            is_bot: true,
+            force_stop: true,
+            name: BOT_NAME.into(),
+            version: crate::APP_VERSION.into(),
+        };
+        let bot_uuid = bot_id.uuid.to_string();
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            recv_addr,
+            "1111".into(),
+            bot_id.clone(),
+            bot_id,
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+
+        let cfg = EncodeLoop {
+            stop: Arc::new(AtomicBool::new(false)),
+            handle,
+            events: mpsc::channel().0,
+            music: Arc::new(MusicSource::new(1.0, false, false)),
+            controls: Arc::new(LiveControls::new(0.0, true, 32, 96)),
+            tx_state: Arc::new(TxState::new()),
+            monitor_tx: Arc::new(Mutex::new(None)),
+            host_user_id: "host-user".into(),
+            session_id: bot_uuid,
+            force_stop: true,
+        };
+
+        send_announcements(&cfg, "Track Paused", false);
+        send_announcements(&cfg, "Track Playing", true);
+
+        let mut states = Vec::new();
+        let mut buf = [0u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline && states.len() < 2 {
+            if let Ok((n, _)) = recv_sock.recv_from(&mut buf) {
+                let inner: &[u8] = if n > 20
+                    && buf[0..2] == [0x00, 0x01]
+                    && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                {
+                    &buf[20..n]
+                } else {
+                    &buf[..n]
+                };
+                if inner.len() > 21 && inner[20] == verio_transport::RELAY_TAG_CONTROL {
+                    if let Ok(ControlMessage::State {
+                        music,
+                        music_title,
+                        ..
+                    }) = serde_json::from_slice::<ControlMessage>(&inner[21..])
+                    {
+                        states.push((music, music_title));
+                    }
+                }
+            }
+        }
+        assert!(
+            states.contains(&(false, "Track Paused".to_string())),
+            "paused bot announcement must set music=false, got {states:?}"
+        );
+        assert!(
+            states.contains(&(true, "Track Playing".to_string())),
+            "playing bot announcement must set music=true, got {states:?}"
+        );
+    }
+
+    #[test]
+    fn bot_pump_defers_remote_music_stop_to_room_forwarder() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let bot_id = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(502),
+            user_id: "host-user".into(),
+            is_bot: true,
+            force_stop: true,
+            name: BOT_NAME.into(),
+            version: crate::APP_VERSION.into(),
+        };
+        let (tx_ev, _rx_ev) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            addr,
+            "1111".into(),
+            bot_id.clone(),
+            bot_id,
+            Arc::new(vec![0u8; 2]),
+            tx_ev,
+        )
+        .unwrap();
+
+        let (pump_tx, pump_rx) = mpsc::channel();
+        let (bot_ev_tx, bot_ev_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_pump = Arc::clone(&stop);
+        let jh = std::thread::spawn(move || {
+            bot_pump(pump_rx, stop_pump, handle, bot_ev_tx, "bot-sess-1".into(), true);
+        });
+
+        pump_tx
+            .send(TransportEvent::Control {
+                peer: "peer-uuid".into(),
+                message: ControlMessage::MusicStop,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "bot_pump must not race with verio-room-forwarder on MusicStop"
+        );
+        assert!(
+            bot_ev_rx.try_recv().is_err(),
+            "bot_pump must not emit BotEvent::Stopped directly on MusicStop"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = pump_tx.send(TransportEvent::Disconnected {
+            reason: "test shutdown".into(),
+        });
+        jh.join().unwrap();
+        assert!(
+            bot_ev_rx.try_recv().is_err(),
+            "intentional shutdown after deferred MusicStop must not emit spurious Stopped"
+        );
+    }
+
+    #[test]
+    fn cleanup_spawn_failure_sets_flags_and_joins_spawned_threads() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let bot_id = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(503),
+            user_id: "host-user".into(),
+            is_bot: true,
+            force_stop: true,
+            name: BOT_NAME.into(),
+            version: crate::APP_VERSION.into(),
+        };
+        let (tx_ev, _rx_ev) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            addr,
+            "1111".into(),
+            bot_id.clone(),
+            bot_id,
+            Arc::new(vec![0u8; 2]),
+            tx_ev,
+        )
+        .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let sig_stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let s = Arc::clone(&stop);
+        let f = Arc::clone(&finished);
+        let worker = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            f.store(true, Ordering::Relaxed);
+        });
+
+        cleanup_spawn_failure(&stop, &sig_stop, &handle, vec![worker]);
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(sig_stop.load(Ordering::Relaxed));
+        assert!(finished.load(Ordering::Relaxed));
     }
 }

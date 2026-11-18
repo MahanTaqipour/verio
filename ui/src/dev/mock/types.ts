@@ -136,7 +136,7 @@ export interface QueueItem {
 
 export interface TransportDiagnostics {
   mode: string;
-  remote_endpoint: string | null;
+  endpoint: string | null;
   local_addr: string | null;
   packets_sent: number;
   packets_recv: number;
@@ -146,7 +146,7 @@ export interface TransportDiagnostics {
   rtt_ms: number | null;
   ice_state: string | null;
   status: string;
-  last_error: string | null;
+  error: string | null;
   relay_packets_sent: number;
   relay_packets_recv: number;
   relay_bytes_sent: number;

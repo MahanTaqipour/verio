@@ -92,6 +92,7 @@ export interface SettingsProps {
   devices: { inputs: DeviceOption[]; outputs: DeviceOption[] };
   /** Which action is currently awaiting a keypress, or null. */
   capturingAction: HotkeyAction | null;
+  onCancelCapture?: () => void;
   /** Controlled value for the VPS address field. */
   vpsAddress: string;
   onVpsAddressChange: (next: string) => void;
@@ -174,6 +175,7 @@ export function Settings({
   settings,
   devices,
   capturingAction,
+  onCancelCapture,
   vpsAddress,
   onVpsAddressChange,
   onSaveVpsAddress,
@@ -502,7 +504,12 @@ export function Settings({
             <button
               key={s.id}
               type="button"
-              onClick={() => setSection(s.id)}
+              onClick={() => {
+                if (capturingAction !== null) {
+                  onCancelCapture?.();
+                }
+                setSection(s.id);
+              }}
               aria-current={selected ? "true" : undefined}
               className={cn(
                 "flex items-center gap-2.5 rounded-sm px-2 py-1.5 text-left text-13",

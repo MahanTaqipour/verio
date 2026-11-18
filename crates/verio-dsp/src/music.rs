@@ -229,16 +229,23 @@ impl MusicDecoder {
             .map_err(|e| MusicError(format!("decode error: {e}")))?;
 
         let spec = *audio.spec();
-        let capacity = audio.capacity() as u64;
+        let frame_cap = audio.capacity().max(audio.frames());
         let rate = spec.rate;
         let channels = spec.channels.count() as u16;
+        let needed_samples = frame_cap.saturating_mul(spec.channels.count());
 
-        let buf = self
+        if self
             .sample_buf
-            .get_or_insert_with(|| SampleBuffer::<f32>::new(capacity, spec));
+            .as_ref()
+            .is_none_or(|b| b.capacity() < needed_samples)
+        {
+            self.sample_buf = Some(SampleBuffer::<f32>::new(frame_cap as u64, spec));
+        }
+        let buf = self.sample_buf.as_mut().expect("sample_buf just populated");
         buf.copy_interleaved_ref(audio);
         let mono = mixdown_to_mono(buf.samples(), channels);
 
+        self.sample_rate = rate;
         match self.resampler.as_mut() {
             Some(r) => {
                 self.resampled.clear();
@@ -247,9 +254,12 @@ impl MusicDecoder {
             }
             None => {
                 // File is already 48 kHz. A rate mismatch with the decoder spec
-                // would still need conversion, so guard on it explicitly.
+                // would still need conversion, so guard on it explicitly and store
+                // the resampler so phase continuity and `seek` stay accurate.
                 if rate != SAMPLE_RATE {
-                    let mut r = LinearResampler::new(rate, SAMPLE_RATE);
+                    let r = self
+                        .resampler
+                        .insert(LinearResampler::new(rate, SAMPLE_RATE));
                     self.resampled.clear();
                     r.process(&mono, &mut self.resampled);
                     self.pending.extend(self.resampled.iter().copied());
@@ -347,6 +357,66 @@ mod tests {
             "peak {peak} not within 5% of {amplitude}"
         );
         assert_eq!(dec.position_ms(), 1000);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn write_mono_pcm16_wav(path: &std::path::Path, sample_rate: u32, samples: &[i16]) {
+        use std::io::Write;
+        let data_bytes = (samples.len() * 2) as u32;
+        let mut f = std::fs::File::create(path).expect("create custom rate wav");
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36 + data_bytes).to_le_bytes()).unwrap();
+        f.write_all(b"WAVEfmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // mono
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&(sample_rate * 2).to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&16u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_bytes.to_le_bytes()).unwrap();
+        for s in samples {
+            f.write_all(&s.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn decoder_reallocates_small_sample_buf_and_stores_lazy_resampler() {
+        let path = std::env::temp_dir().join("verio_music_decoder_44100_test.wav");
+        let pcm: Vec<i16> = (0..8820)
+            .map(|i| {
+                let s = (2.0 * PI * 440.0 * i as f32 / 44_100.0).sin();
+                (s * 16_000.0) as i16
+            })
+            .collect();
+        write_mono_pcm16_wav(&path, 44_100, &pcm);
+
+        let mut dec = MusicDecoder::open(&path).expect("open 44.1k wav");
+        // Simulate a small initial SampleBuffer + missing params.sample_rate at open.
+        let small_spec = symphonia::core::audio::SignalSpec::new(
+            SAMPLE_RATE,
+            symphonia::core::audio::Channels::FRONT_LEFT,
+        );
+        dec.sample_buf = Some(SampleBuffer::<f32>::new(4, small_spec));
+        dec.resampler = None;
+        dec.sample_rate = SAMPLE_RATE;
+
+        let mut chunk = [0.0_f32; 480];
+        let n = dec
+            .next_chunk(&mut chunk)
+            .expect("decode must reallocate sample_buf cleanly");
+        assert!(n > 0);
+        assert!(
+            dec.resampler.is_some(),
+            "lazy fallback resampler must be stored on MusicDecoder"
+        );
+        assert_eq!(dec.sample_rate, 44_100);
+        assert!(
+            dec.sample_buf.as_ref().expect("sample_buf").capacity() > 4,
+            "sample_buf capacity must grow to hold larger packets"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

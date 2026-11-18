@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -19,15 +20,21 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 
 const DEFAULT_TCP_PORT: u16 = 8443;
 const DEFAULT_UDP_PORT: u16 = 8444;
 pub const MAIN_ROOT_ROOM: &str = "1111";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerIdentity {
     pub uuid: String,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub is_bot: bool,
+    #[serde(default)]
+    pub force_stop: bool,
     pub name: String,
     pub version: String,
 }
@@ -102,8 +109,10 @@ pub enum ServerMessage {
 }
 
 struct PeerSession {
+    conn_id: u64,
     identity: PeerIdentity,
     tx: mpsc::UnboundedSender<Message>,
+    close_notify: Arc<Notify>,
 }
 
 struct Room {
@@ -113,6 +122,20 @@ struct Room {
 #[derive(Clone)]
 struct AppState {
     rooms: Arc<RwLock<HashMap<String, Room>>>,
+    next_conn_id: Arc<AtomicU64>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+            next_conn_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn allocate_conn_id(&self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,9 +265,7 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let state = AppState {
-        rooms: Arc::new(RwLock::new(HashMap::new())),
-    };
+    let state = AppState::new();
 
     if config.main_root {
         let mut rooms = state.rooms.write().await;
@@ -257,6 +278,22 @@ async fn main() {
         tracing::info!(room = %MAIN_ROOT_ROOM, "main root room initialized (permanent)");
     }
     let relay_hub = SharedRelayHub::default();
+
+    // Spawn background pruner so dead UDP relay targets and stale MusicBot
+    // entries are swept out of every room (including MAIN_ROOT_ROOM "1111").
+    let prune_hub = relay_hub.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        );
+        loop {
+            interval.tick().await;
+            prune_hub
+                .prune_stale(std::time::Duration::from_secs(30))
+                .await;
+        }
+    });
 
     // Spawn Fallback UDP Relay on configured UDP port
     let hub_clone1 = relay_hub.clone();
@@ -296,22 +333,61 @@ async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
+    let conn_id = state.allocate_conn_id();
+    let close_notify = Arc::new(Notify::new());
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     // Forward messages from mpsc channel to the actual WebSocket
+    let send_exit_notify = Arc::clone(&close_notify);
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender.send(msg).await.is_err() {
                 break;
             }
         }
+        send_exit_notify.notify_one();
     });
 
     let mut current_room: Option<String> = None;
     let mut current_peer_id: Option<String> = None;
+    let mut ping_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(20),
+    );
+    let mut last_rx = tokio::time::Instant::now();
 
-    while let Some(Ok(msg)) = receiver.next().await {
+    loop {
+        let msg = tokio::select! {
+            _ = close_notify.notified() => {
+                tracing::debug!(conn_id, "closing signaling socket due to send failure or session replacement");
+                break;
+            }
+            _ = ping_interval.tick() => {
+                if last_rx.elapsed() >= std::time::Duration::from_secs(60) {
+                    tracing::warn!(conn_id, "closing inactive signaling websocket after 60s without traffic");
+                    break;
+                }
+                if tx.send(Message::Ping(Vec::new().into())).is_err() {
+                    break;
+                }
+                continue;
+            }
+            next = receiver.next() => {
+                match next {
+                    Some(Ok(msg)) => {
+                        last_rx = tokio::time::Instant::now();
+                        msg
+                    }
+                    Some(Err(e)) => {
+                        tracing::debug!(conn_id, %e, "websocket receive ended");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        };
+
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => match String::from_utf8(b.to_vec()) {
@@ -337,90 +413,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         match client_msg {
             ClientMessage::Create { identity } => {
+                if let (Some(prev_room), Some(prev_peer)) =
+                    (current_room.take(), current_peer_id.take())
+                {
+                    remove_peer_from_room(&state, &prev_room, &prev_peer, conn_id).await;
+                }
                 let peer_id = identity.uuid.clone();
-                let mut rooms = state.rooms.write().await;
-
-                // Generate random 4-digit code (1000..=9999) excluding MAIN_ROOT_ROOM
-                let mut rng = rand::thread_rng();
-                let mut code;
-                loop {
-                    code = format!("{:04}", rng.gen_range(1000..=9999));
-                    if code != MAIN_ROOT_ROOM && !rooms.contains_key(&code) {
-                        break;
-                    }
-                }
-
-                let mut peers = HashMap::new();
-                peers.insert(
-                    peer_id.clone(),
-                    PeerSession {
-                        identity: identity.clone(),
-                        tx: tx.clone(),
-                    },
-                );
-                rooms.insert(code.clone(), Room { peers });
-
-                current_room = Some(code.clone());
-                current_peer_id = Some(peer_id.clone());
-
-                tracing::info!(room = %code, host = %identity.name, "room created");
-                let resp = ServerMessage::Created {
-                    room: code,
-                    peer_id,
-                };
-                if let Ok(resp_json) = serde_json::to_string(&resp) {
-                    let _ = tx.send(Message::Text(resp_json.into()));
-                }
+                let code = create_room_session(
+                    &state,
+                    identity,
+                    conn_id,
+                    tx.clone(),
+                    Arc::clone(&close_notify),
+                )
+                .await;
+                current_room = Some(code);
+                current_peer_id = Some(peer_id);
             }
 
             ClientMessage::Join { room, identity } => {
+                if let (Some(prev_room), Some(prev_peer)) =
+                    (current_room.take(), current_peer_id.take())
+                {
+                    remove_peer_from_room(&state, &prev_room, &prev_peer, conn_id).await;
+                }
                 let peer_id = identity.uuid.clone();
-                let mut rooms = state.rooms.write().await;
-
-                if let Some(r) = rooms.get_mut(&room) {
-                    let existing_peers: Vec<PeerIdentity> =
-                        r.peers.values().map(|p| p.identity.clone()).collect();
-
-                    // Notify existing peers
-                    let notify = ServerMessage::PeerJoined {
-                        room: room.clone(),
-                        peer: identity.clone(),
-                    };
-                    if let Ok(notify_json) = serde_json::to_string(&notify) {
-                        for p in r.peers.values() {
-                            let _ = p.tx.send(Message::Text(notify_json.clone().into()));
-                        }
-                    }
-
-                    // Add new peer
-                    r.peers.insert(
-                        peer_id.clone(),
-                        PeerSession {
-                            identity: identity.clone(),
-                            tx: tx.clone(),
-                        },
-                    );
-
-                    current_room = Some(room.clone());
+                if join_room_session(
+                    &state,
+                    &room,
+                    identity,
+                    conn_id,
+                    tx.clone(),
+                    Arc::clone(&close_notify),
+                )
+                .await
+                {
+                    current_room = Some(room);
                     current_peer_id = Some(peer_id);
-
-                    tracing::info!(room = %room, peer = %identity.name, "peer joined room");
-
-                    // Send joined response with existing peers list
-                    let resp = ServerMessage::Joined {
-                        room,
-                        peers: existing_peers,
-                    };
-                    if let Ok(resp_json) = serde_json::to_string(&resp) {
-                        let _ = tx.send(Message::Text(resp_json.into()));
-                    }
-                } else {
-                    let err = ServerMessage::Error {
-                        message: format!("room {room} not found"),
-                    };
-                    if let Ok(err_json) = serde_json::to_string(&err) {
-                        let _ = tx.send(Message::Text(err_json.into()));
-                    }
                 }
             }
 
@@ -472,39 +501,184 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
 
             ClientMessage::Leave { room } => {
-                if let Some(peer_id) = &current_peer_id {
-                    remove_peer_from_room(&state, &room, peer_id).await;
+                if let Some(peer_id) = current_peer_id.take() {
+                    remove_peer_from_room(&state, &room, &peer_id, conn_id).await;
                 }
                 current_room = None;
-                current_peer_id = None;
             }
         }
     }
 
     // Clean up on disconnect
     if let (Some(room), Some(peer_id)) = (current_room, current_peer_id) {
-        remove_peer_from_room(&state, &room, &peer_id).await;
+        remove_peer_from_room(&state, &room, &peer_id, conn_id).await;
     }
 
     send_task.abort();
 }
 
-async fn remove_peer_from_room(state: &AppState, room_code: &str, peer_id: &str) {
+async fn create_room_session(
+    state: &AppState,
+    identity: PeerIdentity,
+    conn_id: u64,
+    tx: mpsc::UnboundedSender<Message>,
+    close_notify: Arc<Notify>,
+) -> String {
+    let peer_id = identity.uuid.clone();
+    let mut rooms = state.rooms.write().await;
+
+    // Generate random 4-digit code (1000..=9999) excluding MAIN_ROOT_ROOM
+    let mut rng = rand::thread_rng();
+    let mut code;
+    loop {
+        code = format!("{:04}", rng.gen_range(1000..=9999));
+        if code != MAIN_ROOT_ROOM && !rooms.contains_key(&code) {
+            break;
+        }
+    }
+
+    let mut peers = HashMap::new();
+    peers.insert(
+        peer_id.clone(),
+        PeerSession {
+            conn_id,
+            identity: identity.clone(),
+            tx: tx.clone(),
+            close_notify,
+        },
+    );
+    rooms.insert(code.clone(), Room { peers });
+
+    tracing::info!(room = %code, host = %identity.name, conn_id, "room created");
+    let resp = ServerMessage::Created {
+        room: code.clone(),
+        peer_id,
+    };
+    if let Ok(resp_json) = serde_json::to_string(&resp) {
+        let _ = tx.send(Message::Text(resp_json.into()));
+    }
+    code
+}
+
+async fn join_room_session(
+    state: &AppState,
+    room: &str,
+    identity: PeerIdentity,
+    conn_id: u64,
+    tx: mpsc::UnboundedSender<Message>,
+    close_notify: Arc<Notify>,
+) -> bool {
+    let peer_id = identity.uuid.clone();
+    let mut rooms = state.rooms.write().await;
+
+    if let Some(r) = rooms.get_mut(room) {
+        // Prune dead senders first so closed WebSockets never linger as ghosts.
+        r.peers.retain(|existing_id, p| {
+            let alive = !p.tx.is_closed();
+            if !alive {
+                tracing::warn!(room = %room, peer_id = %existing_id, "pruned dead signaling session before join");
+            }
+            alive
+        });
+
+        // If the same peer_id reconnects before its previous socket closed,
+        // replace it immediately and signal the old socket task to shut down.
+        if let Some(old) = r.peers.remove(&peer_id) {
+            tracing::info!(
+                room = %room,
+                %peer_id,
+                old_conn_id = old.conn_id,
+                new_conn_id = conn_id,
+                "replacing superseded session for same peer_id"
+            );
+            old.close_notify.notify_one();
+        }
+
+        // Notify existing peers, pruning any sender that fails along the way.
+        let notify = ServerMessage::PeerJoined {
+            room: room.to_string(),
+            peer: identity.clone(),
+        };
+        if let Ok(notify_json) = serde_json::to_string(&notify) {
+            r.peers.retain(|other_id, p| {
+                let ok = !p.tx.is_closed()
+                    && p.tx.send(Message::Text(notify_json.clone().into())).is_ok();
+                if !ok {
+                    tracing::warn!(room = %room, peer_id = %other_id, "pruned dead signaling session during PeerJoined");
+                }
+                ok
+            });
+        }
+
+        // Build Joined payload from living remote peers only (self not yet inserted).
+        let existing_peers: Vec<PeerIdentity> =
+            r.peers.values().map(|p| p.identity.clone()).collect();
+
+        r.peers.insert(
+            peer_id,
+            PeerSession {
+                conn_id,
+                identity: identity.clone(),
+                tx: tx.clone(),
+                close_notify,
+            },
+        );
+
+        tracing::info!(room = %room, peer = %identity.name, conn_id, "peer joined room");
+
+        let resp = ServerMessage::Joined {
+            room: room.to_string(),
+            peers: existing_peers,
+        };
+        if let Ok(resp_json) = serde_json::to_string(&resp) {
+            let _ = tx.send(Message::Text(resp_json.into()));
+        }
+        true
+    } else {
+        let err = ServerMessage::Error {
+            message: format!("room {room} not found"),
+        };
+        if let Ok(err_json) = serde_json::to_string(&err) {
+            let _ = tx.send(Message::Text(err_json.into()));
+        }
+        false
+    }
+}
+
+async fn remove_peer_from_room(state: &AppState, room_code: &str, peer_id: &str, conn_id: u64) {
     let mut rooms = state.rooms.write().await;
     let mut is_empty = false;
     if let Some(r) = rooms.get_mut(room_code) {
+        let should_remove = r
+            .peers
+            .get(peer_id)
+            .is_some_and(|session| session.conn_id == conn_id);
+        if !should_remove {
+            tracing::debug!(
+                room = %room_code,
+                peer_id = %peer_id,
+                conn_id,
+                "ignoring leave/disconnect for superseded or unknown session"
+            );
+            return;
+        }
         r.peers.remove(peer_id);
-        tracing::info!(room = %room_code, peer_id = %peer_id, "peer left room");
+        tracing::info!(room = %room_code, peer_id = %peer_id, conn_id, "peer left room");
 
-        // Notify remaining peers
+        // Notify remaining peers and prune closed channels immediately
         let notify = ServerMessage::PeerLeft {
             room: room_code.to_string(),
             peer_id: peer_id.to_string(),
         };
         if let Ok(json) = serde_json::to_string(&notify) {
-            for p in r.peers.values() {
-                let _ = p.tx.send(Message::Text(json.clone().into()));
-            }
+            r.peers.retain(|other_id, p| {
+                let ok = !p.tx.is_closed()
+                    && p.tx.send(Message::Text(json.clone().into())).is_ok();
+                if !ok {
+                    tracing::warn!(room = %room_code, peer_id = %other_id, "pruned dead signaling session during PeerLeft");
+                }
+                ok
+            });
         }
 
         if r.peers.is_empty() {
@@ -585,11 +759,11 @@ pub struct SharedRelayHub {
 }
 
 impl SharedRelayHub {
-    pub async fn prune_stale(&self) {
+    pub async fn prune_stale(&self, max_age: std::time::Duration) {
         let mut rooms = self.rooms.write().await;
         let now = std::time::Instant::now();
         rooms.retain(|room, clients| {
-            clients.retain(|_uuid, client| now.duration_since(client.last_seen) < std::time::Duration::from_secs(60));
+            clients.retain(|_uuid, client| now.duration_since(client.last_seen) < max_age);
             room == MAIN_ROOT_ROOM || !clients.is_empty()
         });
     }
@@ -836,9 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_main_root_retained_when_empty() {
-        let state = AppState {
-            rooms: Arc::new(RwLock::new(HashMap::new())),
-        };
+        let state = AppState::new();
         {
             let mut rooms = state.rooms.write().await;
             rooms.insert(
@@ -849,10 +1021,204 @@ mod tests {
             );
         }
 
-        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "peer-1").await;
+        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "peer-1", 1).await;
 
         let rooms = state.rooms.read().await;
-        assert!(rooms.contains_key(MAIN_ROOT_ROOM), "1111 must be kept alive even when empty");
+        assert!(
+            rooms.contains_key(MAIN_ROOT_ROOM),
+            "1111 must be kept alive even when empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_conn_id_cannot_evict_newer_session_for_same_peer() {
+        let state = AppState::new();
+        state.rooms.write().await.insert(
+            MAIN_ROOT_ROOM.to_string(),
+            Room {
+                peers: HashMap::new(),
+            },
+        );
+        let id = PeerIdentity {
+            uuid: "peer-uuid-1".into(),
+            user_id: "user-1".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Alice".into(),
+            version: "0.1.0".into(),
+        };
+
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let notify1 = Arc::new(Notify::new());
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let notify2 = Arc::new(Notify::new());
+
+        assert!(join_room_session(&state, MAIN_ROOT_ROOM, id.clone(), 1, tx1, notify1).await);
+        assert!(join_room_session(&state, MAIN_ROOT_ROOM, id.clone(), 2, tx2, notify2).await);
+
+        // Old conn_id 1 finishes closing late: must NOT remove conn_id 2!
+        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "peer-uuid-1", 1).await;
+
+        {
+            let rooms = state.rooms.read().await;
+            let r = rooms.get(MAIN_ROOT_ROOM).unwrap();
+            assert_eq!(r.peers.len(), 1);
+            assert_eq!(r.peers.get("peer-uuid-1").unwrap().conn_id, 2);
+        }
+
+        // Joining message for conn_id 2 must NOT contain self as an existing peer.
+        let joined_msg = rx2.recv().await.unwrap();
+        let Message::Text(joined_text) = joined_msg else {
+            panic!("expected text Joined frame");
+        };
+        let parsed: ServerMessage = serde_json::from_str(&joined_text).unwrap();
+        match parsed {
+            ServerMessage::Joined { peers, .. } => {
+                assert!(peers.is_empty(), "self must never appear in Joined peers");
+            }
+            other => panic!("unexpected server message: {other:?}"),
+        }
+
+        // Current conn_id 2 leaving DOES remove the peer cleanly.
+        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "peer-uuid-1", 2).await;
+        let rooms = state.rooms.read().await;
+        assert!(rooms.get(MAIN_ROOT_ROOM).unwrap().peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_join_prunes_dead_senders_and_empty_1111_rejoin_succeeds() {
+        let state = AppState::new();
+        state.rooms.write().await.insert(
+            MAIN_ROOT_ROOM.to_string(),
+            Room {
+                peers: HashMap::new(),
+            },
+        );
+        let ghost_id = PeerIdentity {
+            uuid: "ghost-bot".into(),
+            user_id: "user-1".into(),
+            is_bot: true,
+            force_stop: true,
+            name: "Music".into(),
+            version: "0.1.0".into(),
+        };
+        let (ghost_tx, ghost_rx) = mpsc::unbounded_channel();
+        assert!(
+            join_room_session(
+                &state,
+                MAIN_ROOT_ROOM,
+                ghost_id,
+                1,
+                ghost_tx,
+                Arc::new(Notify::new())
+            )
+            .await
+        );
+        // Simulate abrupt WebSocket death without Leave: receiver dropped.
+        drop(ghost_rx);
+
+        let alice = PeerIdentity {
+            uuid: "alice-1".into(),
+            user_id: "user-alice".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Alice".into(),
+            version: "0.1.0".into(),
+        };
+        let (tx_a1, mut rx_a1) = mpsc::unbounded_channel();
+        assert!(
+            join_room_session(
+                &state,
+                MAIN_ROOT_ROOM,
+                alice.clone(),
+                2,
+                tx_a1,
+                Arc::new(Notify::new())
+            )
+            .await
+        );
+        let msg = rx_a1.recv().await.unwrap();
+        let Message::Text(txt) = msg else {
+            panic!("expected text");
+        };
+        let ServerMessage::Joined { peers, .. } = serde_json::from_str(&txt).unwrap() else {
+            panic!("expected Joined");
+        };
+        assert!(
+            peers.is_empty(),
+            "dead ghost channel must be pruned before building Joined.peers"
+        );
+
+        // Leave empty 1111 and rejoin repeatedly.
+        remove_peer_from_room(&state, MAIN_ROOT_ROOM, "alice-1", 2).await;
+        drop(rx_a1);
+
+        let (tx_a2, mut rx_a2) = mpsc::unbounded_channel();
+        assert!(
+            join_room_session(
+                &state,
+                MAIN_ROOT_ROOM,
+                alice,
+                3,
+                tx_a2,
+                Arc::new(Notify::new())
+            )
+            .await
+        );
+        let msg2 = rx_a2.recv().await.unwrap();
+        let Message::Text(txt2) = msg2 else {
+            panic!("expected text");
+        };
+        let ServerMessage::Joined { room, peers } = serde_json::from_str(&txt2).unwrap() else {
+            panic!("expected Joined");
+        };
+        assert_eq!(room, MAIN_ROOT_ROOM);
+        assert!(peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_shared_relay_hub_prune_stale_sweeps_1111_and_removes_empty_rooms() {
+        let hub = SharedRelayHub::default();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let now = std::time::Instant::now();
+        {
+            let mut rooms = hub.rooms.write().await;
+            let main_clients = rooms.entry(MAIN_ROOT_ROOM.to_string()).or_default();
+            main_clients.insert(
+                [1u8; 16],
+                RelayClient {
+                    addr,
+                    last_seen: now - std::time::Duration::from_secs(45),
+                    socket: Arc::clone(&sock),
+                },
+            );
+            main_clients.insert(
+                [2u8; 16],
+                RelayClient {
+                    addr,
+                    last_seen: now - std::time::Duration::from_secs(5),
+                    socket: Arc::clone(&sock),
+                },
+            );
+            let old_room = rooms.entry("9999".to_string()).or_default();
+            old_room.insert(
+                [3u8; 16],
+                RelayClient {
+                    addr,
+                    last_seen: now - std::time::Duration::from_secs(45),
+                    socket: Arc::clone(&sock),
+                },
+            );
+        }
+
+        hub.prune_stale(std::time::Duration::from_secs(30)).await;
+
+        let rooms = hub.rooms.read().await;
+        assert!(!rooms.contains_key("9999"), "empty non-1111 room must be removed");
+        let main_clients = rooms.get(MAIN_ROOT_ROOM).unwrap();
+        assert!(!main_clients.contains_key(&[1u8; 16]), "stale client in 1111 must be pruned");
+        assert!(main_clients.contains_key(&[2u8; 16]), "fresh client in 1111 must remain");
     }
 }
 

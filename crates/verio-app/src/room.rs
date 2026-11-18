@@ -198,6 +198,15 @@ struct PendingInvite {
     pending: SdpPendingOffer,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalState {
+    speaking: bool,
+    mute: bool,
+    deafen: bool,
+    music: bool,
+    music_title: String,
+}
+
 pub struct RoomManager {
     identity: Identity,
     state: RoomState,
@@ -221,9 +230,17 @@ pub struct RoomManager {
     /// Session 11: set to make the VPS signalling listener leave the room and close
     /// its socket, so peers drop us immediately instead of waiting for a timeout.
     signaling_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Background thread handles joined on explicit disconnect/rejoin so the old
+    /// signaling Leave cannot race ahead of a new session.
+    signaling_thread: Option<std::thread::JoinHandle<()>>,
+    roster_thread: Option<std::thread::JoinHandle<()>>,
     /// Session 14: last time each peer was heard from on the relay, so peers that
     /// vanish without a signalling event are still pruned.
     peer_seen: std::collections::HashMap<String, std::time::Instant>,
+    /// Session 32A: latest local voice/mute/deafen state for gossiping to late joiners.
+    last_local_state: LocalState,
+    /// Session 32A: early `State` packets received before `Hello` / `PeerJoined` added the peer.
+    pending_peer_states: std::collections::HashMap<String, LocalState>,
     /// Session 29: the room-wide mute — presence means "silenced in my mix", and
     /// the value names whoever set it.
     ///
@@ -270,7 +287,11 @@ impl RoomManager {
             room_events,
             pending: None,
             signaling_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            signaling_thread: None,
+            roster_thread: None,
             peer_seen: std::collections::HashMap::new(),
+            last_local_state: LocalState::default(),
+            pending_peer_states: std::collections::HashMap::new(),
             room_mutes: std::collections::HashMap::new(),
             mute_sink: None,
             db,
@@ -344,6 +365,48 @@ impl RoomManager {
         }
     }
 
+    /// Session 32A: update our live nickname and immediately broadcast `Hello`.
+    pub fn set_local_nickname(&mut self, name: String) {
+        let display_name = if name.trim().is_empty() {
+            "Player".to_string()
+        } else {
+            name.trim().to_string()
+        };
+        self.identity.name = display_name;
+        self.send_hello();
+    }
+
+    /// Session 32A: periodically re-announce our own `Hello` and latest local
+    /// mute/deafen/speaking state so late joiners or peers recovering from UDP loss
+    /// converge promptly.
+    pub fn send_state_gossip(&mut self) {
+        self.send_hello();
+        let st = self.last_local_state.clone();
+        if let Some(active) = self.active.lock().expect("active lock").as_ref() {
+            active.handle.send_control(ControlMessage::State {
+                speaking: st.speaking,
+                mute: st.mute,
+                deafen: st.deafen,
+                music: st.music,
+                music_title: st.music_title,
+            });
+        }
+    }
+
+    /// Session 32A: sync active room-wide mutes to a newly joined peer.
+    /// Kept separate from the 3s periodic gossip so a third peer's stale mute state
+    /// cannot continuously resurrect an unmuted peer.
+    pub fn sync_mutes_to_room(&mut self) {
+        if let Some(active) = self.active.lock().expect("active lock").as_ref() {
+            for target_user_id in self.room_mutes.keys() {
+                active.handle.send_control(ControlMessage::MuteUser {
+                    target_user_id: target_user_id.clone(),
+                    muted: true,
+                });
+            }
+        }
+    }
+
     /// Session 14: drop peers we have not heard from within `max_age`. This is what
     /// removes a stale card when someone leaves without a clean signalling event.
     pub fn prune_stale_peers(&mut self, max_age: std::time::Duration) {
@@ -391,8 +454,16 @@ impl RoomManager {
     /// consumer that builds its peer list from these events never misses one.
     /// `arrived` is what separates "someone joined" from "here is who is here".
     fn upsert_peer(&mut self, peer: Identity, arrived: bool) {
+        if peer.uuid == self.identity.uuid {
+            return;
+        }
         let uuid = peer.uuid.to_string();
         let is_new = !self.peers.contains_key(&uuid);
+        let pending_state = if is_new {
+            self.pending_peer_states.remove(&uuid)
+        } else {
+            None
+        };
         self.peer_seen
             .insert(uuid.clone(), std::time::Instant::now());
         let entry = self.peers.entry(uuid.clone()).or_insert_with(|| PeerInfo {
@@ -410,27 +481,24 @@ impl RoomManager {
             // listener's own preference must never stand in for it.
             force_stop: peer.force_stop,
         });
+        if let Some(st) = pending_state.as_ref() {
+            entry.speaking = st.speaking;
+            entry.mute = st.mute;
+            entry.deafen = st.deafen;
+            entry.music = st.music;
+            entry.music_title = st.music_title.clone();
+        }
         entry.name = peer.name.clone();
         // An empty id means "unknown" (a peer built before Session 29), so it must
         // never erase an id we already learned.
         if !peer.user_id.is_empty() {
             entry.user_id = peer.user_id.clone();
         }
-        // Session 29b: the same asymmetry for the bot flag. Only a relay `Hello`
-        // can declare a bot — a signalling-sourced identity never can, because the
-        // server's `PeerIdentity` has no such field and serde drops it — so a
-        // `false` arriving down that path must not clear a `true` we already
-        // learned. A bot also cannot stop being a bot; its session simply ends,
-        // and the roster entry goes with it.
+        // Session 29b: the same asymmetry for the bot flag.
         if peer.is_bot {
             entry.is_bot = true;
         }
-        // Session 29b Force Stop: the same asymmetry, for the same reason. Only a
-        // relay `Hello` can carry the host's decision — a signalling identity never
-        // can, because the server's `PeerIdentity` has no such field — so a `false`
-        // arriving down that path must not clear a `true` we already learned. Unlike
-        // a mute, this value cannot change during a session: the host's setting is
-        // applied when the bot is spawned. So ratcheting it one way loses nothing.
+        // Session 29b Force Stop: the same asymmetry, for the same reason.
         if peer.force_stop {
             entry.force_stop = true;
         }
@@ -441,11 +509,21 @@ impl RoomManager {
         if is_new || !arrived {
             self.emit(RoomEvent::PeerConnected {
                 name: peer.name,
-                uuid,
+                uuid: uuid.clone(),
                 user_id: peer.user_id,
                 is_bot,
                 force_stop,
                 arrived,
+            });
+        }
+        if let Some(st) = pending_state {
+            self.emit(RoomEvent::PeerState {
+                peer_id: uuid,
+                speaking: st.speaking,
+                mute: st.mute,
+                deafen: st.deafen,
+                music: st.music,
+                music_title: st.music_title,
             });
         }
         // Session 29: a peer who arrives already silenced — because we muted them
@@ -454,16 +532,13 @@ impl RoomManager {
         self.project_mutes();
     }
 
-    /// Session 12: drop a peer and tell the UI; the room idles when it empties.
+    /// Session 12: drop a peer and tell the UI; direct/P2P rooms idle when empty
+    /// while VPS rooms stay open ("Waiting for others") until explicit leave.
     pub fn remove_peer(&mut self, uuid: &str) {
+        self.peer_seen.remove(uuid);
+        self.pending_peer_states.remove(uuid);
         // Session 29b: a bot is not a participant, so its departure must not count
         // as "everybody left".
-        //
-        // A host alone in a room has an empty roster, and the only way the roster
-        // ever becomes non-empty for them is their own bot joining it. So without
-        // this flag the teardown below fires the moment they stop the music: they
-        // get thrown out of their own call for having played a track. Read before
-        // the removal, because the flag lives on the entry being removed.
         let was_bot = self.peers.get(uuid).is_some_and(|p| p.is_bot);
         if self.peers.remove(uuid).is_some() {
             self.emit(RoomEvent::PeerDisconnected {
@@ -472,7 +547,7 @@ impl RoomManager {
                 is_bot: was_bot,
             });
         }
-        if !was_bot && self.peers.is_empty() {
+        if self.room_code.is_none() && !was_bot && self.peers.is_empty() {
             self.teardown_session("all peers left");
             self.set_state(RoomState::Idle);
         }
@@ -526,6 +601,7 @@ impl RoomManager {
     }
 
     fn begin_connecting(&mut self) {
+        self.signaling_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.set_state(RoomState::Connecting);
     }
 
@@ -549,6 +625,10 @@ impl RoomManager {
         self.pending = None;
         self.peers.clear();
         self.peer_seen.clear();
+        self.pending_peer_states.clear();
+        self.last_local_state.speaking = false;
+        self.last_local_state.music = false;
+        self.last_local_state.music_title.clear();
         self.room_code = None;
         self.transport_mode = None;
         self.recent_chat_ids.clear();
@@ -559,12 +639,12 @@ impl RoomManager {
         self.room_code.as_deref()
     }
 
-        // -- pumps / control -----------------------------------------------------
+    // -- pumps / control -----------------------------------------------------
 
     /// Permanent audio pump: forwards encoded frames from the pipeline channel
     /// to the active peer's transport. Runs for the whole app lifetime; when no
-    /// session is active it idles. Uses only the lock-shielded slots (never the
-    /// room lock), so it cannot deadlock with commands.
+    /// session is active it drains stale lobby frames and idles cleanly. Uses only
+    /// the lock-shielded slots (never the room lock), so it cannot deadlock.
     pub fn spawn_audio_pump(&self) {
         let active = Arc::clone(&self.active);
         let net_out = Arc::clone(&self.net_out);
@@ -599,6 +679,9 @@ impl RoomManager {
                             }
                         }
                     } else {
+                        if let Some(rx) = net_out.lock().expect("net_out lock").as_ref() {
+                            while rx.try_recv().is_ok() {}
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
@@ -617,6 +700,13 @@ impl RoomManager {
         music: bool,
         music_title: String,
     ) {
+        self.last_local_state = LocalState {
+            speaking,
+            mute,
+            deafen,
+            music,
+            music_title: music_title.clone(),
+        };
         if let Some(active) = self.active.lock().expect("active lock").as_ref() {
             active.handle.send_control(ControlMessage::State {
                 speaking,
@@ -632,6 +722,35 @@ impl RoomManager {
     pub fn disconnect(&mut self) {
         self.teardown_session("user requested");
         self.set_state(RoomState::Idle);
+    }
+
+    /// Join background worker handles outside the room lock (never self-join).
+    fn join_handles(
+        sig_handle: Option<std::thread::JoinHandle<()>>,
+        roster_handle: Option<std::thread::JoinHandle<()>>,
+    ) {
+        let current = std::thread::current().id();
+        if let Some(h) = sig_handle {
+            if h.thread().id() != current {
+                let _ = h.join();
+            }
+        }
+        if let Some(h) = roster_handle {
+            if h.thread().id() != current {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Disconnect from the current room and wait for signaling & roster threads
+    /// to finish sending Leave / closing their WebSocket before returning.
+    pub fn disconnect_and_wait(room: &Arc<Mutex<RoomManager>>) {
+        let (sig_handle, roster_handle) = {
+            let mut m = room.lock().expect("room lock");
+            m.disconnect();
+            (m.signaling_thread.take(), m.roster_thread.take())
+        };
+        Self::join_handles(sig_handle, roster_handle);
     }
 
     /// The pipeline RX thread installs its sender here on every (re)start.
@@ -734,9 +853,10 @@ impl RoomManager {
             timestamp_ms,
         };
 
-        // Double-send over UDP relay for packet loss resilience
-        active.handle.send_control(msg.clone());
-        active.handle.send_control(msg);
+        // Double-send over UDP relay for packet loss resilience, failing fast if
+        // the transport control channel is already closed.
+        active.handle.try_send_control(msg.clone())?;
+        let _ = active.handle.try_send_control(msg);
 
         // Emit locally for our own UI
         self.emit(RoomEvent::ChatReceived {
@@ -762,6 +882,17 @@ impl RoomManager {
         if target_user_id.trim().is_empty() {
             tracing::warn!(by, "ignoring a room mute that names no target");
             return;
+        }
+        if !broadcast {
+            if muted {
+                if let Some(existing_by) = self.room_mutes.get(target_user_id) {
+                    if !existing_by.is_empty() || by.is_empty() {
+                        return;
+                    }
+                }
+            } else if !self.room_mutes.contains_key(target_user_id) {
+                return;
+            }
         }
         if muted {
             self.room_mutes
@@ -843,48 +974,65 @@ impl RoomManager {
             m.emit(RoomEvent::TransportModeChanged { mode: "direct_p2p".to_string() });
             *m.active.lock().expect("active lock") = Some(ActiveSession { handle });
         }
-        spawn_transport_pump(Arc::clone(room), event_rx, remote);
+        spawn_transport_pump(Arc::clone(room), event_rx, Some(remote));
         Ok(())
     }
 
     /// Activate a voice session over the fallback UDP relay or peer-host.
+    /// `remote` may be `None` when joining an empty VPS room (e.g. room `1111`
+    /// with nobody else inside yet); the relay transport still comes up
+    /// immediately so peers arriving later can connect without deadlocking.
     fn activate_relay_session(
         room: &Arc<Mutex<RoomManager>>,
         relay_addr: SocketAddr,
         fallback_addrs: Vec<SocketAddr>,
         room_code: String,
-        remote: Identity,
+        remote: Option<Identity>,
         mode_label: &'static str,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let (event_tx, event_rx) = mpsc::channel::<TransportEvent>();
-        let (silence, local_id) = {
+        let (silence, local_id, stop_flag) = {
             let m = room.lock().expect("room lock");
-            (Arc::clone(&m.silence_frame), m.identity.clone())
+            (
+                Arc::clone(&m.silence_frame),
+                m.identity.clone(),
+                Arc::clone(&m.signaling_stop),
+            )
         };
+        let transport_remote = remote.clone().unwrap_or_else(|| local_id.clone());
         let handle = verio_transport::spawn_relay_session_with_candidates(
             relay_addr,
             fallback_addrs,
             room_code,
             local_id,
-            remote.clone(),
+            transport_remote,
             silence,
             event_tx,
             mode_label,
-        ).map_err(|e| e.0)?;
+        )
+        .map_err(|e| e.0)?;
         {
             let mut m = room.lock().expect("room lock");
-            m.add_peer(remote.clone());
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                || !matches!(m.state, RoomState::Connecting | RoomState::Connected)
+            {
+                handle.disconnect();
+                return Ok(false);
+            }
+            if let Some(ref peer) = remote {
+                m.add_peer(peer.clone());
+            }
             m.transport_mode = Some(mode_label.to_string());
             m.set_state(RoomState::Connected);
-            m.emit(RoomEvent::TransportModeChanged { mode: mode_label.to_string() });
-            // `add_peer` above already announced this peer if it was new. A
-            // second `PeerConnected` here fired a duplicate join cue for the same
-            // peer on every relay call; a peer adopted from the server's roster
-            // was announced by that adopt, so nothing is lost by dropping it.
+            m.emit(RoomEvent::TransportModeChanged {
+                mode: mode_label.to_string(),
+            });
             *m.active.lock().expect("active lock") = Some(ActiveSession { handle });
+            m.send_state_gossip();
+            m.sync_mutes_to_room();
         }
         spawn_transport_pump(Arc::clone(room), event_rx, remote);
-        Ok(())
+        Ok(true)
     }
 
     // -- connect flows (blocking — run on worker threads) --------------------
@@ -981,25 +1129,44 @@ impl RoomManager {
         Ok(candidates[0])
     }
 
-    /// Create a room on the VPS signaling server and wait for a peer to join.
+    /// Create a room on the VPS signaling server and activate voice transport.
     pub fn run_create_room(
         room: &Arc<Mutex<RoomManager>>,
         vps_addr: String,
         transport_mode: crate::settings::TransportModeSetting,
         host_port: u16,
     ) -> Result<String, String> {
-        let identity = {
+        let (prev_sig, prev_roster, identity, stop_flag) = {
             let mut m = room.lock().expect("room lock");
             if m.is_busy() {
                 return Err("a connection is already in progress".into());
             }
+            let prev_sig = m.signaling_thread.take();
+            let prev_roster = m.roster_thread.take();
             m.begin_connecting();
-            m.identity.clone()
+            (
+                prev_sig,
+                prev_roster,
+                m.identity.clone(),
+                Arc::clone(&m.signaling_stop),
+            )
         };
-        let (session, code) = verio_discovery::VpsSignaling::create(&vps_addr, &identity)
+        Self::join_handles(prev_sig, prev_roster);
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("connection cancelled".into());
+        }
+        let (mut session, code) = verio_discovery::VpsSignaling::create(&vps_addr, &identity)
             .map_err(|e| Self::fail_flow(room, e.to_string()))?;
+        session.set_stop_flag(Arc::clone(&stop_flag));
         {
             let mut m = room.lock().expect("room lock");
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                || !matches!(m.state, RoomState::Connecting)
+            {
+                drop(m);
+                session.leave_and_close();
+                return Err("connection cancelled".into());
+            }
             m.room_code = Some(code.clone());
             m.emit(RoomEvent::RoomCreated { code: code.clone() });
         }
@@ -1032,19 +1199,38 @@ impl RoomManager {
         code: String,
         transport_mode: crate::settings::TransportModeSetting,
     ) -> Result<(), String> {
-        let identity = {
+        let (prev_sig, prev_roster, identity, stop_flag) = {
             let mut m = room.lock().expect("room lock");
             if m.is_busy() {
                 return Err("a connection is already in progress".into());
             }
+            let prev_sig = m.signaling_thread.take();
+            let prev_roster = m.roster_thread.take();
             m.begin_connecting();
             m.room_code = Some(code.clone());
-            m.identity.clone()
+            (
+                prev_sig,
+                prev_roster,
+                m.identity.clone(),
+                Arc::clone(&m.signaling_stop),
+            )
         };
-        let session = verio_discovery::VpsSignaling::join(&vps_addr, &code, &identity)
+        Self::join_handles(prev_sig, prev_roster);
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("connection cancelled".into());
+        }
+        let mut session = verio_discovery::VpsSignaling::join(&vps_addr, &code, &identity)
             .map_err(|e| Self::fail_flow(room, e.to_string()))?;
+        session.set_stop_flag(Arc::clone(&stop_flag));
         {
             let m = room.lock().expect("room lock");
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                || !matches!(m.state, RoomState::Connecting)
+            {
+                drop(m);
+                session.leave_and_close();
+                return Err("connection cancelled".into());
+            }
             m.emit(RoomEvent::RoomJoined { code: code.clone() });
         }
         let room_clone = Arc::clone(room);
@@ -1080,45 +1266,86 @@ impl RoomManager {
         host_port: u16,
         is_creator: bool,
     ) -> Result<(), String> {
-        let identity = {
+        let (identity, stop_flag) = {
             let m = room.lock().expect("room lock");
-            m.identity.clone()
+            (m.identity.clone(), Arc::clone(&m.signaling_stop))
         };
-        let (remote, role) = session
-            .exchange_identities(&identity)
-            .map_err(|e| e.to_string())?;
-
-        tracing::info!(
-            peer = %remote.name,
-            uuid = %remote.uuid,
-            ?transport_mode,
-            is_creator,
-            "signaling: peer identified, selecting voice transport"
-        );
-
-        // Session 11: the VPS relay is the only transport for room calls. The old
-        // transport-mode picker and the force-relay switch are gone, so a room call
-        // always resolves to the relay path (ICE/STUN gathering and the P2P
-        // handshake are no longer reachable from the 4-digit room flow).
-        // Session 12: adopt the peers the server already listed for this room.
-        // Session 27: `adopt_peer`, not `add_peer` — these peers did not join,
-        // *we* did, and announcing each of them played a join cue per head.
-        for peer in session.initial_peers() {
-            let mut m = room.lock().expect("room lock");
-            m.adopt_peer(peer);
+        session.set_stop_flag(Arc::clone(&stop_flag));
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            session.leave_and_close();
+            return Ok(());
         }
 
+        // Session 11 + 32A: VPS Cloud Relay supports empty rooms (such as permanent
+        // room `1111` or newly created rooms) immediately without blocking in
+        // `exchange_identities`. Peers joining later arrive via `SignalingEvent::PeerJoined`.
+        let _ = transport_mode;
         let effective_mode = crate::settings::TransportModeSetting::CloudRelay;
         let relay_label: &'static str = "cloud_relay";
-        let res = match effective_mode {
-            crate::settings::TransportModeSetting::CloudRelay | crate::settings::TransportModeSetting::Auto => {
-                let relay_addrs = Self::resolve_vps_relay_candidates(vps_addr)?;
+
+        let activated = match effective_mode {
+            crate::settings::TransportModeSetting::CloudRelay
+            | crate::settings::TransportModeSetting::Auto => {
+                let initial_peers: Vec<Identity> = session
+                    .initial_peers()
+                    .into_iter()
+                    .filter(|p| p.uuid != identity.uuid)
+                    .collect();
+                {
+                    let mut m = room.lock().expect("room lock");
+                    if stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                        || !matches!(m.state, RoomState::Connecting | RoomState::Connected)
+                    {
+                        drop(m);
+                        session.leave_and_close();
+                        return Ok(());
+                    }
+                    for peer in &initial_peers {
+                        m.adopt_peer(peer.clone());
+                    }
+                }
+                let remote = initial_peers.into_iter().next();
+                let relay_addrs = match Self::resolve_vps_relay_candidates(vps_addr) {
+                    Ok(addrs) => addrs,
+                    Err(e) => {
+                        session.leave_and_close();
+                        return Err(e);
+                    }
+                };
                 let primary = relay_addrs[0];
                 let fallbacks = relay_addrs[1..].to_vec();
-                tracing::info!(%primary, ?fallbacks, "activating relay for room call");
-                Self::activate_relay_session(room, primary, fallbacks, room_code.to_string(), remote, relay_label)
+                tracing::info!(
+                    %primary,
+                    ?fallbacks,
+                    has_remote = remote.is_some(),
+                    is_creator,
+                    "activating relay for room call"
+                );
+                match Self::activate_relay_session(
+                    room,
+                    primary,
+                    fallbacks,
+                    room_code.to_string(),
+                    remote,
+                    relay_label,
+                ) {
+                    Ok(active) => active,
+                    Err(e) => {
+                        session.leave_and_close();
+                        return Err(e);
+                    }
+                }
             }
             crate::settings::TransportModeSetting::PeerHost => {
+                let initial_peers: Vec<Identity> = session
+                    .initial_peers()
+                    .into_iter()
+                    .filter(|p| p.uuid != identity.uuid)
+                    .collect();
+                for peer in &initial_peers {
+                    room.lock().expect("room lock").adopt_peer(peer.clone());
+                }
+                let remote = initial_peers.into_iter().next();
                 if is_creator {
                     let host = verio_transport::EmbeddedVoiceHost::start(host_port)
                         .map_err(|e| e.0)?;
@@ -1130,55 +1357,87 @@ impl RoomManager {
                     let host_addr: SocketAddr = format!("127.0.0.1:{actual_port}")
                         .parse()
                         .map_err(|e| format!("parse host addr: {e}"))?;
-                    Self::activate_relay_session(room, host_addr, Vec::new(), room_code.to_string(), remote, "peer_host")
+                    Self::activate_relay_session(
+                        room,
+                        host_addr,
+                        Vec::new(),
+                        room_code.to_string(),
+                        remote,
+                        "peer_host",
+                    )?
                 } else {
                     let relay_addrs = Self::resolve_vps_relay_candidates(vps_addr)?;
                     let primary = relay_addrs[0];
                     let fallbacks = relay_addrs[1..].to_vec();
-                    Self::activate_relay_session(room, primary, fallbacks, room_code.to_string(), remote, "peer_host")
+                    Self::activate_relay_session(
+                        room,
+                        primary,
+                        fallbacks,
+                        room_code.to_string(),
+                        remote,
+                        "peer_host",
+                    )?
                 }
             }
             crate::settings::TransportModeSetting::DirectP2P => {
+                let (remote, role) = session
+                    .exchange_identities(&identity)
+                    .map_err(|e| e.to_string())?;
+                for peer in session.initial_peers() {
+                    if peer.uuid != identity.uuid {
+                        room.lock().expect("room lock").adopt_peer(peer);
+                    }
+                }
                 let stun_addrs = Self::resolve_vps_stuns(vps_addr);
-                Self::run_vps_p2p_handshake(room, &mut session, &stun_addrs, remote, role)
+                Self::run_vps_p2p_handshake(room, &mut session, &stun_addrs, remote, role)?;
+                true
             }
         };
 
-        if res.is_ok() {
-            // Keep the WebSocket open on a helper thread so we hear about peers
-            // leaving, and so leaving ourselves reaches the server immediately.
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let mut m = room.lock().expect("room lock");
-                m.signaling_stop = Arc::clone(&stop);
-            }
-            session.set_stop_flag(stop);
+        if !activated {
+            session.leave_and_close();
+            return Ok(());
+        }
 
-            // Session 14: roster gossip. Re-announce ourselves every few seconds so
-            // peers learn about us even if a signalling event was missed, and prune
-            // peers we stop hearing from so stale cards disappear.
-            {
-                let room_weak = Arc::downgrade(room);
-                let spawned = std::thread::Builder::new()
-                    .name("verio-roster".into())
-                    .spawn(move || loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        let Some(r) = room_weak.upgrade() else {
-                            return;
-                        };
-                        let mut m = r.lock().expect("room lock");
-                        if matches!(m.state, RoomState::Idle) {
+        // Session 14 + 32A: roster gossip in 100 ms ticks so disconnect/leave exits promptly.
+        let roster_handle = {
+            let room_weak = Arc::downgrade(room);
+            let roster_stop = Arc::clone(&stop_flag);
+            match std::thread::Builder::new()
+                .name("verio-roster".into())
+                .spawn(move || loop {
+                    for _ in 0..30 {
+                        if roster_stop.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
-                        m.send_hello();
-                        m.prune_stale_peers(std::time::Duration::from_secs(15));
-                    });
-                if let Err(e) = spawned {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if roster_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let Some(r) = room_weak.upgrade() else {
+                        return;
+                    };
+                    let mut m = r.lock().expect("room lock");
+                    if matches!(m.state, RoomState::Idle)
+                        || roster_stop.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    m.send_state_gossip();
+                    m.prune_stale_peers(std::time::Duration::from_secs(15));
+                }) {
+                Ok(h) => Some(h),
+                Err(e) => {
                     tracing::error!("spawn roster thread failed: {e}");
+                    None
                 }
             }
+        };
+
+        let sig_handle = {
             let room_weak = Arc::downgrade(room);
-            std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("verio-vps-ws-listener".into())
                 .spawn(move || {
                     session.run_listener(move |event| {
@@ -1187,18 +1446,42 @@ impl RoomManager {
                         };
                         match event {
                             verio_discovery::vps::SignalingEvent::PeerJoined(peer) => {
-                                r.lock().expect("room lock").add_peer(peer);
+                                let mut m = r.lock().expect("room lock");
+                                m.add_peer(peer);
+                                m.send_state_gossip();
+                                m.sync_mutes_to_room();
                             }
                             verio_discovery::vps::SignalingEvent::PeerLeft(peer_id) => {
                                 r.lock().expect("room lock").remove_peer(&peer_id);
                             }
                         }
                     });
-                })
-                .ok();
+                }) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::error!("spawn vps ws listener failed: {e}");
+                    None
+                }
+            }
+        };
+
+        let stale_handles = {
+            let mut m = room.lock().expect("room lock");
+            if Arc::ptr_eq(&m.signaling_stop, &stop_flag)
+                && !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                m.roster_thread = roster_handle;
+                m.signaling_thread = sig_handle;
+                None
+            } else {
+                Some((sig_handle, roster_handle))
+            }
+        };
+        if let Some((sh, rh)) = stale_handles {
+            Self::join_handles(sh, rh);
         }
 
-        res
+        Ok(())
     }
 
     /// Pure direct WebRTC P2P handshake (str0m) for DirectP2P mode.
@@ -1384,20 +1667,20 @@ impl RoomManager {
 /// the authoritative display name.)
 /// Session 12: relay events carry the sender; single-peer transports do not, in
 /// which case the session's peer is the only candidate.
-fn resolve_peer(event_peer: &str, fallback: &str) -> String {
-    if event_peer.is_empty() {
-        fallback.to_string()
+fn resolve_peer(event_peer: &str, fallback: Option<&str>) -> Option<String> {
+    if !event_peer.is_empty() {
+        Some(event_peer.to_string())
     } else {
-        event_peer.to_string()
+        fallback.map(str::to_string)
     }
 }
 
 fn spawn_transport_pump(
     room: Arc<Mutex<RoomManager>>,
     event_rx: mpsc::Receiver<TransportEvent>,
-    remote: Identity,
+    remote: Option<Identity>,
 ) {
-    let peer_id = remote.uuid.to_string();
+    let peer_id = remote.map(|r| r.uuid.to_string());
     let spawned = std::thread::Builder::new()
         .name("verio-room-pump".into())
         .spawn(move || {
@@ -1413,14 +1696,20 @@ fn spawn_transport_pump(
                         capture_ts_ms,
                         opus,
                     } => {
-                        let tx = {
+                        let (self_uuid, tx) = {
                             let m = room.lock().expect("room lock");
                             let guard = m.net_in.lock().expect("net_in lock");
-                            guard.clone()
+                            (m.identity.uuid.to_string(), guard.clone())
                         };
+                        let Some(sender_id) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if sender_id == self_uuid {
+                            continue;
+                        }
                         if let Some(tx) = tx {
                             let _ = tx.send(NetAudioIn {
-                                peer_id: resolve_peer(&peer, &peer_id),
+                                peer_id: sender_id,
                                 seq,
                                 capture_ts_ms,
                                 opus,
@@ -1439,7 +1728,12 @@ fn spawn_transport_pump(
                             },
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        let id = resolve_peer(&peer, &peer_id);
+                        let Some(id) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if id == m.identity.uuid.to_string() {
+                            continue;
+                        }
                         m.mark_peer_seen(&id);
                         if let Some(p) = m.peers.get_mut(&id) {
                             p.speaking = speaking;
@@ -1447,15 +1741,26 @@ fn spawn_transport_pump(
                             p.deafen = deafen;
                             p.music = music;
                             p.music_title = music_title.clone();
+                            m.emit(RoomEvent::PeerState {
+                                peer_id: id,
+                                speaking,
+                                mute,
+                                deafen,
+                                music,
+                                music_title,
+                            });
+                        } else {
+                            m.pending_peer_states.insert(
+                                id,
+                                LocalState {
+                                    speaking,
+                                    mute,
+                                    deafen,
+                                    music,
+                                    music_title,
+                                },
+                            );
                         }
-                        m.emit(RoomEvent::PeerState {
-                            peer_id: id,
-                            speaking,
-                            mute,
-                            deafen,
-                            music,
-                            music_title,
-                        });
                     }
                     TransportEvent::Control {
                         peer,
@@ -1469,29 +1774,14 @@ fn spawn_transport_pump(
                             },
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        let uuid = resolve_peer(&peer, &peer_id);
+                        let Some(uuid) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if uuid == m.identity.uuid.to_string() {
+                            continue;
+                        }
                         m.mark_peer_seen(&uuid);
                         let is_new = !m.peers.contains_key(&uuid);
-                        // Session 29: refresh the roster when the name OR the
-                        // persistent id changed. The id matters because a room-wide
-                        // mute is keyed on it, so learning it late must update the
-                        // roster rather than be discarded as "not a rename". An
-                        // empty id never overwrites a known one — that is a peer
-                        // built before this field existed.
-                        //
-                        // Session 29b: the bot flag refreshes it for the same
-                        // reason, and only in one direction — a bot is declared by
-                        // its `Hello`, so a `false` here must not clear a `true`
-                        // that arrived earlier. Without this clause a bot whose
-                        // `Hello` landed before its signalling `PeerJoined` would
-                        // settle back into looking like a person.
-                        //
-                        // The force-stop decision rides the same clause and the same
-                        // direction: this message is the only thing that can teach
-                        // it, and learning it late is precisely why the clause
-                        // exists — the Stop control has to appear on a listener's
-                        // screen when the bot's announcement arrives, not whenever
-                        // its tile happened to.
                         let changed = m.peers.get(&uuid).is_some_and(|p| {
                             p.name != name
                                 || (p.user_id != user_id && !user_id.is_empty())
@@ -1511,12 +1801,12 @@ fn spawn_transport_pump(
                             };
                             if is_new {
                                 m.add_peer(identity);
+                                // Now that this peer is confirmed active on the UDP relay,
+                                // push our latest state and active room_mutes to converge fast.
+                                m.send_state_gossip();
+                                m.sync_mutes_to_room();
                             } else {
                                 // A rename is a roster update, not an arrival.
-                                // `adopt_peer` refreshes the name and tells the
-                                // UI; emitting `PeerConnected` by hand here used
-                                // to play a join cue every time a peer renamed
-                                // themselves.
                                 m.adopt_peer(identity);
                             }
                         }
@@ -1529,19 +1819,18 @@ fn spawn_transport_pump(
                         },
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        let actor = resolve_peer(&peer, &peer_id);
+                        let Some(actor) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if actor == m.identity.uuid.to_string() {
+                            continue;
+                        }
                         m.mark_peer_seen(&actor);
-                        // The actor comes from the envelope, not the payload: the
-                        // relay stamps every control frame with its sender, so the
-                        // message neither has to repeat it nor gets to lie about it.
                         let by = m
                             .peers
                             .get(&actor)
                             .map(|p| p.name.clone())
                             .unwrap_or_default();
-                        // `broadcast: false` — this is the mute we just received.
-                        // Sending it on would have it circulate for the life of the
-                        // room.
                         m.apply_mute(&target_user_id, muted, &by, false);
                     }
                     TransportEvent::Control {
@@ -1549,12 +1838,13 @@ fn spawn_transport_pump(
                         message: ControlMessage::MusicStop,
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        let actor = resolve_peer(&peer, &peer_id);
+                        let Some(actor) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if actor == m.identity.uuid.to_string() {
+                            continue;
+                        }
                         m.mark_peer_seen(&actor);
-                        // The actor again comes from the envelope. This is the one
-                        // that matters most: the host is told *who* stopped their
-                        // music, so taking that from the payload would let anyone
-                        // blame anyone.
                         let by = m
                             .peers
                             .get(&actor)
@@ -1572,7 +1862,12 @@ fn spawn_transport_pump(
                             },
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        let actor = resolve_peer(&peer, &peer_id);
+                        let Some(actor) = resolve_peer(&peer, peer_id.as_deref()) else {
+                            continue;
+                        };
+                        if actor == m.identity.uuid.to_string() {
+                            continue;
+                        }
                         m.mark_peer_seen(&actor);
 
                         if m.recent_chat_ids.contains(&id) {
@@ -1602,35 +1897,31 @@ fn spawn_transport_pump(
                         let m = room.lock().expect("room lock");
                         m.emit(RoomEvent::Rtt { ms });
                     }
-                    // Ping/Pong are answered inside the transport driver and
-                    // never surfaced as room events.
                     // Ping/Pong are the liveness signal for the roster sweep.
                     TransportEvent::Control {
                         peer,
                         message: ControlMessage::Ping { .. } | ControlMessage::Pong { .. },
                     } => {
                         let mut m = room.lock().expect("room lock");
-                        m.mark_peer_seen(&resolve_peer(&peer, &peer_id));
+                        if let Some(id) = resolve_peer(&peer, peer_id.as_deref()) {
+                            if id != m.identity.uuid.to_string() {
+                                m.mark_peer_seen(&id);
+                            }
+                        }
                     }
                     TransportEvent::Disconnected { reason } => {
                         let mut m = room.lock().expect("room lock");
-                        // Only report a departure if this teardown is what ended
-                        // the call. Both `disconnect()` (the user pressing Leave)
-                        // and `remove_peer` (the last peer leaving) idle the room
-                        // *before* the transport winds down, so without this guard
-                        // the leave cue played when you left your own call, and
-                        // twice for the last peer's already-reported departure.
                         let was_active = !matches!(m.state, RoomState::Idle);
-                        // Read before the teardown clears the roster. The transport
-                        // signs with whichever peer joined first, so for a host
-                        // alone in a room that peer is their own bot.
-                        let was_bot = m.peers.get(&peer_id).is_some_and(|p| p.is_bot);
+                        let was_bot = peer_id
+                            .as_deref()
+                            .and_then(|id| m.peers.get(id))
+                            .is_some_and(|p| p.is_bot);
                         m.teardown_session(&reason);
                         m.set_state(RoomState::Idle);
                         if was_active {
                             m.emit(RoomEvent::PeerDisconnected {
                                 reason,
-                                peer_id: Some(peer_id.clone()),
+                                peer_id: peer_id.clone(),
                                 is_bot: was_bot,
                             });
                         }
@@ -2317,6 +2608,540 @@ mod tests {
         // Teardown clears ephemeral chat IDs
         m.teardown_session("test");
         assert!(m.recent_chat_ids.is_empty());
+    }
+
+    fn sha1_digest(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+        let mut padded = data.to_vec();
+        let bit_len = (padded.len() as u64) * 8;
+        padded.push(0x80);
+        while (padded.len() % 64) != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in padded.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (i, word) in chunk.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as usize;
+            let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+            let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+            out.push(TBL[(b0 >> 2) & 0x3F] as char);
+            out.push(TBL[((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)] as char);
+            out.push(if chunk.len() > 1 {
+                TBL[((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                TBL[b2 & 0x3F] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn ws_send_text(stream: &mut std::net::TcpStream, json: &str) {
+        use std::io::Write;
+        let payload = json.as_bytes();
+        let mut frame = Vec::with_capacity(10 + payload.len());
+        frame.push(0x81);
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8);
+        } else {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        let _ = stream.write_all(&frame);
+    }
+
+    fn ws_read_text(stream: &mut std::net::TcpStream) -> Option<String> {
+        use std::io::Read;
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr).ok()?;
+        let opcode = hdr[0] & 0x0F;
+        let masked = (hdr[1] & 0x80) != 0;
+        let mut len = (hdr[1] & 0x7F) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).ok()?;
+            len = u16::from_be_bytes(ext) as usize;
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            stream.read_exact(&mut mask).ok()?;
+        }
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).ok()?;
+        if masked {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+        }
+        if opcode == 0x8 {
+            return None;
+        }
+        String::from_utf8(payload).ok()
+    }
+
+    #[test]
+    fn test_vps_room_1111_empty_join_leave_and_rejoin_succeeds_without_deadlock() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (event_tx, event_rx) = mpsc::channel::<String>();
+
+        let server_thread = std::thread::spawn(move || {
+            for _session_idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut tmp).unwrap();
+                    req_buf.extend_from_slice(&tmp[..n]);
+                    if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&req_buf);
+                let key = req_str
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        if k.eq_ignore_ascii_case("sec-websocket-key") {
+                            Some(v.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let accept = base64_encode(&sha1_digest(
+                    format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+                ));
+                let resp = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+
+                while let Some(txt) = ws_read_text(&mut stream) {
+                    let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                    match v.get("type").and_then(|t| t.as_str()) {
+                        Some("join") => {
+                            let _ = event_tx.send("join".into());
+                            // Reply with EMPTY peers list (the exact condition on room 1111).
+                            ws_send_text(&mut stream, r#"{"type":"joined","room":"1111","peers":[]}"#);
+                        }
+                        Some("leave") => {
+                            let _ = event_tx.send("leave".into());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let (tx, _rx) = mpsc::channel();
+        let room = Arc::new(Mutex::new(RoomManager::new(
+            identity("Alice", 10),
+            tx,
+            temp_db("room-1111-rejoin"),
+        )));
+        let url = format!("ws://{addr}");
+
+        // 1st join to empty room 1111 must reach Connected immediately (no exchange_identities deadlock).
+        RoomManager::run_join_room(
+            &room,
+            url.clone(),
+            "1111".into(),
+            crate::settings::TransportModeSetting::CloudRelay,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if room.lock().expect("room lock").state() == RoomState::Connected {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(room.lock().expect("room lock").state(), RoomState::Connected);
+        assert!(room.lock().expect("room lock").peers().is_empty());
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join");
+
+        // Explicit disconnect_and_wait must send Leave and join threads promptly.
+        let leave_start = Instant::now();
+        RoomManager::disconnect_and_wait(&room);
+        assert!(
+            leave_start.elapsed() < Duration::from_secs(2),
+            "disconnect_and_wait took too long"
+        );
+        assert_eq!(room.lock().expect("room lock").state(), RoomState::Idle);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "leave");
+
+        // 2nd immediate rejoin to empty room 1111 must also reach Connected cleanly.
+        RoomManager::run_join_room(
+            &room,
+            url,
+            "1111".into(),
+            crate::settings::TransportModeSetting::CloudRelay,
+        )
+        .unwrap();
+        let deadline2 = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline2 {
+            if room.lock().expect("room lock").state() == RoomState::Connected {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(room.lock().expect("room lock").state(), RoomState::Connected);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join");
+
+        RoomManager::disconnect_and_wait(&room);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "leave");
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_lobby_net_out_frames_are_drained_when_idle() {
+        use std::time::{Duration, Instant};
+
+        let (m, _rx) = manager();
+        let tx = m.net_out_tx();
+        for i in 0..25u64 {
+            tx.send(NetAudioOut {
+                opus: vec![9, 9, i as u8],
+                capture_ts_ms: 100 + i,
+            })
+            .unwrap();
+        }
+        // Let verio-audio-pump run at least two 100 ms idle iterations to drain lobby frames.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        sink.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            sink_addr,
+            "1111".into(),
+            m.identity().clone(),
+            identity("Bob", 2),
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+        *m.active.lock().expect("active lock") = Some(ActiveSession {
+            handle: handle.clone(),
+        });
+
+        // Give the pump time to process anything still left in net_out before our live frame.
+        std::thread::sleep(Duration::from_millis(120));
+        tx.send(NetAudioOut {
+            opus: vec![42, 43, 44],
+            capture_ts_ms: 999999,
+        })
+        .unwrap();
+
+        let mut received_ts = Vec::new();
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if let Ok((n, _)) = sink.recv_from(&mut buf) {
+                let inner: &[u8] = if n > 20
+                    && buf[0..2] == [0x00, 0x01]
+                    && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                {
+                    &buf[20..n]
+                } else {
+                    &buf[..n]
+                };
+                if inner.len() > 21 && inner[20] == verio_transport::RELAY_TAG_AUDIO {
+                    if let Ok((_seq, ts, _opus)) = verio_transport::parse_audio_packet(&inner[21..]) {
+                        received_ts.push(ts);
+                        if ts == 999999 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            received_ts,
+            vec![999999],
+            "stale lobby frames must be drained while not in a call"
+        );
+        handle.disconnect();
+    }
+
+    #[test]
+    fn test_vps_room_stays_connected_when_peers_leave() {
+        let (mut m, _rx) = manager();
+        m.room_code = Some("1111".into());
+        m.set_state(RoomState::Connected);
+        m.add_peer(identity("Ada", 1));
+        m.remove_peer(&uuid(1));
+        assert_eq!(
+            m.state(),
+            RoomState::Connected,
+            "VPS room 1111 must stay open ('Waiting for others') after all peers leave"
+        );
+        assert!(m.peers().is_empty());
+    }
+
+    #[test]
+    fn test_set_local_nickname_updates_identity_and_broadcasts_hello() {
+        use std::time::{Duration, Instant};
+
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        sink.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+
+        let (mut m, _rx) = manager();
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            sink_addr,
+            "1111".into(),
+            m.identity().clone(),
+            identity("Bob", 2),
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+        *m.active.lock().expect("active lock") = Some(ActiveSession {
+            handle: handle.clone(),
+        });
+
+        m.set_local_nickname("  Kaveh  ".into());
+        assert_eq!(m.identity().name, "Kaveh");
+
+        let mut names = Vec::new();
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if let Ok((n, _)) = sink.recv_from(&mut buf) {
+                let inner: &[u8] = if n > 20
+                    && buf[0..2] == [0x00, 0x01]
+                    && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                {
+                    &buf[20..n]
+                } else {
+                    &buf[..n]
+                };
+                if inner.len() > 21 && inner[20] == verio_transport::RELAY_TAG_CONTROL {
+                    if let Ok(ControlMessage::Hello { name, .. }) =
+                        serde_json::from_slice::<ControlMessage>(&inner[21..])
+                    {
+                        names.push(name.clone());
+                        if name == "Kaveh" {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(names.contains(&"Kaveh".to_string()), "got {names:?}");
+        handle.disconnect();
+    }
+
+    #[test]
+    fn test_gossip_syncs_cached_state_and_mutes_idempotently() {
+        use std::time::{Duration, Instant};
+
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        sink.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+
+        let (mut m, rx) = manager();
+        // Muted + deafened + room-muted BEFORE active session / late joiner connects.
+        m.send_state(false, true, true, false, String::new());
+        m.set_room_mute("user-bob", true).unwrap();
+
+        // Incoming redundant gossip mute from the wire must be idempotent (no duplicate PeerMuted).
+        m.apply_mute("user-bob", true, "Alice", false);
+        while rx.try_recv().is_ok() {}
+        m.apply_mute("user-bob", true, "Alice", false);
+        assert!(
+            rx.try_recv().is_err(),
+            "redundant wire MuteUser must not re-emit PeerMuted"
+        );
+
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            sink_addr,
+            "1111".into(),
+            m.identity().clone(),
+            identity("LateJoiner", 5),
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+        *m.active.lock().expect("active lock") = Some(ActiveSession {
+            handle: handle.clone(),
+        });
+
+        m.send_state_gossip();
+        m.sync_mutes_to_room();
+
+        let mut saw_state = false;
+        let mut saw_mute = false;
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && (!saw_state || !saw_mute) {
+            if let Ok((n, _)) = sink.recv_from(&mut buf) {
+                let inner: &[u8] = if n > 20
+                    && buf[0..2] == [0x00, 0x01]
+                    && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                {
+                    &buf[20..n]
+                } else {
+                    &buf[..n]
+                };
+                if inner.len() > 21 && inner[20] == verio_transport::RELAY_TAG_CONTROL {
+                    match serde_json::from_slice::<ControlMessage>(&inner[21..]) {
+                        Ok(ControlMessage::State { mute: true, deafen: true, .. }) => {
+                            saw_state = true;
+                        }
+                        Ok(ControlMessage::MuteUser { target_user_id, muted: true })
+                            if target_user_id == "user-bob" =>
+                        {
+                            saw_mute = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(saw_state, "late joiner gossip must carry cached mute/deafen State");
+        assert!(saw_mute, "late joiner sync must carry active room_mutes");
+        handle.disconnect();
+    }
+
+    #[test]
+    fn test_self_uuid_filtered_and_pending_state_applied_on_arrival() {
+        let (mut m, rx) = manager();
+        // Self identity must NEVER be added to peers even if echoed by signaling or Hello.
+        let me = m.identity().clone();
+        m.add_peer(me);
+        assert!(m.peers().is_empty());
+
+        // Early State arriving before peer registration must apply cleanly on add_peer.
+        let bob = identity("Bob", 77);
+        m.pending_peer_states.insert(
+            bob.uuid.to_string(),
+            LocalState {
+                speaking: true,
+                mute: true,
+                deafen: false,
+                music: true,
+                music_title: "Song".into(),
+            },
+        );
+        m.add_peer(bob.clone());
+        let peers = m.peers();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].speaking);
+        assert!(peers[0].mute);
+        assert_eq!(peers[0].music_title, "Song");
+        let mut saw_peer_state = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, RoomEvent::PeerState { mute: true, .. }) {
+                saw_peer_state = true;
+            }
+        }
+        assert!(saw_peer_state);
+    }
+
+    #[test]
+    fn send_chat_returns_err_and_does_not_emit_when_transport_channel_closed() {
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let (mut m, rx) = manager();
+        let (ev_tx, _ev_rx) = mpsc::channel();
+        let handle = verio_transport::spawn_relay_session(
+            sink_addr,
+            "1111".into(),
+            m.identity().clone(),
+            identity("Bob", 6),
+            Arc::new(vec![0u8; 2]),
+            ev_tx,
+        )
+        .unwrap();
+
+        *m.active.lock().expect("active lock") = Some(ActiveSession {
+            handle: handle.clone(),
+        });
+        m.set_state(RoomState::Connected);
+        while rx.try_recv().is_ok() {}
+
+        // Close the transport worker and wait until the control channel's receiver drops.
+        handle.disconnect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if handle.try_send_control(ControlMessage::MusicStop).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(handle.try_send_control(ControlMessage::MusicStop).is_err());
+
+        let err = m.send_chat("hello after disconnect".into());
+        assert!(
+            err.is_err(),
+            "send_chat must propagate closed-channel Err instead of silently succeeding"
+        );
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, RoomEvent::ChatReceived { .. }),
+                "failed send_chat must not emit local ChatReceived echo"
+            );
+        }
     }
 }
 

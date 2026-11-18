@@ -347,8 +347,40 @@ pub fn start(
         gate,
     } = match setup_rx.recv() {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("stream-owner thread exited before opening devices".into()),
+        Ok(Err(e)) => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = owner.join();
+            return Err(e);
+        }
+        Err(_) => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = owner.join();
+            return Err("stream-owner thread exited before opening devices".into());
+        }
+    };
+
+    struct StartupRollback {
+        stop: Arc<AtomicBool>,
+        owner: Option<std::thread::JoinHandle<()>>,
+        processing: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for StartupRollback {
+        fn drop(&mut self) {
+            if self.owner.is_some() || self.processing.is_some() {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(h) = self.processing.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.owner.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let mut rollback = StartupRollback {
+        stop: Arc::clone(&stop),
+        owner: Some(owner),
+        processing: None,
     };
 
     tracing::info!(
@@ -435,6 +467,7 @@ pub fn start(
             );
         })
         .map_err(|e| format!("spawn processing thread: {e}"))?;
+    rollback.processing = Some(processing);
 
     // --- RX / Multi-Source Mixer thread ---
     let r_stop = Arc::clone(&stop);
@@ -476,9 +509,9 @@ pub fn start(
         event_rx,
         PipelineHandle {
             stop,
-            processing: Some(processing),
+            processing: rollback.processing.take(),
             rx: Some(rx),
-            streams: Some(owner),
+            streams: rollback.owner.take(),
             earcon_tx,
             peer_volumes,
             peer_mutes,
@@ -492,6 +525,7 @@ struct InputConverter {
     channels: u16,
     resampler: Option<LinearResampler>,
     mono_tmp: Vec<f32>,
+    remainder: Vec<f32>,
 }
 
 impl InputConverter {
@@ -501,18 +535,36 @@ impl InputConverter {
             resampler: (native_rate != SAMPLE_RATE)
                 .then(|| LinearResampler::new(native_rate, SAMPLE_RATE)),
             mono_tmp: Vec::new(),
+            remainder: Vec::with_capacity(usize::from(channels)),
         }
     }
 
     fn process(&mut self, native: &[f32], out: &mut Vec<f32>) {
         self.mono_tmp.clear();
-        if self.channels <= 1 {
+        let ch = usize::from(self.channels);
+        if ch <= 1 {
             self.mono_tmp.extend_from_slice(native);
         } else {
-            for frame in native.chunks_exact(self.channels as usize) {
+            let inv = 1.0 / ch as f32;
+            let mut offset = 0usize;
+            if !self.remainder.is_empty() {
+                let need = ch - self.remainder.len();
+                if native.len() < need {
+                    self.remainder.extend_from_slice(native);
+                    return;
+                }
+                self.remainder.extend_from_slice(&native[..need]);
                 self.mono_tmp
-                    .push(frame.iter().sum::<f32>() / self.channels as f32);
+                    .push(self.remainder.iter().sum::<f32>() * inv);
+                self.remainder.clear();
+                offset = need;
             }
+            let tail = &native[offset..];
+            let full_samples = (tail.len() / ch) * ch;
+            for frame in tail[..full_samples].chunks_exact(ch) {
+                self.mono_tmp.push(frame.iter().sum::<f32>() * inv);
+            }
+            self.remainder.extend_from_slice(&tail[full_samples..]);
         }
         match &mut self.resampler {
             Some(r) => r.process(&self.mono_tmp, out),
@@ -700,16 +752,22 @@ fn processing_loop(
             // bitrate, and must not claim music presence to the room.
             let music_active = pipeline_owns_music(music.is_active(), music.is_bot_owned());
             let mut using_music = false;
-            if music_active && music.next_chunk(&mut music_buf) > 0 {
-                let vol = music.volume();
-                // The mic only contributes while the user's own gate is open
-                // (mute, PTT and deafen all silence it); music contributes always.
-                let mic_gain = if tx_state.effective_transmission() { 1.0 } else { 0.0 };
-                for i in 0..RNNOISE_FRAME {
-                    mixed_buf[i] =
-                        soft_limit_sample(encode_input[i] * mic_gain + music_buf[i] * vol);
+            if music_active {
+                let n = music.next_chunk(&mut music_buf);
+                if n > 0 {
+                    if n < RNNOISE_FRAME {
+                        music_buf[n..].fill(0.0);
+                    }
+                    let vol = music.volume();
+                    // The mic only contributes while the user's own gate is open
+                    // (mute, PTT and deafen all silence it); music contributes always.
+                    let mic_gain = if tx_state.effective_transmission() { 1.0 } else { 0.0 };
+                    for i in 0..RNNOISE_FRAME {
+                        mixed_buf[i] =
+                            soft_limit_sample(encode_input[i] * mic_gain + music_buf[i] * vol);
+                    }
+                    using_music = true;
                 }
-                using_music = true;
             }
 
             // DTX would collapse sustained music into near-silent packets, so it
@@ -1015,6 +1073,7 @@ impl MusicSource {
     pub fn pause(&self) {
         if let Ok(mut g) = self.inner.lock() {
             g.playing = false;
+            g.advance_to = None;
         }
     }
 
@@ -1022,6 +1081,7 @@ impl MusicSource {
     pub fn stop(&self) {
         if let Ok(mut g) = self.inner.lock() {
             g.playing = false;
+            g.advance_to = None;
             if let Some(d) = g.decoder.as_mut() {
                 let _ = d.reset();
             }
@@ -1443,11 +1503,14 @@ struct PeerRxStream {
     pre_buf: VecDeque<f32>,
     armed: bool,
     last_seq: Option<u32>,
+    last_packet: Instant,
     stats_decoded: u64,
     stats_late: u64,
     stats_lost: u64,
     stats_oneway: Vec<u64>,
 }
+
+const PEER_RX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl PeerRxStream {
     fn new() -> Result<Self, String> {
@@ -1456,6 +1519,7 @@ impl PeerRxStream {
             pre_buf: VecDeque::with_capacity(4800),
             armed: false,
             last_seq: None,
+            last_packet: Instant::now(),
             stats_decoded: 0,
             stats_late: 0,
             stats_lost: 0,
@@ -1464,6 +1528,7 @@ impl PeerRxStream {
     }
 
     fn push_packet(&mut self, seq: u32, capture_ts_ms: u64, opus: &[u8]) {
+        self.last_packet = Instant::now();
         self.stats_decoded += 1;
         if let Some(last) = self.last_seq {
             let gap = seq.wrapping_sub(last);
@@ -1587,9 +1652,10 @@ fn rx_loop(
     let mut last_stats = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        // Periodic stats every 5 s
+        // Periodic stats and stale-peer cleanup every 5 s
         if last_stats.elapsed() >= Duration::from_secs(5) {
             last_stats = Instant::now();
+            peers.retain(|_, peer| peer.last_packet.elapsed() <= PEER_RX_IDLE_TIMEOUT);
             for (pid, peer) in &mut peers {
                 let (p50, p95) = if peer.stats_oneway.is_empty() {
                     (0, 0)
@@ -1655,6 +1721,9 @@ fn rx_loop(
             // remove, so the slot is never allowed to outlive its owner.
             monitor_peer = peer;
             monitor_buf.extend(chunk);
+            while monitor_buf.len() > 4800 {
+                monitor_buf.pop_front();
+            }
         }
 
         // 4. Mix active audio into CPAL output producer
@@ -2019,6 +2088,65 @@ mod music_bus_tests {
 
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&c);
+    }
+
+    #[test]
+    fn pause_and_stop_clear_pending_advance_to() {
+        let a = std::env::temp_dir().join("verio_q_clr_a.wav");
+        let b = std::env::temp_dir().join("verio_q_clr_b.wav");
+        write_tone(&a);
+        write_tone(&b);
+
+        let src = MusicSource::new(1.0, false, false);
+        src.queue_replace(vec![
+            MusicSource::describe_track(&a).expect("describe a"),
+            MusicSource::describe_track(&b).expect("describe b"),
+        ]);
+        src.jump_to(0, true).expect("jump");
+        src.request_next();
+        src.pause();
+        assert!(
+            !src.service_advance(),
+            "pause() must clear pending advance_to so service_advance cannot auto-resume"
+        );
+        assert!(!src.is_active());
+
+        src.play().expect("resume");
+        src.request_next();
+        src.stop();
+        assert!(
+            !src.service_advance(),
+            "stop() must clear pending advance_to so service_advance cannot auto-resume"
+        );
+        assert!(!src.is_active());
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn input_converter_preserves_multichannel_remainder() {
+        let mut conv = InputConverter::new(6, SAMPLE_RATE);
+        let mut out = Vec::new();
+        // Frame 0 = all 1.0; first 2 channels of Frame 1 = [2.0, 2.0].
+        conv.process(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0], &mut out);
+        // Remaining 4 channels of Frame 1 = [2.0; 4], plus Frame 2 = all 3.0.
+        conv.process(&[2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0], &mut out);
+
+        assert_eq!(out.len(), 3, "expected 3 aligned mono frames, got {out:?}");
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        assert!((out[1] - 2.0).abs() < 1e-6);
+        assert!((out[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn peer_rx_stream_prunes_only_after_idle_timeout() {
+        let mut s = PeerRxStream::new().expect("peer rx stream");
+        s.last_packet = Instant::now() - Duration::from_secs(31);
+        assert!(s.last_packet.elapsed() > PEER_RX_IDLE_TIMEOUT);
+        // Empty Opus payload isn't needed to test timestamp refresh on push_packet:
+        s.push_packet(1, 0, &[]);
+        assert!(s.last_packet.elapsed() < Duration::from_secs(1));
     }
 
     /// Reordering must carry the loaded track with it, not leave `queue_index`

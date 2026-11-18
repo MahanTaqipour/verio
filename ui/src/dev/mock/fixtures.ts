@@ -296,7 +296,7 @@ function queueItem(over: Partial<QueueItem> = {}): QueueItem {
 function diag(over: Partial<TransportDiagnostics> = {}): TransportDiagnostics {
   return {
     mode: "direct_p2p",
-    remote_endpoint: "85.198.44.17:51844",
+    endpoint: "85.198.44.17:51844",
     local_addr: "192.168.1.24:51844",
     packets_sent: 18422,
     packets_recv: 18390,
@@ -306,7 +306,7 @@ function diag(over: Partial<TransportDiagnostics> = {}): TransportDiagnostics {
     rtt_ms: 14,
     ice_state: "connected",
     status: "connected",
-    last_error: null,
+    error: null,
     relay_packets_sent: 0,
     relay_packets_recv: 0,
     relay_bytes_sent: 0,
@@ -320,7 +320,7 @@ function diag(over: Partial<TransportDiagnostics> = {}): TransportDiagnostics {
 function diagOffline(): TransportDiagnostics {
   return {
     mode: "cloud_relay",
-    remote_endpoint: null,
+    endpoint: null,
     local_addr: null,
     packets_sent: 0,
     packets_recv: 0,
@@ -330,7 +330,7 @@ function diagOffline(): TransportDiagnostics {
     rtt_ms: null,
     ice_state: null,
     status: "offline",
-    last_error: "failed to resolve VPS relay address for relay.verio.internal",
+    error: "failed to resolve VPS relay address for relay.verio.internal",
     relay_packets_sent: 0,
     relay_packets_recv: 0,
     relay_bytes_sent: 0,
@@ -491,7 +491,7 @@ export const SCENARIOS: Scenario[] = [
         peers: [],
         diagnostics: diag({
           mode: "auto",
-          remote_endpoint: null,
+          endpoint: null,
           ice_state: "checking",
           status: "connecting",
           rtt_ms: null,
@@ -782,7 +782,7 @@ export const SCENARIOS: Scenario[] = [
         peers: roster(4, { 0: { speaking: true } }),
         diagnostics: diag({
           mode: "cloud_relay",
-          remote_endpoint: null,
+          endpoint: null,
           local_addr: "192.168.1.24:51844",
           rtt_ms: null,
           last_recv_ms_ago: null,
@@ -851,7 +851,7 @@ export const SCENARIOS: Scenario[] = [
           peer(1, { name: "Bartholomew" }),
         ],
         diagnostics: diag({
-          remote_endpoint: "2606:4700:4700::1111:51844",
+          endpoint: "2606:4700:4700::1111:51844",
           local_addr: "fe80::a4b2:c3d4:e5f6:7890%12:51844",
         }),
       }),

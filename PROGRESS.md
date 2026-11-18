@@ -5452,3 +5452,44 @@ Verified (real command output):
   - Windows client: `target\release\verio.exe` (20,603,392 bytes)
   - Windows server: `target\release\verio-server.exe` (1,857,024 bytes)
   - Linux musl server: `target\x86_64-unknown-linux-musl\release\verio-server` (2,844,464 bytes)
+
+### Session 32A & 32B (2026-11-18) — Room `1111` Lockout Remediation, Audio/DSP Hardening, MusicBot/Hotkey Fixes & VPS Deploy
+
+Goal:
+1. Resolve Room `1111` lockout, server/signaling ghosts, lobby packet leaks, and room state sync bugs without touching STUN envelope framing or two-tier SQLite identity (`user_id` vs `session_id`).
+2. Remediate audio/DSP callback/decoder/pipeline edge cases, MusicBot startup/teardown/single-stop races, game-proof hotkey poller edges, UTF-8 settings truncation, frontend event/diagnostics mismatches, and deploy the updated Linux `verio-server` binary to `89.116.72.30`.
+
+Work done:
+1. **Room `1111` & Signaling/Transport Sync (Session 32A)** (`crates/verio-server/src/main.rs`, `crates/verio-discovery/src/vps.rs`, `crates/verio-transport/src/lib.rs`, `crates/verio-app/src/room.rs`):
+   - Assigned monotonic `conn_id` per WebSocket session and pruned closed senders (`is_closed`) so stale disconnections cannot evict newer sessions or ghost-block `"1111"`, plus activated periodic `SharedRelayHub::prune_stale` sweeps.
+   - Added read timeout handling on WebSocket/TLS streams (`Plain` and `NativeTls`), clean join behavior when `"1111"` is empty, and `PeerHandle::try_send_control` for propagating closed transport channels in `RoomManager::send_chat`.
+2. **Audio/DSP & Pipeline Hardening** (`crates/verio-audio/src/streams.rs`, `crates/verio-dsp/src/music.rs`, `crates/verio-app/src/pipeline.rs`):
+   - Added dedicated `SampleFormat::U16` output branch (`f32_to_u16`, silence `32768`) and bounded `fill_output_chunks` (`OUTPUT_CHUNK_LEN = 8192`) for `F32`/`I16`/`U16` output callbacks.
+   - Updated `MusicDecoder::decode_more` to reallocate `sample_buf` when packet capacity grows and persist lazily created `LinearResampler` + `sample_rate`.
+   - Added `StartupRollback` cleanup on `pipeline::start` errors, multichannel remainder preservation in `InputConverter`, EOF tail zeroing in `processing_loop`, clearing `advance_to` in `MusicSource::pause`/`stop`, 4800-sample `monitor_buf` cap, and `PEER_RX_IDLE_TIMEOUT` (30 s) pruning in `rx_loop`.
+3. **MusicBot Lifecycle & Single Remote Stop Path** (`crates/verio-app/src/music_bot.rs`, `ui/src-tauri/src/lib.rs`, `ui/src/lib/use-music-bot.ts`):
+   - Added `BotStartGuard` (`bot_starting` atomic reservation) in `music_bot_start`, claimed `bot_owned(true)` before `music_bot::start` (reverting on error), checked `watcher_owns_bot` (`session_id`) inside `verio-bot-watch`, and added `cleanup_spawn_failure` on thread spawn errors in `music_bot::start`.
+   - Stopped active `MusicBot` on `disconnect_peer` and `RoomEvent::StateChanged` (`Idle | Closed`), deferred `MusicStop` in `bot_pump` so `verio-room-forwarder` enforces and notifies in one deterministic path, and guarded `useMusicBot` `playPause`/`stop` (plus pre-reserving `bot_owned` in `music_play` while connected).
+4. **Hotkeys, Settings & Frontend State** (`crates/verio-app/src/settings.rs`, `ui/src-tauri/src/lib.rs`, `ui/src/App.tsx`, `ui/src/components/verio/settings.tsx`, `ui/src/dev/mock/types.ts`, `ui/src/dev/mock/fixtures.ts`):
+   - Allowed single-key PTT with held game modifiers (`binding_matches_modifiers`), validated hotkey actions before pausing in `prepare_hotkey_capture`, seeded poller edge state (`seed_edges`) on unpause, and flushed settings on window close / exit.
+   - Updated `Settings::sanitize` to truncate `nickname`/`direct_recent` on UTF-8 char boundaries and keep `"Ctrl+Shift+Space"`.
+   - Updated `App.tsx` with `disposed` listener guards, `"audio_error"` and `"music_stop_requested"` subscriptions, `TransportDiagnostics` alignment (`endpoint`, `error`), clearing `roomCode` to `""` on `"idle"`/`"closed"`, strict `sender_user_id === selfUserIdRef.current` check, outside-updater `setUnreadChatCount(0)`, and `cancel_hotkey_capture` on Settings close/section switch.
+5. **VPS Deployment (`89.116.72.30`)**:
+   - Cross-compiled `verio-server` (`x86_64-unknown-linux-musl`, `--release`), uploaded (`SHA-256: 7d41018ffb07f46a7178333e249e3ab0090132e4fcb80afb888b612dac4763b9`, 2,923,864 bytes), replaced `/root/verio-server-linux`, and restarted inside `tmux` session `verio` with `-p 9091 -mr active` (`room=1111` initialized permanent, listening on `ws://0.0.0.0:9091/ws` and UDP `0.0.0.0:9092`).
+
+Verified (real command output):
+- `cargo clippy --workspace --all-targets -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test -p verio-audio -p verio-dsp -p verio-app -p verio-discovery -p verio-server`: Exit code 0 (100 `verio-app` unit + 4 `audio_pipeline_remediation` + 2 `room_music_peer` + 2 `verio-audio` + 10 `verio-discovery` + 33 `verio-dsp` + 11 `verio-server` = 162 passed; 0 failed)
+- `cargo test -p verio-transport --lib`: Exit code 0 (18 passed; 0 failed)
+- `cargo test -p verio --lib`: Exit code 0 (9 passed; 0 failed)
+- `cd ui; pnpm exec tsc --noEmit; pnpm test; pnpm build`: Exit code 0 (`13 passed; 0 failed` in `tests/**/*.test.ts`, Vite built cleanly)
+- Mutation testing (all reverted byte-exact and verified via `git hash-object`):
+  - `crates/verio-audio/src/streams.rs` (`chunk_cap` unchunked): `fill_output_chunks_handles_buffers_over_8192_without_panic` FAILED (`exit=101`). Restored (`f39585e852cc2028dda42676988da7dee594a409`).
+  - `crates/verio-dsp/src/music.rs` (skip persisting lazy resampler): `decoder_reallocates_small_sample_buf_and_stores_lazy_resampler` FAILED (`exit=101`). Restored (`d94fc0b761b2d8cbc6f5a7672d2803bf6b96264e`).
+  - `crates/verio-app/src/pipeline.rs` (drop `g.advance_to = None` in `pause`): `pause_and_stop_clear_pending_advance_to` FAILED (`exit=101`). Restored (`f22afbedb3b63f1791e6f750ba5497a0db89971a`).
+  - `crates/verio-app/src/settings.rs` (restore `Ctrl+Shift+Space` clear): `sanitize_truncates_utf8_on_char_boundaries_and_keeps_ctrl_shift_space` FAILED (`exit=101`). Restored (`e1790c621251240ba47b999773c2b5843878a1ba`).
+  - `crates/verio-app/src/room.rs` (`send_control` without closed-channel check): `send_chat_returns_err_and_does_not_emit_when_transport_channel_closed` FAILED (`exit=101`). Restored (`1f1f579340f52c5b8d5c4722d6471cb39087207b`).
+  - `crates/verio-app/src/music_bot.rs` (stop directly inside `bot_pump` on `MusicStop`): `bot_pump_defers_remote_music_stop_to_room_forwarder` FAILED (`exit=101`). Restored (`4565fb54dbfb45f6802255fb395ca459cdcf0931`).
+  - `ui/src-tauri/src/lib.rs` (require exact zero modifiers on single-key PTT): `single_key_ptt_tolerates_held_game_modifiers_while_strict_rejects` FAILED (`exit=101`). Restored (`4256ffd36805dbcf30d26b76c206d3cfcdd19f36`).
+- Release binary built:
+  - Linux musl server: `target\x86_64-unknown-linux-musl\release\verio-server` (2,923,864 bytes)

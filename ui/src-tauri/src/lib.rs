@@ -120,6 +120,8 @@ struct Bridge {
     /// Without this, changing the output device while hosting would silently end
     /// the host's local monitor.
     bot_monitor: std::sync::Arc<Mutex<Option<verio_app::pipeline::MonitorSink>>>,
+    /// Guards concurrent `music_bot_start` calls so two bots cannot spawn.
+    bot_starting: AtomicBool,
     /// Session 31: non-blocking hardware hotkey state.
     hotkeys: Arc<Mutex<HotkeyPollerState>>,
 }
@@ -140,6 +142,7 @@ pub struct HotkeyPollerState {
     pub deafen: Option<HotkeyBinding>,
     pub ptt: Option<HotkeyBinding>,
     pub paused: bool,
+    pub seed_edges: bool,
 }
 
 /// Session 29b: whether this client is hosting the music bot.
@@ -433,10 +436,26 @@ fn set_nickname(
     let raw = name.or(nickname).unwrap_or_default();
     let trimmed = raw.trim().to_string();
     tracing::info!(nickname = %trimmed, "updating nickname");
-    bridge.settings.update(|s| s.nickname = trimmed);
-    // Session 14: tell the room right away so the new name shows live everywhere.
-    bridge.room.lock().expect("room lock").send_hello();
+    bridge.settings.update(|s| s.nickname = trimmed.clone());
+    // Session 14 + 32A: update RoomManager's live identity and re-announce immediately.
+    bridge
+        .room
+        .lock()
+        .expect("room lock")
+        .set_local_nickname(trimmed);
     Ok(())
+}
+
+fn hotkey_binding_for_action<'a>(
+    hotkeys: &'a verio_app::settings::HotkeySettings,
+    action: &str,
+) -> Result<&'a str, String> {
+    match action {
+        "mute" => Ok(hotkeys.mute.as_str()),
+        "deafen" => Ok(hotkeys.deafen.as_str()),
+        "ptt" => Ok(hotkeys.ptt.as_str()),
+        other => Err(format!("unknown hotkey action: {other}")),
+    }
 }
 
 /// Called when the UI enters hotkey-capture mode: pauses the hotkey poller
@@ -446,22 +465,20 @@ fn prepare_hotkey_capture(
     action: String,
     bridge: State<Bridge>,
 ) -> Result<String, String> {
-    bridge.hotkeys.lock().expect("hotkeys lock").paused = true;
     let hotkeys = bridge.settings.get().hotkeys;
-    let old = match action.as_str() {
-        "mute" => hotkeys.mute,
-        "deafen" => hotkeys.deafen,
-        "ptt" => hotkeys.ptt,
-        other => return Err(format!("unknown hotkey action: {other}")),
-    };
+    // Validate action BEFORE pausing the poller so invalid input cannot wedge hotkeys.
+    let old = hotkey_binding_for_action(&hotkeys, action.as_str())?.to_string();
+    bridge.hotkeys.lock().expect("hotkeys lock").paused = true;
     tracing::info!(action = %action, binding = %old, "hotkey poller paused for capture");
     Ok(old)
 }
 
-/// Called when the user cancels hotkey capture: unpauses the poller.
+/// Called when the user cancels hotkey capture: unpauses the poller and seeds edges.
 #[tauri::command]
 fn cancel_hotkey_capture(bridge: State<Bridge>) {
-    bridge.hotkeys.lock().expect("hotkeys lock").paused = false;
+    let mut hp = bridge.hotkeys.lock().expect("hotkeys lock");
+    hp.paused = false;
+    hp.seed_edges = true;
     tracing::info!("hotkey poller unpaused");
 }
 
@@ -506,10 +523,11 @@ fn set_hotkey(
         }
     }
 
-    // Update poller bindings and unpause
+    // Update poller bindings, unpause, and seed live key edges
     {
         let mut hp = bridge.hotkeys.lock().expect("hotkeys lock");
         hp.paused = false;
+        hp.seed_edges = true;
         match field {
             "mute" => hp.mute = new_binding,
             "deafen" => hp.deafen = new_binding,
@@ -565,7 +583,22 @@ fn music_open(
 
 #[tauri::command]
 fn music_play(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
-    bridge.music.play()?;
+    let in_room = matches!(
+        bridge.room.lock().expect("room lock").state(),
+        verio_app::room::RoomState::Connected
+    );
+    if in_room {
+        // Reserve bot ownership before unpausing so the voice processing thread
+        // never leaks pre-bot music audio into the mic stream while the bot starts.
+        bridge.music.set_bot_owned(true);
+    }
+    if let Err(e) = bridge.music.play() {
+        let has_bot = bridge.bot.lock().expect("bot lock").is_some();
+        if !has_bot {
+            bridge.music.set_bot_owned(false);
+        }
+        return Err(e);
+    }
     emit_music_status(&app, &bridge);
     send_room_state(&bridge);
     Ok(())
@@ -581,6 +614,9 @@ fn music_pause(app: AppHandle, bridge: State<Bridge>) {
 #[tauri::command]
 fn music_stop(app: AppHandle, bridge: State<Bridge>) {
     bridge.music.stop();
+    if bridge.bot.lock().expect("bot lock").is_none() {
+        bridge.music.set_bot_owned(false);
+    }
     emit_music_status(&app, &bridge);
     send_room_state(&bridge);
 }
@@ -658,10 +694,51 @@ fn music_bot_state(bridge: State<Bridge>) -> BotState {
     bot_state(&bridge)
 }
 
+struct BotStartGuard<'a>(&'a AtomicBool);
+
+impl Drop for BotStartGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[must_use]
+fn session_id_matches(current_id: Option<&str>, expected_session_id: &str) -> bool {
+    current_id.is_some_and(|id| id == expected_session_id)
+}
+
+#[must_use]
+fn watcher_owns_bot(
+    current: Option<&verio_app::music_bot::MusicBot>,
+    expected_session_id: &str,
+) -> bool {
+    session_id_matches(
+        current.map(verio_app::music_bot::MusicBot::session_id),
+        expected_session_id,
+    )
+}
+
 /// Start hosting: open a second session, join the room as "Music", and route the
 /// local music bus through it.
 #[tauri::command]
 fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
+    if bridge
+        .bot_starting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Music bot is already starting.".to_string());
+    }
+    let _start_guard = BotStartGuard(&bridge.bot_starting);
+
+    // Stop any previous local bot instance before starting a new one so no
+    // duplicate bot threads remain, without rewinding active music playback.
+    let prior_bot = bridge.bot.lock().expect("bot lock").take();
+    if let Some(old) = prior_bot {
+        old.stop();
+        emit_bot_state(&app, &bridge);
+    }
+
     // Everything read from the room in one lock, so the room cannot change between
     // the checks and the start.
     let (room_code, host_user_id, host_name, existing_bot) = {
@@ -698,6 +775,10 @@ fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> 
         return Err("Press play before sending music to the room.".into());
     }
 
+    // Hand the bus over *before* spawning `music_bot::start` so the voice pipeline
+    // cannot pull chunks and mix them into mic frames during signaling/STUN setup.
+    bridge.music.set_bot_owned(true);
+
     let (events_tx, events_rx) = std::sync::mpsc::channel();
     let settings = bridge.settings.get();
     // Session 29b Force Stop: read here, at the moment the user becomes host, and
@@ -705,7 +786,7 @@ fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> 
     // and the enforcement, so the room is told exactly what will be enforced — and
     // toggling the setting later changes the *next* bot, never this one.
     let force_stop = settings.music_force_stop;
-    let bot = verio_app::music_bot::start(verio_app::music_bot::BotConfig {
+    let bot = match verio_app::music_bot::start(verio_app::music_bot::BotConfig {
         vps_addr: settings.vps_address,
         room_code,
         host_user_id,
@@ -716,12 +797,15 @@ fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> 
         tx_state: Arc::clone(&bridge.tx),
         monitor_tx: Arc::clone(&bridge.bot_monitor),
         events: events_tx,
-    })?;
+    }) {
+        Ok(bot) => bot,
+        Err(e) => {
+            bridge.music.set_bot_owned(false);
+            return Err(e);
+        }
+    };
 
-    // Hand the bus over *after* a successful start: the voice pipeline must stop
-    // pulling it, or both consumers would interleave half-chunks and double-advance
-    // the queue.
-    bridge.music.set_bot_owned(true);
+    let expected_session_id = bot.session_id().to_string();
     *bridge.bot.lock().expect("bot lock") = Some(bot);
     emit_bot_state(&app, &bridge);
 
@@ -738,36 +822,31 @@ fn music_bot_start(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> 
             // the session, so every path through the body left — clippy's
             // `never_loop` caught the `while` for claiming otherwise.
             let Ok(ev) = events_rx.recv() else {
-                // The senders are gone, so the bot's threads have already ended. The
-                // only path that ends them without an event is a Stop this client
-                // asked for, and that has already cleared the slot and handed the
-                // music bus back — so there is nothing to do.
-                //
-                // Deliberately *not* clearing `bot_owned` here: if the user had
-                // started a new bot in the meantime, this stale watcher would take
-                // the bus away from it.
                 tracing::debug!("music bot: watcher exiting with no event");
                 return;
             };
             let verio_app::music_bot::BotEvent::Stopped { reason } = ev;
-            let taken = bot_slot.lock().expect("bot lock").take();
+            let taken = {
+                let mut guard = bot_slot.lock().expect("bot lock");
+                if watcher_owns_bot(guard.as_ref(), &expected_session_id) {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
             if let Some(bot) = taken {
                 bot.stop();
-                // Session 29c fix: the player is stopped with the session, for the
-                // same reason as in `stop_bot`. A bot that ended on its own — a
-                // remote stop, a dropped relay, the queue running out — released the
-                // bus while the player was still `playing`, and the voice pipeline
-                // took it back and mixed the track into the outgoing voice frame.
-                // The tile left the room; the music did not stop.
+                // Session 29c fix: the player is stopped with the session so the
+                // voice pipeline does not pick up playing audio when the bus returns.
                 music.stop();
+                music.set_bot_owned(false);
+                let bridge = tauri::Manager::state::<Bridge>(&watcher_app);
+                emit_bot_state(&watcher_app, &bridge);
+                let _ = watcher_app.emit(
+                    "music_bot_ended",
+                    serde_json::json!({ "reason": reason }),
+                );
             }
-            music.set_bot_owned(false);
-            let bridge = tauri::Manager::state::<Bridge>(&watcher_app);
-            emit_bot_state(&watcher_app, &bridge);
-            let _ = watcher_app.emit(
-                "music_bot_ended",
-                serde_json::json!({ "reason": reason }),
-            );
         });
     if let Err(e) = spawned {
         tracing::error!("spawn music bot watcher failed: {e}");
@@ -1113,8 +1192,10 @@ fn leave_room(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
     // disconnects, the bot session dies with them". Stopping it here rather than
     // letting it notice means the room returns to IDLE before we have even finished
     // leaving, so nobody is left looking at a Music tile for a host who has gone.
+    // Session 32A: wait briefly for signaling/roster threads to send Leave and close
+    // the WebSocket before a subsequent rejoin can race ahead.
     stop_bot(&app, &bridge);
-    bridge.room.lock().expect("room lock").disconnect();
+    RoomManager::disconnect_and_wait(&bridge.room);
     Ok(())
 }
 
@@ -1208,8 +1289,9 @@ async fn complete_invite(blob: String, bridge: State<'_, Bridge>) -> Result<(), 
 }
 
 #[tauri::command]
-fn disconnect_peer(bridge: State<Bridge>) -> Result<(), String> {
-    bridge.room.lock().expect("room lock").disconnect();
+fn disconnect_peer(app: AppHandle, bridge: State<Bridge>) -> Result<(), String> {
+    stop_bot(&app, &bridge);
+    RoomManager::disconnect_and_wait(&bridge.room);
     Ok(())
 }
 
@@ -1623,6 +1705,7 @@ pub fn run() {
                 // Session 29b: IDLE until somebody presses play for the room.
                 bot: std::sync::Arc::new(Mutex::new(None)),
                 bot_monitor: std::sync::Arc::new(Mutex::new(None)),
+                bot_starting: AtomicBool::new(false),
                 hotkeys: Arc::clone(&hotkey_state),
             };
 
@@ -1677,6 +1760,14 @@ pub fn run() {
                         while let Ok(ev) = room_rx.recv() {
                             match ev {
                                 RoomEvent::StateChanged { state } => {
+                                    if matches!(
+                                        state,
+                                        verio_app::room::RoomState::Idle
+                                            | verio_app::room::RoomState::Closed
+                                    ) {
+                                        let bridge = tauri::Manager::state::<Bridge>(&fwd_app);
+                                        stop_bot(&fwd_app, &bridge);
+                                    }
                                     let _ = fwd_app.emit("room_state", state);
                                 }
                                 RoomEvent::RoomCreated { code } => {
@@ -1782,38 +1873,23 @@ pub fn run() {
                                     );
                                 }
                                 RoomEvent::MusicStopRequested { by } => {
-                                    // Session 29b: the room only carries the
-                                    // request; the client that owns the bot acts on
-                                    // it, so `acted` is what the UI keys the toast
-                                    // off — a listener who is not hosting must not
-                                    // be told that somebody stopped *their* music.
-                                    //
-                                    // Session 29b Force Stop: `acted` now means the
-                                    // stop actually *happened*, not merely that we
-                                    // own a bot. The bot is the authority on whether
-                                    // it accepts one — its own control pump refuses
-                                    // the same request — and asking it, rather than
-                                    // re-reading the setting, is what stops the two
-                                    // from disagreeing about whether the music
-                                    // stopped. The guard is dropped before
-                                    // `stop_bot`, which takes the same lock.
+                                    // Single deterministic path for remote `MusicStop`:
+                                    // `bot_pump` defers to the voice room forwarder so
+                                    // enforcement and host toast notification (`acted`)
+                                    // never race between the two sockets.
                                     let bridge = tauri::Manager::state::<Bridge>(&fwd_app);
-                                    let (hosts, willing) = {
+                                    let (hosts, force_stop) = {
                                         let guard = bridge.bot.lock().expect("bot lock");
                                         match guard.as_ref() {
                                             Some(bot) => (true, bot.accepts_remote_stop()),
                                             None => (false, false),
                                         }
                                     };
-                                    if hosts && willing {
+                                    let acted = hosts
+                                        && !verio_app::music_bot::remote_stop_is_refused(force_stop);
+                                    if acted {
                                         stop_bot(&fwd_app, &bridge);
                                     } else if hosts {
-                                        // We host it and we refused. Worth a line:
-                                        // the requester was shown no Stop control, so
-                                        // a frame arriving anyway is either a peer
-                                        // ignoring its own UI or one that never had
-                                        // it — and either is a thing to be able to
-                                        // see in a log rather than infer.
                                         tracing::info!(
                                             by = %by,
                                             "music bot: refusing a remote stop — Force Stop is off"
@@ -1823,7 +1899,7 @@ pub fn run() {
                                         "music_stop_requested",
                                         serde_json::json!({
                                             "by": by,
-                                            "acted": hosts && willing,
+                                            "acted": acted,
                                         }),
                                     );
                                 }
@@ -1899,9 +1975,26 @@ pub fn run() {
 
             Ok(())
         })
-
-        .run(tauri::generate_context!())
-        .expect("Verio failed to start");
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                tauri::Manager::state::<Bridge>(window.app_handle())
+                    .settings
+                    .flush();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("Verio failed to build")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                tauri::Manager::state::<Bridge>(app).settings.flush();
+            }
+        });
 }
 
 /// Drain pipeline events → UI events. Runs on its own (non-audio) thread.
@@ -2236,27 +2329,44 @@ fn is_key_down(vk: i32) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModifierState {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    win: bool,
+}
+
+#[must_use]
+fn binding_matches_modifiers(
+    binding: &HotkeyBinding,
+    key_down: bool,
+    strict_modifiers: bool,
+    held: ModifierState,
+) -> bool {
+    if !key_down {
+        return false;
+    }
+    let has_mods = binding.ctrl || binding.shift || binding.alt || binding.win;
+    if !strict_modifiers && !has_mods {
+        // Single-key PTT must remain active while holding Shift/Ctrl/etc. in games.
+        return true;
+    }
+    binding.ctrl == held.ctrl
+        && binding.shift == held.shift
+        && binding.alt == held.alt
+        && binding.win == held.win
+}
+
 #[cfg(windows)]
-fn check_binding_down(binding: &HotkeyBinding) -> bool {
-    let ctrl_down = is_key_down(VK_CONTROL);
-    let shift_down = is_key_down(VK_SHIFT);
-    let alt_down = is_key_down(VK_MENU);
-    let win_down = is_key_down(VK_LWIN) || is_key_down(VK_RWIN);
-
-    if binding.ctrl != ctrl_down {
-        return false;
-    }
-    if binding.shift != shift_down {
-        return false;
-    }
-    if binding.alt != alt_down {
-        return false;
-    }
-    if binding.win != win_down {
-        return false;
-    }
-
-    is_key_down(binding.vk)
+fn check_binding_down(binding: &HotkeyBinding, strict_modifiers: bool) -> bool {
+    let held = ModifierState {
+        ctrl: is_key_down(VK_CONTROL),
+        shift: is_key_down(VK_SHIFT),
+        alt: is_key_down(VK_MENU),
+        win: is_key_down(VK_LWIN) || is_key_down(VK_RWIN),
+    };
+    binding_matches_modifiers(binding, is_key_down(binding.vk), strict_modifiers, held)
 }
 
 #[cfg(windows)]
@@ -2275,13 +2385,15 @@ fn spawn_hotkey_poller(
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
 
-                let (mute_b, deafen_b, ptt_b, paused) = {
-                    let guard = state.lock().expect("hotkey poller lock");
+                let (mute_b, deafen_b, ptt_b, paused, seed_edges) = {
+                    let mut guard = state.lock().expect("hotkey poller lock");
+                    let seed = std::mem::take(&mut guard.seed_edges);
                     (
                         guard.mute.clone(),
                         guard.deafen.clone(),
                         guard.ptt.clone(),
                         guard.paused,
+                        seed,
                     )
                 };
 
@@ -2298,22 +2410,33 @@ fn spawn_hotkey_poller(
                     continue;
                 }
 
+                // Check live key states (single-key PTT ignores held game modifiers)
+                let mute_down = mute_b.as_ref().is_some_and(|b| check_binding_down(b, true));
+                let deafen_down = deafen_b
+                    .as_ref()
+                    .is_some_and(|b| check_binding_down(b, true));
+                let ptt_down = ptt_b.as_ref().is_some_and(|b| check_binding_down(b, false));
+
+                if seed_edges {
+                    prev_mute = mute_down;
+                    prev_deafen = deafen_down;
+                    prev_ptt = ptt_down;
+                    continue;
+                }
+
                 // Check Mute (rising edge)
-                let mute_down = mute_b.as_ref().is_some_and(check_binding_down);
                 if mute_down && !prev_mute {
                     handle_shortcut_event(&app, HotkeyAction::Mute, ShortcutState::Pressed);
                 }
                 prev_mute = mute_down;
 
                 // Check Deafen (rising edge)
-                let deafen_down = deafen_b.as_ref().is_some_and(check_binding_down);
                 if deafen_down && !prev_deafen {
                     handle_shortcut_event(&app, HotkeyAction::Deafen, ShortcutState::Pressed);
                 }
                 prev_deafen = deafen_down;
 
                 // Check PTT (level transition)
-                let ptt_down = ptt_b.as_ref().is_some_and(check_binding_down);
                 if ptt_down != prev_ptt {
                     prev_ptt = ptt_down;
                     bridge_tx.set_ptt_held(ptt_down);
@@ -2363,6 +2486,7 @@ fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
         hp.deafen = deafen;
         hp.ptt = ptt;
         hp.paused = false;
+        hp.seed_edges = true;
     }
 
     tracing::info!("hotkeys loaded into hardware poller");
@@ -2463,6 +2587,83 @@ mod tests {
     fn bare_double_plus_binding_is_rejected() {
         assert!(parse_binding("Ctrl++").is_err(), "Ctrl++ should be rejected");
         assert!(parse_binding("Ctrl+NumpadAdd").is_ok());
+    }
+
+    #[test]
+    fn single_key_ptt_tolerates_held_game_modifiers_while_strict_rejects() {
+        let bare = HotkeyBinding {
+            vk: 0x56,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+        let shift_held = ModifierState {
+            ctrl: false,
+            shift: true,
+            alt: false,
+            win: false,
+        };
+        let all_held = ModifierState {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            win: true,
+        };
+        let none_held = ModifierState {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+
+        // Single-key PTT (`V`): no required modifiers, non-strict check.
+        assert!(binding_matches_modifiers(&bare, true, false, shift_held));
+        assert!(binding_matches_modifiers(&bare, true, false, all_held));
+        assert!(!binding_matches_modifiers(&bare, false, false, all_held));
+
+        // Strict modifier hotkey (e.g., Mute `M` or `Ctrl+Shift+M`): extra Shift fails.
+        assert!(!binding_matches_modifiers(&bare, true, true, shift_held));
+        assert!(binding_matches_modifiers(&bare, true, true, none_held));
+
+        // Modifier-bound PTT (`Ctrl+V`): still checks exact modifiers even with !strict.
+        let ctrl_v = HotkeyBinding {
+            vk: 0x56,
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+        let ctrl_only = ModifierState {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+        assert!(!binding_matches_modifiers(&ctrl_v, true, false, shift_held));
+        assert!(!binding_matches_modifiers(&ctrl_v, true, false, all_held));
+        assert!(binding_matches_modifiers(&ctrl_v, true, false, ctrl_only));
+    }
+
+    #[test]
+    fn watcher_owns_bot_only_matches_exact_session_id() {
+        assert!(!watcher_owns_bot(None, "sess-1"));
+        assert!(session_id_matches(Some("sess-1"), "sess-1"));
+        assert!(!session_id_matches(Some("sess-2"), "sess-1"));
+        assert!(!session_id_matches(None, "sess-1"));
+    }
+
+    #[test]
+    fn hotkey_binding_for_action_validates_before_pausing() {
+        let hk = verio_app::settings::HotkeySettings {
+            mute: "Ctrl+M".into(),
+            deafen: "Ctrl+D".into(),
+            ptt: "V".into(),
+        };
+        assert_eq!(hotkey_binding_for_action(&hk, "mute").unwrap(), "Ctrl+M");
+        assert_eq!(hotkey_binding_for_action(&hk, "deafen").unwrap(), "Ctrl+D");
+        assert_eq!(hotkey_binding_for_action(&hk, "ptt").unwrap(), "V");
+        assert!(hotkey_binding_for_action(&hk, "invalid").is_err());
     }
 }
 
