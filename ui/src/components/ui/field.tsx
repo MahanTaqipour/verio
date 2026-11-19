@@ -67,7 +67,7 @@ export function Field({
         {message && (
           <p
             id={messageId}
-            className={cn("text-13", error ? "text-danger" : "text-text-faint")}
+            className={cn("text-13", error ? "text-[#fca5a5]" : "text-text-faint")}
           >
             {message}
           </p>

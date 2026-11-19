@@ -49,7 +49,9 @@ export interface MockHarnessProps {
 }
 
 export function MockHarness({ transport }: MockHarnessProps) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(
+    () => new URLSearchParams(window.location.search).get("panel") === "1",
+  );
   const [, force] = useReducer((n: number) => n + 1, 0);
 
   // Refresh the command log / counters a few times a second.
@@ -78,8 +80,8 @@ export function MockHarness({ transport }: MockHarnessProps) {
         style={{
           ...btn,
           position: "fixed",
-          right: 10,
-          bottom: 10,
+          left: 248,
+          top: 23,
           zIndex: 2147483000,
           background: C.accent,
           color: "#171412",
@@ -95,8 +97,8 @@ export function MockHarness({ transport }: MockHarnessProps) {
     <div
       style={{
         position: "fixed",
-        right: 10,
-        bottom: 10,
+        left: 96,
+        top: 66,
         width: 320,
         maxHeight: "82vh",
         overflowY: "auto",

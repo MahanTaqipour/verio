@@ -1,22 +1,10 @@
 /**
- * MusicPanel — the music player surface.
+ * MusicPanel — spacious 2-column horizontal widescreen Music Studio:
+ *   - Left column (lg:col-span-5): Now Playing rounded glass island
+ *   - Right column (lg:col-span-7): Playlist Queue rounded glass island
  *
- * Presentation only. All state and command calls live in `useMusic`, so this file
- * can be replaced without touching behaviour.
- *
- * Two behaviour details carried over deliberately from the pre-redesign version:
- *
- *   - **The seek bar drafts, then commits.** `onChange` only moves the handle;
- *     the seek is sent on pointer-up or on a keyboard commit. Seeking on every
- *     `change` during a drag would issue a decoder seek per pixel.
- *   - **The filename is shown under the title.** The old markup put this in a
- *     class called `track-artist`, which was a misnomer — the backend reports no
- *     artist, only a path. It is labelled as a file here rather than dressed up
- *     as metadata the app does not have.
- *
- * The queue shows the queue's real shape: `queue_index` from the backend marks
- * the loaded entry. There is no artwork, no artist and no "shuffle" — the backend
- * has none of those, and inventing them would be a fake feature.
+ * Strictly preserves Session 29b/29c playback/bot/force-stop behavior and
+ * commit-on-pointer-up seek semantics.
  */
 
 import { Button, IconButton } from "@/components/ui/button";
@@ -24,7 +12,11 @@ import { SectionLabel } from "@/components/ui/field";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { EmptyState } from "@/components/verio/empty-state";
-import { StateChip, TONE_DOT, type ChipTone } from "@/components/verio/state-chip";
+import {
+  StateChip,
+  TONE_DOT,
+  type ChipTone,
+} from "@/components/verio/state-chip";
 import { Panel } from "@/components/ui/surface";
 import {
   IconChevronDown,
@@ -41,7 +33,6 @@ import {
   IconStop,
   IconTrash,
   IconVolume,
-  IconX,
 } from "@/components/verio/icons";
 import { cn } from "@/lib/utils";
 import {
@@ -53,63 +44,19 @@ import type { MusicBotController } from "@/lib/use-music-bot";
 
 export interface MusicPanelProps {
   music: MusicController;
-  /**
-   * Session 29b: the bot's state, and the Play/Stop policy that goes with it.
-   *
-   * The transport buttons below call *this* rather than `music` directly, because
-   * in a room pressing Play is not one action but two in sequence — start the
-   * player, then open the bot session that streams it. Outside a room it delegates
-   * straight back to `music`, so the panel needs no room awareness of its own.
-   */
   bot: MusicBotController;
-  /** True when this client is deafened — the local monitor is silenced. */
   deafened: boolean;
-  /**
-   * Session 29b Force Stop: this user's stored preference.
-   *
-   * Drives the toggle, and nothing else. It is applied when this user *becomes*
-   * host, so it says nothing about the music playing right now — which is why the
-   * listener's control below reads a different value.
-   */
   forceStop: boolean;
-  /** True when a music bot is in the room, whoever owns it. */
   botPresent: boolean;
-  /**
-   * Session 29b Force Stop: what the bot in this room announced it will accept.
-   *
-   * The only thing that may decide whether a Stop control is *enabled*. Taken from
-   * the wire rather than from `forceStop`, because the host may be somebody else
-   * entirely and their decision is the one that applies.
-   */
   botAcceptsRemoteStop: boolean;
-  /** True while this client is in a room. */
   inCall: boolean;
-  /**
-   * Session 29c: the track the room's music peer is playing.
-   *
-   * Read from the bot peer's `music_title`, which the bot announces over the
-   * control channel on every track change and every 3 s. Empty until that first
-   * announcement lands, and empty when the bot has nothing loaded.
-   */
   roomMusicTitle: string;
-  /**
-   * Session 29c: the person hosting the room's music.
-   *
-   * Deliberately not the bot's own name — that is always "Music", which says
-   * nothing about whose music it is. This is the *voice* peer that shares the
-   * bot's persistent id, the same link the Host badge is placed by. Empty while
-   * that peer is unknown, which the panel renders as "somebody else's music"
-   * rather than guessing a name.
-   */
   roomMusicHost: string;
   onSetForceStop: (on: boolean) => void;
-  /** Ask the room's host to stop. Whether it is honoured is theirs to decide. */
   onRequestMusicStop: () => void;
-  onClose: () => void;
   className?: string;
 }
 
-/** Playback state as one chip. `active` already means "loaded and playing". */
 function statusChip(music: MusicController): { tone: ChipTone; label: string } {
   if (music.status?.active) return { tone: "accent", label: "Sending to room" };
   if (music.hasTrack) return { tone: "idle", label: "Paused" };
@@ -128,7 +75,6 @@ export function MusicPanel({
   roomMusicHost,
   onSetForceStop,
   onRequestMusicStop,
-  onClose,
   className,
 }: MusicPanelProps) {
   const { status, queue, hasTrack } = music;
@@ -136,157 +82,156 @@ export function MusicPanel({
   const hosting = bot.state.hosting;
   const durationMs = music.durationMs;
   const seekMax = Math.max(1, Math.round(durationMs));
-
-  /**
-   * Session 29c: somebody else is hosting the music in this room.
-   *
-   * All three conditions are load-bearing. `inCall` because a bot only exists in
-   * a room; `!hosting` because when *we* host, this panel is describing our own
-   * player and the Hosting chip already says so; `botPresent` because a listener
-   * with no bot in the room has nothing to report but their own player.
-   */
   const remoteMusic = inCall && !hosting && botPresent;
 
-  /**
-   * The line a listener reads instead of "No track loaded".
-   *
-   * Built only from what the room actually told us, rather than padded with
-   * placeholders: with no title yet it reads "Room music", and while the host's
-   * voice peer is unknown the clause is dropped rather than filled with a guess.
-   * Both are transient — the bot re-announces every 3 s.
-   */
   const roomLine =
     "Room music" +
     (roomMusicTitle ? `: ${roomMusicTitle}` : "") +
     (roomMusicHost ? ` — hosted by ${roomMusicHost}` : "");
 
-  /** Send the seek for a raw slider value. No-op when nothing is loaded. */
   const commitSeek = (raw: number) => {
     void music.seekTo(raw / seekMax);
   };
 
   return (
-    // Panel, not a hand-rolled `<section class="rounded-md border border-border
-    // bg-surface p-4">`. That string WAS the Panel default, spelled out — the
-    // Phase 4 rebuild re-implemented a Phase 3 atom. `role="region"` keeps the
-    // labelled landmark that `<section aria-label>` gave implicitly.
-    <Panel
-      role="region"
-      aria-label="Music player"
-      // Session 29d: the panel lifts into place instead of snapping open.
-      className={cn("animate-lift flex flex-col gap-4", className)}
-    >
-      <header className="flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <IconMusic size={16} className="shrink-0 text-text-dim" />
-          <h2 className="truncate text-14 font-medium text-text">
-            {status?.active ? "Now playing" : "Music"}
-          </h2>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {/* Session 29b: hosting is a separate fact from playback state — the bot
-              session outlives a pause — so it gets its own chip rather than
-              overloading the one that reports what the player is doing. The two
-              disagree on purpose when the music is paused. */}
-          {hosting && (
-            <StateChip
-              tone="idle"
-              title="You are hosting the music for this room. Stop ends it for everyone."
-            >
-              Hosting
-            </StateChip>
-          )}
-          {/* Session 29c: omitted while somebody else hosts, and that is the point
-              rather than an oversight. This chip reports *this client's* player —
-              "Sending to room" / "Paused" / "Idle" — and none of those three is
-              true of somebody else's music. Leaving it in place is precisely how
-              the panel came to read "Idle" while the room was plainly playing. */}
-          {!remoteMusic && (
-            <StateChip
-              tone={chip.tone}
-              leading={
-                <span className={cn("size-1.5 rounded-full", TONE_DOT[chip.tone])} />
-              }
-            >
-              {chip.label}
-            </StateChip>
-          )}
-          <IconButton label="Collapse music player panel" size="sm" onClick={onClose}>
-            <IconX size={14} />
-          </IconButton>
-        </div>
-      </header>
-
-      {/* Track identity */}
-      {remoteMusic ? (
-        // Session 29c: the room's music, not ours. The track is the bot's own
-        // announcement; the host is the voice peer sharing its persistent id.
-        // The second line is not decoration — the volume slider below stays
-        // enabled because it is *this client's* player volume, and without this
-        // line a reader would take it for the room's music volume, which is the
-        // per-peer slider on the Music card.
-        <div className="flex min-w-0 flex-col gap-1">
-          <span className="truncate text-13 text-text" title={roomLine}>
-            {roomLine}
-          </span>
-          <span className="text-11 text-text-faint">
-            Volume and mute for this music are on the Music card in the room.
-          </span>
-        </div>
-      ) : (
-        <div className="flex min-w-0 flex-col gap-1">
-          {status?.title ? (
-            <>
-              <span className="truncate text-13 text-text">{status.title}</span>
-              <span className="flex min-w-0 items-center gap-1.5 text-11 text-text-faint">
-                <IconFileAudio size={14} className="shrink-0" />
-                <span className="truncate">{fileNameOf(status.path)}</span>
-              </span>
-            </>
-          ) : (
-            <span className="text-13 text-text-faint">No track loaded</span>
-          )}
-        </div>
+    <section
+      aria-label="Music studio"
+      className={cn(
+        "animate-lift mx-auto my-auto grid w-full max-w-[1080px] grid-cols-1 gap-5 lg:grid-cols-12",
+        className,
       )}
+    >
+      {/* Left Column: Now Playing Glass Card */}
+      <Panel
+        glass
+        padding="none"
+        className="flex min-w-0 flex-col justify-between gap-5 rounded-[22px] p-6 lg:col-span-5"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <IconMusic
+              size={16}
+              className={cn(
+                "shrink-0",
+                status?.playing || remoteMusic ? "text-accent" : "text-lavender",
+              )}
+            />
+            <h2 className="truncate text-15 font-semibold text-text">
+              {status?.active || remoteMusic ? "Now Playing" : "Music Player"}
+            </h2>
+          </div>
 
-      {/* Seek */}
-      <div className="flex items-center gap-3">
-        <Slider
-          className="min-w-0 flex-1"
-          min={0}
-          max={seekMax}
-          value={Math.round(music.positionMs)}
-          fillPercent={music.percent}
-          disabled={durationMs <= 0}
-          aria-label="Track playback position"
-          valueText={`${formatTime(music.positionMs)} of ${formatTime(durationMs)}`}
-          onChange={(e) => music.setSeekDraft(Number(e.currentTarget.value))}
-          onPointerUp={(e) => commitSeek(Number(e.currentTarget.value))}
-          onKeyUp={(e) => {
-            // Only commit on keys that actually move the handle; otherwise Tab
-            // and modifiers would fire a seek.
-            if (e.key.startsWith("Arrow") || e.key === "Home" || e.key === "End") {
-              commitSeek(Number(e.currentTarget.value));
-            }
-          }}
-        />
-        <span className="mono-num shrink-0 text-11 text-text-dim">
-          {formatTime(music.positionMs)} / {formatTime(durationMs)}
-        </span>
-      </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {hosting && (
+              <StateChip
+                tone="idle"
+                title="You are hosting the music for this room. Stop ends it for everyone."
+              >
+                Hosting
+              </StateChip>
+            )}
+            {!remoteMusic && (
+              <StateChip
+                tone={chip.tone}
+                leading={
+                  <span className={cn("size-1.5 rounded-full", TONE_DOT[chip.tone])} />
+                }
+              >
+                {chip.label}
+              </StateChip>
+            )}
+          </div>
+        </div>
 
-      {/* Transport */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        {/* Session 29c: every control in this cluster drives *this client's*
-            player, so while somebody else hosts the room's music they are all
-            disabled rather than left looking effective. The volume slider on the
-            right is deliberately NOT disabled: it is this client's own player
-            volume — a stored preference of theirs, like Force Stop — whereas the
-            room's loudness is the per-peer slider on the Music card, which the
-            line above the transport says. */}
-        <div className="flex items-center gap-1">
+        {/* Rounded Visualizer / Cover Well */}
+        <div className="flex items-center gap-4 rounded-2xl border border-border bg-[var(--bg-input)] p-4">
+          <div
+            className={cn(
+              "grid size-14 shrink-0 place-items-center rounded-2xl border transition-colors",
+              status?.playing || remoteMusic
+                ? "border-accent/45 bg-accent/14 text-accent shadow-[0_0_20px_rgba(232,255,58,0.16)]"
+                : "border-border-2 bg-surface-2/80 text-lavender",
+            )}
+          >
+            <IconMusic size={20} />
+          </div>
+
+          {remoteMusic ? (
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <span
+                className="truncate text-14 font-semibold text-text"
+                title={roomLine}
+              >
+                {roomMusicTitle || "Room music active"}
+              </span>
+              <span className="truncate text-13 text-lavender">
+                {roomMusicHost ? `Hosted by ${roomMusicHost}` : "Hosted by a squadmate"}
+              </span>
+              <span className="text-11 text-text-faint">
+                Adjust loudness using the Music card in the room.
+              </span>
+            </div>
+          ) : (
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              {status?.title ? (
+                <>
+                  <span
+                    className="truncate text-14 font-semibold text-text"
+                    title={status.title}
+                  >
+                    {status.title}
+                  </span>
+                  <span className="flex min-w-0 items-center gap-1.5 text-11 text-text-dim">
+                    <IconFileAudio size={14} className="shrink-0 text-lavender" />
+                    <span className="truncate font-mono">
+                      {fileNameOf(status.path)}
+                    </span>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="text-14 font-medium text-text">No track loaded</span>
+                  <span className="text-11 text-text-dim">
+                    Add audio files on the right to start playing.
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Seek Bar */}
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-3">
+            <Slider
+              className="min-w-0 flex-1"
+              min={0}
+              max={seekMax}
+              value={Math.round(music.positionMs)}
+              fillPercent={music.percent}
+              disabled={durationMs <= 0}
+              aria-label="Track playback position"
+              valueText={`${formatTime(music.positionMs)} of ${formatTime(durationMs)}`}
+              onChange={(e) => music.setSeekDraft(Number(e.currentTarget.value))}
+              onPointerUp={(e) => commitSeek(Number(e.currentTarget.value))}
+              onKeyUp={(e) => {
+                if (e.key.startsWith("Arrow") || e.key === "Home" || e.key === "End") {
+                  commitSeek(Number(e.currentTarget.value));
+                }
+              }}
+            />
+          </div>
+          <div className="flex items-center justify-between font-mono text-11 mono-num text-text-dim">
+            <span>{formatTime(music.positionMs)}</span>
+            <span>{formatTime(durationMs)}</span>
+          </div>
+        </div>
+
+        {/* Rounded Transport Row */}
+        <div className="flex items-center justify-center gap-2">
           <IconButton
             label="Previous track"
+            size="md"
             onClick={() => void music.prev()}
             disabled={remoteMusic || queue.length === 0}
           >
@@ -294,28 +239,17 @@ export function MusicPanel({
           </IconButton>
           <IconButton
             label={status?.playing ? "Pause track" : "Play track"}
-            variant="secondary"
+            variant={hasTrack && !remoteMusic ? "primary" : "secondary"}
             size="lg"
-            // Session 29b: not `music.playPause()`. In a room, starting playback is
-            // also what opens the bot session — and the room gets to refuse first,
-            // so a listener who presses Play is told the music is already playing
-            // instead of quietly broadcasting through the pre-29b voice path.
+            className="size-12 rounded-2xl"
             onClick={() => void bot.playPause()}
             disabled={remoteMusic || !hasTrack}
           >
-            {status?.playing ? <IconPause size={16} /> : <IconPlay size={16} />}
+            {status?.playing ? <IconPause size={20} /> : <IconPlay size={20} />}
           </IconButton>
           <IconButton
-            // One stable name, deliberately. The first version of this made the
-            // label depend on hosting ("Stop the music for the room"), which is
-            // true but broke every harness that drives the control by label —
-            // `verify-music.mjs` waited 30s for "Stop playback" and timed out.
-            // The scope belongs on the *state*, not on the action: the Hosting
-            // chip beside the status already says it, and says who it applies to.
             label="Stop playback"
-            // Session 29b: stops the bot session too when this client hosts it. A
-            // stopped player with a live bot would be a peer sitting in the room
-            // sending nothing.
+            size="md"
             onClick={() => void bot.stop()}
             disabled={remoteMusic || !hasTrack}
           >
@@ -323,6 +257,7 @@ export function MusicPanel({
           </IconButton>
           <IconButton
             label="Next track"
+            size="md"
             onClick={() => void music.next()}
             disabled={remoteMusic || queue.length === 0}
           >
@@ -330,8 +265,9 @@ export function MusicPanel({
           </IconButton>
           <IconButton
             label="Repeat current track"
+            size="md"
             aria-pressed={Boolean(status?.loop)}
-            className={cn(status?.loop && "text-accent")}
+            className={cn(status?.loop && "bg-accent/15 text-accent")}
             disabled={remoteMusic}
             onClick={() => void music.setTrackLoop(!status?.loop)}
           >
@@ -339,10 +275,12 @@ export function MusicPanel({
           </IconButton>
         </div>
 
-        <div className="flex min-w-0 items-center gap-2">
-          <IconVolume size={14} className="shrink-0 text-text-dim" />
+        {/* Volume */}
+        <div className="flex items-center gap-3 rounded-xl border border-border bg-[var(--bg-input)] px-3.5 py-2.5">
+          <IconVolume size={14} className="shrink-0 text-lavender" />
+          <span className="text-11 font-medium text-text-dim">Volume</span>
           <Slider
-            className="w-24"
+            className="min-w-0 flex-1"
             min={0}
             max={200}
             value={Math.round(music.volumeDraft * 100)}
@@ -351,60 +289,49 @@ export function MusicPanel({
             valueText={`${Math.round(music.volumeDraft * 100)}%`}
             onChange={(e) => music.setVolume(Number(e.currentTarget.value) / 200)}
           />
-          <span className="mono-num w-8 shrink-0 text-right text-11 text-text-dim">
+          <span className="mono-num w-10 shrink-0 text-right font-mono text-11 text-text-dim">
             {Math.round(music.volumeDraft * 100)}%
           </span>
         </div>
-      </div>
 
-      {/* Monitor + Force Stop + add */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
-          <span className="flex min-w-0 items-center gap-2">
-            <Switch
-              label="Local monitor playback"
-              checked={Boolean(status?.monitor)}
-              onChange={(e) => void music.setMonitor(e.currentTarget.checked)}
-            />
-            <span className="text-11 text-text-dim">Local monitor</span>
-            {deafened && status?.active ? (
-              <span
-                className="flex items-center gap-1.5 text-11 text-warn"
-                title="Your client is deafened; the music monitor is silenced locally. Music still reaches the room."
-              >
-                <IconHeadphones size={14} className="shrink-0" />
-                Silenced locally
-              </span>
-            ) : null}
-          </span>
-
-          {/* Session 29b Force Stop. A *setting*, not a live control, so it sits
-              with the other music preference rather than with the transport — and
-              its title says when it takes effect, because a switch that visibly
-              changes nothing while music is already playing reads as broken. */}
-          <span className="flex min-w-0 items-center gap-2">
-            <Switch
-              label="Force Stop"
-              checked={forceStop}
-              onChange={(e) => onSetForceStop(e.currentTarget.checked)}
-            />
-            <span
-              className="text-11 text-text-dim"
-              title="Let anyone in this room stop the music you are hosting. Applied the next time you start hosting, not to music already playing."
-            >
-              Force Stop
+        {/* Switches + Remote Stop */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <span className="flex items-center gap-2">
+              <Switch
+                label="Local monitor playback"
+                checked={Boolean(status?.monitor)}
+                onChange={(e) => void music.setMonitor(e.currentTarget.checked)}
+              />
+              <span className="text-13 text-text-dim">Local monitor</span>
             </span>
-          </span>
-        </div>
 
-        <div className="flex items-center gap-2">
-          {/* Session 29b Force Stop: ending somebody else's music. Shown whenever a
-              bot is in the room and it is not ours, and *disabled* rather than
-              hidden when the host forbade it — a control that disappears leaves a
-              listener unsure the feature exists, and the tooltip is where the host's
-              decision gets explained. The tooltip lives on the wrapper, because a
-              disabled Button sets `pointer-events-none` and would never show one. */}
-          {inCall && !hosting && botPresent ? (
+            <span className="flex items-center gap-2">
+              <Switch
+                label="Force Stop"
+                checked={forceStop}
+                onChange={(e) => onSetForceStop(e.currentTarget.checked)}
+              />
+              <span
+                className="text-13 text-text-dim"
+                title="Let anyone in this room stop the music you are hosting. Applied the next time you start hosting."
+              >
+                Force Stop
+              </span>
+            </span>
+          </div>
+
+          {deafened && status?.active && (
+            <span
+              className="flex items-center gap-1.5 text-11 text-warn"
+              title="Your client is deafened; local monitor is silenced while the room still hears music."
+            >
+              <IconHeadphones size={14} className="shrink-0" />
+              Silenced locally
+            </span>
+          )}
+
+          {inCall && !hosting && botPresent && (
             <span
               title={
                 botAcceptsRemoteStop
@@ -422,71 +349,83 @@ export function MusicPanel({
                 Stop for everyone
               </Button>
             </span>
-          ) : null}
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={<IconFolderOpen size={14} />}
-            onClick={() => void music.addFiles()}
-          >
-            Add files
-          </Button>
+          )}
         </div>
-      </div>
+      </Panel>
 
-      <div className="h-px w-full bg-border" />
-
-      {/* Queue */}
-      <div className="flex flex-col gap-2">
-        <div className="flex items-center justify-between gap-3">
-          <SectionLabel level={4} className="text-text-dim">
-            Queue{queue.length > 0 ? ` · ${queue.length}` : ""}
+      {/* Right Column: Playlist Queue Glass Card */}
+      <Panel
+        glass
+        padding="none"
+        className="flex min-h-[380px] max-h-[540px] min-w-0 flex-col gap-4 rounded-[22px] p-6 lg:col-span-7"
+      >
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
+          <SectionLabel level={3} className="text-lavender">
+            Playlist Queue{queue.length > 0 ? ` · ${queue.length}` : ""}
           </SectionLabel>
-          {queue.length > 0 ? (
-            <div className="flex items-center gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                aria-pressed={Boolean(status?.queue_looping)}
-                className={cn(status?.queue_looping && "text-accent")}
-                onClick={() => void music.setQueueLooping(!status?.queue_looping)}
-              >
-                Repeat queue
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => void music.clearQueue()}>
-                Clear
-              </Button>
-            </div>
-          ) : null}
+
+          <div className="flex items-center gap-2">
+            {queue.length > 0 && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-pressed={Boolean(status?.queue_looping)}
+                  className={cn(status?.queue_looping && "bg-accent/14 text-accent")}
+                  onClick={() => void music.setQueueLooping(!status?.queue_looping)}
+                >
+                  Repeat queue
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void music.clearQueue()}
+                >
+                  Clear
+                </Button>
+              </>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<IconFolderOpen size={14} />}
+              onClick={() => void music.addFiles()}
+            >
+              Add tracks
+            </Button>
+          </div>
         </div>
 
         {queue.length === 0 ? (
           <EmptyState
             title="Queue is empty"
-            description="Add audio files to build a playlist. Tracks play in order and advance on their own."
-            className="px-2 py-6"
+            description="Add MP3, FLAC, WAV, or OGG files to build a playlist for the room."
+            icon={<IconMusic size={20} />}
+            className="my-auto py-10"
           />
         ) : (
-          <ul className="flex max-h-40 flex-col overflow-y-auto">
+          <ul className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pr-1">
             {queue.map((item, i) => {
               const isCurrent = status?.queue_index === i;
               return (
                 <li
                   key={`${item.path}:${i}`}
                   className={cn(
-                    "group flex items-center gap-2 rounded-sm px-2 py-1.5",
-                    isCurrent && "bg-surface-2",
+                    "group flex items-center gap-2 rounded-xl border px-3 py-2 transition-colors",
+                    isCurrent
+                      ? "border-accent/45 bg-accent/14"
+                      : "border-transparent hover:border-border hover:bg-surface-2/60",
                   )}
                 >
                   <button
                     type="button"
                     onClick={() => void music.jumpTo(i)}
                     title={`Play ${item.title}`}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                   >
                     <span
                       className={cn(
-                        "mono-num w-5 shrink-0 text-right text-10",
+                        "mono-num w-5 shrink-0 text-right font-mono text-11",
                         isCurrent ? "text-accent" : "text-text-faint",
                       )}
                     >
@@ -495,22 +434,15 @@ export function MusicPanel({
                     <span
                       className={cn(
                         "truncate text-13",
-                        isCurrent ? "text-accent" : "text-text",
+                        isCurrent ? "font-semibold text-accent" : "text-text",
                       )}
                     >
                       {item.title}
                     </span>
-                    <span className="mono-num ml-auto shrink-0 text-10 text-text-faint">
+                    <span className="mono-num ml-auto shrink-0 font-mono text-11 text-text-faint">
                       {formatTime(item.duration_ms)}
                     </span>
                   </button>
-                  {/* Session 29c: the queue can be reordered. `music_queue_move`
-                      has existed since Session 20 and `moveItem` has been on the
-                      controller the whole time, but nothing ever called it — so
-                      the order was fixed the moment files were added. Up/down
-                      rather than drag-and-drop: the rows live in a 160px
-                      scroller, and a button is reachable by keyboard, which a
-                      drag handle is not. */}
                   <IconButton
                     label={`Move ${item.title} up`}
                     size="sm"
@@ -542,7 +474,7 @@ export function MusicPanel({
             })}
           </ul>
         )}
-      </div>
-    </Panel>
+      </Panel>
+    </section>
   );
 }

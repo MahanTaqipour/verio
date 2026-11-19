@@ -34,17 +34,17 @@ export const Switch = forwardRef<HTMLInputElement, SwitchProps>(function Switch(
         role="switch"
         checked={checked}
         aria-label={label}
-        className="peer absolute inset-0 z-10 m-0 h-full w-full cursor-pointer appearance-none rounded-sm opacity-0 disabled:cursor-not-allowed"
+        className="peer absolute inset-0 z-10 m-0 h-full w-full cursor-pointer appearance-none rounded-full opacity-0 disabled:cursor-not-allowed"
         {...rest}
       />
       {/* Track */}
       <span
         aria-hidden="true"
         className={cn(
-          "absolute inset-0 rounded-sm border transition-colors ease-verio",
-          "border-border bg-bg",
+          "absolute inset-0 rounded-full border transition-colors ease-verio",
+          "border-border bg-[var(--bg-input)]",
           "peer-hover:border-border-2",
-          "peer-checked:border-accent/50 peer-checked:bg-accent/15",
+          "peer-checked:border-accent/55 peer-checked:bg-accent/15",
           "peer-disabled:opacity-50",
         )}
       />
@@ -52,7 +52,7 @@ export const Switch = forwardRef<HTMLInputElement, SwitchProps>(function Switch(
       <span
         aria-hidden="true"
         className={cn(
-          "pointer-events-none absolute top-[2px] left-[2px] h-[12px] w-[14px] rounded-sm",
+          "pointer-events-none absolute top-[2px] left-[2px] h-[12px] w-[12px] rounded-full",
           "border border-border-2 bg-text-dim",
           "transition-[transform,background-color,border-color] ease-verio",
           "peer-checked:translate-x-[16px] peer-checked:border-accent peer-checked:bg-accent",

@@ -13,8 +13,12 @@
     "windows": [
       {
         "title": "Verio",
-        "width": 860,
-        "height": 640,
+        "width": 1280,
+        "height": 720,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "decorations": false,
+        "transparent": true,
         "resizable": true
       }
     ],

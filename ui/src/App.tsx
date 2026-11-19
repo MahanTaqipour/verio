@@ -2,16 +2,14 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
+import { AmbientGlassCanvas } from "./components/verio/ambient-shell";
 import { AppHeader } from "./components/verio/app-header";
 import { Dock } from "./components/verio/dock";
+import { LeftIconRail, type NavView } from "./components/verio/left-rail";
 import {
   useMicLevelStream,
   type LevelMeterHandle,
 } from "./components/verio/level-meter";
-import { TelemetryRow, TelemetryList } from "./components/verio/telemetry-row";
-import { IconButton } from "./components/ui/button";
-import { SectionLabel } from "./components/ui/field";
-import { IconError, IconX } from "./components/verio/icons";
 import { useMusic } from "./lib/use-music";
 import { useMusicBot } from "./lib/use-music-bot";
 import { comboFromEvent } from "./lib/hotkey";
@@ -187,8 +185,7 @@ export default function App() {
   const [selfUserId, setSelfUserId] = useState("");
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [rttMs, setRttMs] = useState<number | null>(null);
-  const [diagnostics, setDiagnostics] = useState<TransportDiagnostics | null>(null);
-  const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false);
+  const [callElapsedSec, setCallElapsedSec] = useState(0);
 
   const [settings, setSettings] = useState<Settings | null>(null);
   const [devices, setDevices] = useState<DeviceList>({ inputs: [], outputs: [] });
@@ -201,9 +198,10 @@ export default function App() {
     loopback: false,
   });
 
-  // UI inputs
+  // UI inputs & 3-tab floating island navigation
   const [joinCodeInput, setJoinCodeInput] = useState("");
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [activeView, setActiveView] = useState<NavView>("stage");
+  const [isChatOpen, setIsChatOpen] = useState(false);
   const [isEditingNickname, setIsEditingNickname] = useState(false);
   const [nicknameInput, setNicknameInput] = useState("");
   const [vpsAddressInput, setVpsAddressInput] = useState("");
@@ -211,15 +209,30 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [capturingAction, setCapturingAction] = useState<HotkeyAction | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [toastPaused, setToastPaused] = useState(false);
+
+  // Auto-dismiss non-error toast notifications after 2500 ms unless hovered/focused
+  useEffect(() => {
+    if (!statusMsg || statusMsg.isError || toastPaused) return;
+    const timer = window.setTimeout(() => {
+      setStatusMsg(null);
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [statusMsg, toastPaused]);
+
+  const isInCall = roomState === "connected" || (roomState === "connecting" && !!roomCode);
 
   // Session 31: ephemeral in-call chat
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
-  const [isChatOpen, setIsChatOpen] = useState(false);
-  const isChatOpenRef = useRef(isChatOpen);
+  const isChatVisible = activeView === "stage" && isInCall && isChatOpen;
+  const isChatVisibleRef = useRef(isChatVisible);
   useEffect(() => {
-    isChatOpenRef.current = isChatOpen;
-  }, [isChatOpen]);
+    isChatVisibleRef.current = isChatVisible;
+    if (isChatVisible) {
+      setUnreadChatCount(0);
+    }
+  }, [isChatVisible]);
 
   const selfUserIdRef = useRef(selfUserId);
   useEffect(() => {
@@ -242,8 +255,6 @@ export default function App() {
   // mapping, same direct-DOM write — only the listener registration moved out
   // of the initial-load effect so the meter owns its own lifecycle.
   useMicLevelStream(micLevelRef);
-
-  const isInCall = roomState === "connected" || (roomState === "connecting" && !!roomCode);
 
   // Initial Load
   useEffect(() => {
@@ -278,7 +289,7 @@ export default function App() {
         for (const m of snap.mutes ?? []) mutes[m.target_user_id] = m.by;
         setRoomMutes(mutes);
 
-        if (snap.diagnostics) setDiagnostics(snap.diagnostics);
+        if (snap.diagnostics?.rtt_ms != null) setRttMs(Math.round(snap.diagnostics.rtt_ms));
       })
       .catch((e) => console.error("get_room_state failed", e));
 
@@ -314,8 +325,7 @@ export default function App() {
         setPeers([]);
         setRoomMutes({});
         setRttMs(null);
-        setDiagnostics(null);
-        setIsDiagnosticsOpen(false);
+        setCallElapsedSec(0);
         setChatMessages([]);
         setUnreadChatCount(0);
         setIsChatOpen(false);
@@ -475,7 +485,7 @@ export default function App() {
         isSelf,
       };
       setChatMessages((prev) => [...prev, newMsg]);
-      if (!isChatOpenRef.current && !isSelf) {
+      if (!isChatVisibleRef.current && !isSelf) {
         setUnreadChatCount((prev) => prev + 1);
         const preview = msg.text.length > 40 ? msg.text.slice(0, 40) + "..." : msg.text;
         setStatusMsg({ text: `${msg.sender_name}: ${preview}` });
@@ -508,20 +518,16 @@ export default function App() {
     };
   }, []);
 
-  // Poll live transport diagnostics every 1000 ms while in-call
+  // Poll RTT every 1000 ms while in-call
   useEffect(() => {
     if (!isInCall) {
-      setDiagnostics(null);
       return;
     }
     const pollDiag = () => {
       invoke<TransportDiagnostics | null>("get_transport_diagnostics")
         .then((d) => {
-          if (d) {
-            setDiagnostics(d);
-            if (d.rtt_ms !== null && d.rtt_ms !== undefined) {
-              setRttMs(Math.round(d.rtt_ms));
-            }
+          if (d && d.rtt_ms !== null && d.rtt_ms !== undefined) {
+            setRttMs(Math.round(d.rtt_ms));
           }
         })
         .catch(() => {});
@@ -530,6 +536,20 @@ export default function App() {
     const interval = setInterval(pollDiag, 1000);
     return () => clearInterval(interval);
   }, [isInCall]);
+
+  // Elapsed call duration timer (1 s ticks while connected)
+  useEffect(() => {
+    if (roomState !== "connected") {
+      setCallElapsedSec(0);
+      return;
+    }
+    const startedAt = Date.now();
+    setCallElapsedSec(0);
+    const t = setInterval(() => {
+      setCallElapsedSec(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [roomState]);
 
   // -------------------------------------------------------------------------
   // Real Hotkey Recording (Captures any key combo: B, Shift+B, Ctrl+Shift+B)
@@ -656,7 +676,6 @@ export default function App() {
   const music = useMusic({
     onStatus: (text, isError) => setStatusMsg({ text, isError }),
   });
-  const [musicPanelOpen, setMusicPanelOpen] = useState(false);
 
   /**
    * Session 29b: the bot peer in this room, if there is one.
@@ -767,12 +786,48 @@ export default function App() {
     }
   };
 
+  const selectView = (next: NavView) => {
+    if (activeView === "settings" && next !== "settings" && capturingAction) {
+      void invoke("cancel_hotkey_capture").catch(console.error);
+      setCapturingAction(null);
+    }
+    setActiveView(next);
+  };
+
+  const handleJoinMainRoom = async () => {
+    if (roomState === "connecting") return;
+    if (isInCall && roomCode === "1111") {
+      selectView("stage");
+      return;
+    }
+    try {
+      if (isInCall) {
+        await invoke("leave_room");
+        setRoomCode(null);
+        setPeers([]);
+        setRoomMutes({});
+        setChatMessages([]);
+        setUnreadChatCount(0);
+        setCallElapsedSec(0);
+        setIsChatOpen(false);
+        seenChatIds.current.clear();
+      }
+      setStatusMsg({ text: "Entering Main Squad Room #1111..." });
+      await invoke("join_room", { code: "1111" });
+      setRoomCode("1111");
+      selectView("stage");
+    } catch (e: any) {
+      setStatusMsg({ text: `Could not enter #1111: ${e}`, isError: true });
+    }
+  };
+
   const handleLeaveCall = async () => {
     try {
       await invoke("leave_room");
       setRoomCode(null);
       setPeers([]);
-      setRoomState("idle");
+      setRoomMutes({});
+      setCallElapsedSec(0);
       setChatMessages([]);
       setUnreadChatCount(0);
       setIsChatOpen(false);
@@ -784,15 +839,17 @@ export default function App() {
   };
 
   const handleToggleChat = () => {
-    const next = !isChatOpenRef.current;
-    setIsChatOpen(next);
-    if (next) {
+    if (activeView !== "stage") {
+      selectView("stage");
+      setIsChatOpen(true);
       setUnreadChatCount(0);
+      return;
     }
-  };
-
-  const handleCloseChat = () => {
-    setIsChatOpen(false);
+    setIsChatOpen((v) => {
+      const next = !v;
+      if (next) setUnreadChatCount(0);
+      return next;
+    });
   };
 
   const handleSendChatMessage = async (text: string) => {
@@ -1013,53 +1070,65 @@ export default function App() {
    * Verio is cloud-relay only, so the surface was removed rather than repaired.
    */
 
+  const isMusicTabActive = activeView === "music";
+  const isLoopback = Boolean(settings?.loopback ?? audioState.loopback);
+  const busyStatusText =
+    roomState === "connecting"
+      ? roomCode === "1111"
+        ? "CONNECTING TO MAIN ROOM #1111..."
+        : roomCode
+          ? `JOINING ROOM #${roomCode}...`
+          : "CONNECTING TO ROOM..."
+      : undefined;
+
+  const musicPanelSharedProps = {
+    music,
+    bot,
+    deafened: audioState.deafened,
+    forceStop,
+    botPresent: botPeer !== undefined,
+    botAcceptsRemoteStop,
+    inCall: isInCall,
+    roomMusicTitle,
+    roomMusicHost,
+    onSetForceStop: handleSetMusicForceStop,
+    onRequestMusicStop: handleRequestMusicStop,
+  };
+
   return (
-    <div className="app-container">
-      {/*
-        Everything that sits *behind* the Settings surface.
-        `display: contents` keeps this wrapper out of the layout — its children
-        are still the flex items of .app-container, so nothing moves — while
-        giving `inert` a single node to apply to. That is what makes the
-        `aria-modal="true"` in components/verio/settings.tsx true rather than
-        aspirational: while Settings is open, the header, lobby/room, dock and
-        context menu are removed from the tab order and from assistive tech.
-        The legacy modal made no such claim and left the whole app tabbable
-        behind it.
-      */}
-      <div className="contents" inert={isSettingsOpen || undefined}>
-        <AppHeader
-          rttMs={rttMs}
-          state={roomState}
-          roomCode={roomCode}
+    <AmbientGlassCanvas>
+      {/* Zone 1: Floating 48px Top Command Bar */}
+      <AppHeader
+        activeView={activeView}
+        rttMs={rttMs}
+        state={roomState}
+        roomCode={roomCode}
+        isInCall={isInCall}
+        elapsedSeconds={callElapsedSec}
+        copied={copied}
+        onCopyCode={handleCopyCode}
+        onJoinMainRoom={() => void handleJoinMainRoom()}
+        chatOpen={isChatOpen}
+        onToggleChat={handleToggleChat}
+        unreadChatCount={unreadChatCount}
+      />
+
+      {/* Zone 2 + Zone 3: Floating Left Rail & Dynamic Stage */}
+      <div className="flex min-h-0 flex-1 flex-row gap-2.5 overflow-hidden">
+        {/* Zone 2: Floating 72px Left Icon Rail (Room, Music, Settings) */}
+        <LeftIconRail
+          activeView={activeView}
+          onSelectView={selectView}
+          musicPlaying={Boolean(music.status?.active || botPeer !== undefined)}
           isInCall={isInCall}
-          diagnosticsOpen={isDiagnosticsOpen}
-          onCopyCode={handleCopyCode}
-          onToggleDiagnostics={() => setIsDiagnosticsOpen((v) => !v)}
         />
 
-        {/* Main Content */}
-        <main className="main">
-          {/* Phase 7: the last legacy shell markup. `StatusBanner` keeps the
-              message and its tone, and adds the two things the legacy
-              `.toast-banner` did not have — a live region (so the message is
-              announced at all) and an accessible name on the close button.
-              It sits in normal flow at the top of `main`, as the banner did. */}
-          {statusMsg && (
-            <StatusBanner
-              text={statusMsg.text}
-              isError={statusMsg.isError}
-              onDismiss={() => setStatusMsg(null)}
-            />
-          )}
-
-          {isInCall ? (
-            /* IN-CALL VIEW */
-            <>
+        {/* Zone 3: Dynamic Center Stage */}
+        <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+          {activeView === "stage" &&
+            (isInCall ? (
               <Room
                 roomCode={roomCode}
-                copied={copied}
-                onCopyCode={handleCopyCode}
-                onLeave={() => void handleLeaveCall()}
                 nickname={settings?.nickname || "You"}
                 self={{
                   speaking: audioState.speaking,
@@ -1076,290 +1145,181 @@ export default function App() {
                 selfUserId={selfUserId}
                 botHostUserId={botHostUserId}
                 chatOpen={isChatOpen}
-                unreadChatCount={unreadChatCount}
-                onToggleChat={handleToggleChat}
+                onCloseChat={() => setIsChatOpen(false)}
                 chatMessages={chatMessages}
                 onSendMessage={(text) => void handleSendChatMessage(text)}
-                onCloseChat={handleCloseChat}
+                music={music}
+                bot={bot}
+                botPresent={botPeer !== undefined}
+                botAcceptsRemoteStop={botAcceptsRemoteStop}
+                roomMusicTitle={roomMusicTitle}
+                roomMusicHost={roomMusicHost}
+                onRequestMusicStop={handleRequestMusicStop}
+                onOpenMusicTab={() => selectView("music")}
               />
+            ) : (
+              <div className="glass-card min-h-0 flex-1 overflow-y-auto rounded-[22px]">
+                <Lobby
+                  code={joinCodeInput}
+                  onCodeChange={setJoinCodeInput}
+                  onCreateRoom={handleCreateRoom}
+                  onJoinRoom={handleJoinRoom}
+                  onJoinMainRoom={() => void handleJoinMainRoom()}
+                  busy={roomState === "connecting"}
+                  busyLabel={busyStatusText}
+                />
+              </div>
+            ))}
 
-              {/* Live network diagnostics — opened from the header's status chip,
-                  which is its only caller. It reports what the transport layer
-                  actually knows; see the notes on each row for what was removed. */}
-              {isDiagnosticsOpen && (
-                <aside
-                  aria-label="Network diagnostics"
-                  // `top-header`, not `top-14`: this overlay must begin exactly
-                  // where the header ends, and `h-header` on the header and
-                  // `top-header` here now read from one `@theme` declaration
-                  // instead of two literals that had to be kept in step by hand.
-                  className="fixed top-header right-0 bottom-0 z-90 flex w-80 flex-col gap-3 border-l border-border-2 bg-surface p-5"
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <SectionLabel level={2} className="text-text-dim">
-                      Real-time diagnostics
-                    </SectionLabel>
-                    <IconButton
-                      label="Close diagnostics"
-                      size="sm"
-                      onClick={() => setIsDiagnosticsOpen(false)}
-                    >
-                      <IconX size={14} />
-                    </IconButton>
-                  </div>
+          {activeView === "music" && (
+            <div className="flex min-h-0 flex-1 overflow-y-auto p-1">
+              <MusicPanel {...musicPanelSharedProps} />
+            </div>
+          )}
 
-                  <TelemetryList className="min-h-0 flex-1 overflow-y-auto">
-                    <TelemetryRow
-                      label="Latency (RTT)"
-                      value={
-                        diagnostics?.rtt_ms !== null && diagnostics?.rtt_ms !== undefined
-                          ? `${Math.round(diagnostics.rtt_ms)} ms`
-                          : rttMs !== null
-                            ? `${rttMs} ms`
-                            : "Measuring…"
-                      }
-                    />
-
-                    <TelemetryRow
-                      label="Packets"
-                      value={`out ${diagnostics?.packets_sent ?? 0} / in ${diagnostics?.packets_recv ?? 0}`}
-                      hint="Voice datagrams"
-                    />
-
-                    <TelemetryRow
-                      label="Last recv"
-                      value={
-                        diagnostics?.last_recv_ms_ago !== null &&
-                        diagnostics?.last_recv_ms_ago !== undefined
-                          ? `${diagnostics.last_recv_ms_ago} ms ago`
-                          : "None yet"
-                      }
-                      hint={
-                        (diagnostics?.last_recv_ms_ago ?? 0) > 2000
-                          ? "High jitter / delayed"
-                          : "Healthy inbound stream"
-                      }
-                      tone={(diagnostics?.last_recv_ms_ago ?? 0) > 2000 ? "warn" : "default"}
-                    />
-
-                    {/* The drawer previously had a second "Last Relay Recv" row
-                        rendering `last_recv_ms_ago` — the SAME field as the row
-                        above, under a relay-specific label. Measured: both rows
-                        read "14 ms ago". `TransportDiagnostics` has no
-                        relay-specific recency field, so the app does not know it
-                        and the row is gone rather than left implying it does. */}
-                    <TelemetryRow
-                      label="Relay packets"
-                      value={`${diagnostics?.relay_packets_sent ?? 0} sent / ${diagnostics?.relay_packets_recv ?? 0} recv`}
-                    />
-
-                    <TelemetryRow
-                      label="Relay mode"
-                      value={diagnostics?.relay_mode || "unknown"}
-                      hint={`${diagnostics?.relay_bytes_sent ?? 0} B out / ${diagnostics?.relay_bytes_recv ?? 0} B in`}
-                    />
-
-                    {/* Both addresses previously fell back to hardcoded literals —
-                        "141.11.1.110:3478" and "0.0.0.0" — which presented a
-                        specific address the app had not observed. A null endpoint
-                        now says so. */}
-                    <TelemetryRow
-                      label="Remote endpoint"
-                      value={
-                        diagnostics?.endpoint && diagnostics.endpoint !== "none"
-                          ? diagnostics.endpoint
-                          : "Not reported"
-                      }
-                    />
-
-                    <TelemetryRow
-                      label="Local socket"
-                      value={diagnostics?.local_addr || "Not reported"}
-                    />
-                  </TelemetryList>
-
-                  {diagnostics?.error && (
-                    <div className="flex items-start gap-2 rounded-sm border border-danger/35 bg-danger/8 p-3">
-                      <IconError size={14} className="mt-0.5 shrink-0 text-danger" />
-                      <span className="text-13 text-danger">{diagnostics.error}</span>
-                    </div>
-                  )}
-                </aside>
-              )}
-
-            </>
-          ) : (
-            /* LOBBY VIEW */
-            <Lobby
-              code={joinCodeInput}
-              onCodeChange={setJoinCodeInput}
-              onCreateRoom={handleCreateRoom}
-              onJoinRoom={handleJoinRoom}
-              busy={roomState === "connecting"}
+          {activeView === "settings" && (
+            <Settings
+              settings={settings}
+              devices={devices}
+              capturingAction={capturingAction}
+              onCancelCapture={() => {
+                if (capturingAction) {
+                  void invoke("cancel_hotkey_capture").catch(console.error);
+                  setCapturingAction(null);
+                }
+              }}
+              vpsAddress={vpsAddressInput}
+              onVpsAddressChange={setVpsAddressInput}
+              onSaveVpsAddress={() => void handleSaveVpsAddress()}
+              onClose={() => selectView("stage")}
+              onSelectVoiceActivity={() => void handleSelectVoiceActivity()}
+              onSelectPushToTalk={() => void handleSelectPushToTalk()}
+              onBeginCapture={(a) => void handleBeginCapture(a)}
+              onClearHotkey={(a) => void handleClearHotkey(a)}
+              onSetInputDevice={(n) => void handleSetInputDevice(n)}
+              onSetOutputDevice={(n) => void handleSetOutputDevice(n)}
+              onSetInputGain={(db) => void handleSetInputGain(db)}
+              onSetNoiseSuppression={(on) => void handleSetNoiseSuppression(on)}
+              onSetLoopback={(on) => void handleSetLoopback(on)}
+              onSetDebugWavs={(on) => void handleSetDebugWavs(on)}
+              onSetVoiceQuality={(k) => void handleSetVoiceQuality(k)}
+              onSetMusicQuality={(k) => void handleSetMusicQuality(k)}
             />
           )}
         </main>
-
-        {/* Bottom Dock */}
-        {/* Session 13: music player panel (ported from design/music-player) */}
-        {musicPanelOpen && (
-          <MusicPanel
-            music={music}
-            bot={bot}
-            deafened={audioState.deafened}
-            // Session 29b Force Stop. The toggle edits the setting; the two
-            // listener-facing values decide whether this client may end somebody
-            // else's music, and neither is derived from the setting above — only
-            // the host's own announcement can say what the host will accept.
-            forceStop={forceStop}
-            botPresent={botPeer !== undefined}
-            botAcceptsRemoteStop={botAcceptsRemoteStop}
-            inCall={isInCall}
-            // Session 29c: the room's music, for a listener who is not hosting.
-            // Both come from the roster, not from this client's player.
-            roomMusicTitle={roomMusicTitle}
-            roomMusicHost={roomMusicHost}
-            onSetForceStop={handleSetMusicForceStop}
-            onRequestMusicStop={handleRequestMusicStop}
-            onClose={() => setMusicPanelOpen(false)}
-            className="mx-auto my-4 w-full max-w-140"
-          />
-        )}
-
-
-              <Dock
-                nickname={settings?.nickname || "User"}
-                mode={isPttMode ? "ptt" : "open"}
-                pttHotkey={settings?.hotkeys.ptt || ""}
-                isEditingNickname={isEditingNickname}
-                nicknameInput={nicknameInput}
-                onNicknameInputChange={setNicknameInput}
-                onStartEditNickname={() => setIsEditingNickname(true)}
-                onSaveNickname={() => void handleSaveNickname()}
-                onCancelEditNickname={() => setIsEditingNickname(false)}
-                muted={audioState.muted}
-                deafened={audioState.deafened}
-                onToggleMute={() => void handleToggleMute()}
-                onToggleDeafen={() => void handleToggleDeafen()}
-                muteHotkey={settings?.hotkeys.mute || "Ctrl+Shift+M"}
-                deafenHotkey={settings?.hotkeys.deafen || "Ctrl+Shift+D"}
-                onOpenSettings={() => setIsSettingsOpen(true)}
-                musicPanelOpen={musicPanelOpen}
-                onToggleMusicPanel={() => setMusicPanelOpen((v) => !v)}
-                onOpenMusicPanel={() => setMusicPanelOpen(true)}
-                // `MusicStatus` is structurally assignable to `DockMusic`: the dock
-                // needs `active`/`playing` and treats title/path as optional, and
-                // the extra queue fields are simply ignored.
-                music={music.status}
-                musicPercent={music.percent}
-                meterRef={micLevelRef}
-              />
-
-
-              {/* The context menu sits inside the inert region too: while
-                  Settings is open it must not be reachable either, and it is
-                  always dismissed by the same click that opens Settings. */}
-              {ctxMenu && (
-                <div
-                  className="ctx-menu"
-                  style={{ left: ctxMenu.x, top: ctxMenu.y }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {roomCode ? (
-                    <button
-                      className="ctx-item"
-                      onClick={() => {
-                        handleCopyCode();
-                        setCtxMenu(null);
-                      }}
-                    >
-                      Copy room code
-                    </button>
-                  ) : null}
-                  <button
-                    className="ctx-item"
-                    onClick={() => {
-                      void handleToggleMute();
-                      setCtxMenu(null);
-                    }}
-                  >
-                    {audioState.muted ? "Unmute" : "Mute"}
-                  </button>
-                  <button
-                    className="ctx-item"
-                    onClick={() => {
-                      void handleToggleDeafen();
-                      setCtxMenu(null);
-                    }}
-                  >
-                    {audioState.deafened ? "Undeafen" : "Deafen"}
-                  </button>
-                  <div className="ctx-sep" />
-                  <button
-                    className="ctx-item"
-                    onClick={() => {
-                      setIsSettingsOpen(true);
-                      setCtxMenu(null);
-                    }}
-                  >
-                    Settings
-                  </button>
-                  {isInCall ? (
-                    <button
-                      className="ctx-item danger"
-                      onClick={() => {
-                        void handleLeaveCall();
-                        setCtxMenu(null);
-                      }}
-                    >
-                      Leave call
-                    </button>
-                  ) : null}
-                </div>
-              )}
       </div>
-      {/* /contents — end of the inert region */}
 
-      {/* Settings — Phase 6 rebuild. A full-screen surface, not a centred
-          modal: see the header comment in components/verio/settings.tsx for why,
-          and REDESIGN-PLAN.md R6 for the decision it implements. It renders
-          outside the inert wrapper above so it is the only interactive region
-          while it is open. */}
-      {isSettingsOpen && (
-        <Settings
-          settings={settings}
-          devices={devices}
-          capturingAction={capturingAction}
-          onCancelCapture={() => {
-            if (capturingAction) {
-              void invoke("cancel_hotkey_capture").catch(console.error);
-              setCapturingAction(null);
-            }
+      {/* Zone 4: Floating 60px Bottom Hardware Deck */}
+      <Dock
+        nickname={settings?.nickname || "User"}
+        mode={isPttMode ? "ptt" : "open"}
+        pttHotkey={settings?.hotkeys.ptt || ""}
+        speaking={audioState.speaking}
+        isInCall={isInCall}
+        isEditingNickname={isEditingNickname}
+        nicknameInput={nicknameInput}
+        onNicknameInputChange={setNicknameInput}
+        onStartEditNickname={() => {
+          setNicknameInput(settings?.nickname || "");
+          setIsEditingNickname(true);
+        }}
+        onSaveNickname={() => void handleSaveNickname()}
+        onCancelEditNickname={() => setIsEditingNickname(false)}
+        muted={audioState.muted}
+        deafened={audioState.deafened}
+        loopback={isLoopback}
+        onToggleMute={() => void handleToggleMute()}
+        onToggleDeafen={() => void handleToggleDeafen()}
+        onToggleLoopback={() => void handleSetLoopback(!isLoopback)}
+        muteHotkey={settings?.hotkeys.mute || "Ctrl+Shift+M"}
+        deafenHotkey={settings?.hotkeys.deafen || "Ctrl+Shift+D"}
+        musicPanelOpen={isMusicTabActive}
+        onToggleMusicPanel={() =>
+          selectView(activeView === "music" ? "stage" : "music")
+        }
+        onOpenMusicPanel={() => selectView("music")}
+        music={music.status}
+        musicPercent={music.percent}
+        hasTrack={music.hasTrack}
+        onMusicPlayPause={() => void bot.playPause()}
+        onMusicNext={() => void music.next()}
+        onLeaveCall={() => void handleLeaveCall()}
+        meterRef={micLevelRef}
+      />
+
+      {/* Compact Auto-Dismiss Floating Pill Toast */}
+      {statusMsg && (
+        <StatusBanner
+          text={statusMsg.text}
+          isError={statusMsg.isError}
+          onDismiss={() => {
+            setToastPaused(false);
+            setStatusMsg(null);
           }}
-          vpsAddress={vpsAddressInput}
-          onVpsAddressChange={setVpsAddressInput}
-          onSaveVpsAddress={() => void handleSaveVpsAddress()}
-          onClose={() => {
-            if (capturingAction) {
-              void invoke("cancel_hotkey_capture").catch(console.error);
-              setCapturingAction(null);
-            }
-            setIsSettingsOpen(false);
-          }}
-          onSelectVoiceActivity={() => void handleSelectVoiceActivity()}
-          onSelectPushToTalk={() => void handleSelectPushToTalk()}
-          onBeginCapture={(a) => void handleBeginCapture(a)}
-          onClearHotkey={(a) => void handleClearHotkey(a)}
-          onSetInputDevice={(n) => void handleSetInputDevice(n)}
-          onSetOutputDevice={(n) => void handleSetOutputDevice(n)}
-          onSetInputGain={(db) => void handleSetInputGain(db)}
-          onSetNoiseSuppression={(on) => void handleSetNoiseSuppression(on)}
-          onSetLoopback={(on) => void handleSetLoopback(on)}
-          onSetDebugWavs={(on) => void handleSetDebugWavs(on)}
-          onSetVoiceQuality={(k) => void handleSetVoiceQuality(k)}
-          onSetMusicQuality={(k) => void handleSetMusicQuality(k)}
+          onPauseAutoDismiss={() => setToastPaused(true)}
+          onResumeAutoDismiss={() => setToastPaused(false)}
         />
       )}
-    </div>
+
+      {/* Right-click context menu */}
+      {ctxMenu && (
+        <div
+          className="ctx-menu"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {roomCode ? (
+            <button
+              className="ctx-item"
+              onClick={() => {
+                handleCopyCode();
+                setCtxMenu(null);
+              }}
+            >
+              Copy room code
+            </button>
+          ) : null}
+          <button
+            className="ctx-item"
+            onClick={() => {
+              void handleToggleMute();
+              setCtxMenu(null);
+            }}
+          >
+            {audioState.muted ? "Unmute" : "Mute"}
+          </button>
+          <button
+            className="ctx-item"
+            onClick={() => {
+              void handleToggleDeafen();
+              setCtxMenu(null);
+            }}
+          >
+            {audioState.deafened ? "Undeafen" : "Deafen"}
+          </button>
+          <div className="ctx-sep" />
+          <button
+            className="ctx-item"
+            onClick={() => {
+              selectView("settings");
+              setCtxMenu(null);
+            }}
+          >
+            Settings
+          </button>
+          {isInCall ? (
+            <button
+              className="ctx-item danger"
+              onClick={() => {
+                void handleLeaveCall();
+                setCtxMenu(null);
+              }}
+            >
+              Leave call
+            </button>
+          ) : null}
+        </div>
+      )}
+    </AmbientGlassCanvas>
   );
 }

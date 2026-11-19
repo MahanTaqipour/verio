@@ -1427,8 +1427,74 @@ fn migrate_legacy_identifier(new_config_dir: &Path, new_log_dir: &Path) {
 
 // __SETUP__
 
+#[tauri::command]
+fn window_minimize(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| format!("minimize failed: {e}"))
+}
+
+#[tauri::command]
+fn window_toggle_maximize(window: tauri::Window) -> Result<(), String> {
+    let maximized = window
+        .is_maximized()
+        .map_err(|e| format!("is_maximized failed: {e}"))?;
+    if maximized {
+        window.unmaximize().map_err(|e| format!("unmaximize failed: {e}"))
+    } else {
+        window.maximize().map_err(|e| format!("maximize failed: {e}"))
+    }
+}
+
+#[tauri::command]
+fn window_close(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| format!("close failed: {e}"))
+}
+
+#[tauri::command]
+fn window_start_drag(window: tauri::Window) -> Result<(), String> {
+    window
+        .start_dragging()
+        .map_err(|e| format!("start_dragging failed: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn enable_windows_acrylic(hwnd: *mut core::ffi::c_void) {
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut core::ffi::c_void,
+            dw_attribute: u32,
+            pv_attribute: *const core::ffi::c_void,
+            cb_attribute: u32,
+        ) -> i32;
+    }
+
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+
+    unsafe {
+        let dark: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+        let round: i32 = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
 /// Build and run the Tauri application.
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    std::env::set_var("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "0");
+
     let launch = parse_launch_args();
     tauri::Builder::default()
 
@@ -1438,6 +1504,10 @@ pub fn run() {
             ping,
             emit_test_event,
             debug_log,
+            window_minimize,
+            window_toggle_maximize,
+            window_close,
+            window_start_drag,
             get_settings,
             set_nickname,
             list_devices,
@@ -1960,6 +2030,20 @@ pub fn run() {
             if let Some(p) = &launch.profile {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.set_title(&format!("Verio — {p}"));
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Some(w) = app.get_webview_window("main") {
+                use tauri::window::{Color, Effect, EffectsBuilder};
+                let _ = w.set_effects(
+                    EffectsBuilder::new()
+                        .effect(Effect::Acrylic)
+                        .color(Color(0x24, 0x1B, 0x3A, 0x88))
+                        .build(),
+                );
+                if let Ok(hwnd) = w.hwnd() {
+                    enable_windows_acrylic(hwnd.0);
                 }
             }
 

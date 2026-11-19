@@ -25,15 +25,15 @@ export type ButtonSize = "sm" | "md" | "lg";
 
 const VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    "bg-accent text-bg font-medium hover:bg-accent-hi active:bg-accent-lo",
+    "bg-accent text-on-accent font-semibold hover:bg-accent-hi active:bg-accent-lo",
   secondary:
-    "bg-surface-2 text-text border border-border hover:bg-surface-3 hover:border-border-2 active:bg-surface-3",
+    "bg-surface-2/85 text-text border border-border hover:bg-surface-3 hover:border-border-2 active:bg-surface-3",
   ghost:
-    "bg-transparent text-text-dim hover:bg-surface-2 hover:text-text active:bg-surface-3",
+    "bg-transparent text-text-dim hover:bg-[rgba(185,167,230,0.12)] hover:text-text active:bg-surface-3",
   danger:
-    "bg-danger text-text font-medium hover:brightness-110 active:brightness-95",
+    "bg-danger text-white font-semibold hover:brightness-110 active:brightness-95",
   "danger-outline":
-    "bg-transparent text-danger border border-danger/60 hover:bg-danger/10 hover:border-danger active:bg-danger/20",
+    "bg-danger/15 text-[#fca5a5] border border-danger/45 hover:bg-danger/25 hover:border-danger hover:text-white active:bg-danger/30",
 };
 
 const SIZES: Record<ButtonSize, string> = {
@@ -76,13 +76,16 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       disabled={isDisabled}
       aria-busy={loading || undefined}
       className={cn(
-        "inline-flex select-none items-center justify-center rounded-sm whitespace-nowrap",
+        "inline-flex select-none items-center justify-center rounded-xl whitespace-nowrap",
         "transition-[background-color,border-color,color,transform] ease-verio",
         "press",
         VARIANTS[variant],
         SIZES[size],
         isDisabled &&
-          "pointer-events-none cursor-not-allowed text-text-faint opacity-50",
+          cn(
+            "pointer-events-none cursor-not-allowed opacity-50",
+            variant !== "primary" && "text-text-faint",
+          ),
         className,
       )}
       {...rest}
@@ -130,7 +133,7 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
         aria-label={label}
         title={label}
         className={cn(
-          "inline-flex shrink-0 select-none items-center justify-center rounded-sm",
+          "inline-flex shrink-0 select-none items-center justify-center rounded-xl",
           "transition-[background-color,border-color,color,transform] ease-verio",
           "press",
           VARIANTS[variant],

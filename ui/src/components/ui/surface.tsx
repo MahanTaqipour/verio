@@ -46,14 +46,16 @@ export interface PanelProps extends HTMLAttributes<HTMLDivElement> {
   tier?: "surface" | "surface-2" | "surface-3";
   /** Adds the 1px border. Off for panels that sit flush inside another panel. */
   bordered?: boolean;
+  /** Enables the refracted Lavender/Violet glass gradient + specular bevel shadow. */
+  glass?: boolean;
   padding?: "none" | "sm" | "md" | "lg";
   children?: ReactNode;
 }
 
 const TIERS = {
-  surface: "bg-surface",
-  "surface-2": "bg-surface-2",
-  "surface-3": "bg-surface-3",
+  surface: "bg-surface/90",
+  "surface-2": "bg-surface-2/90",
+  "surface-3": "bg-surface-3/95",
 } as const;
 
 const PADDING = {
@@ -66,6 +68,7 @@ const PADDING = {
 export function Panel({
   tier = "surface",
   bordered = true,
+  glass = false,
   padding = "md",
   className,
   children,
@@ -74,9 +77,8 @@ export function Panel({
   return (
     <div
       className={cn(
-        "rounded-md",
-        TIERS[tier],
-        bordered && "border border-border",
+        "rounded-2xl",
+        glass ? "glass-card" : cn(TIERS[tier], bordered && "border border-border"),
         PADDING[padding],
         className,
       )}

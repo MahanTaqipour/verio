@@ -86,14 +86,9 @@ export function RoomCodeInput({
           onChange={(e) => handleChange(i, e.target.value)}
           onKeyDown={(e) => handleKeyDown(i, e)}
           className={cn(
-            // 40px matches Button size="lg", so the row sits on one line.
-            // `bg-bg` matches the Input primitive: a field is recessed against
-            // the panel it sits on, not the same colour as it. The legacy
-            // `.otp-box` used --surface on a --surface card, so only the border
-            // separated the box from the card behind it.
-            "size-10 shrink-0 rounded-sm border border-border bg-bg",
+            "size-11 shrink-0 rounded-xl border border-[rgba(185,167,230,0.30)] bg-[var(--bg-input)]",
             "mono-num text-center text-18 text-text",
-            "transition-colors ease-verio",
+            "transition-colors ease-verio hover:border-border-2 focus-visible:border-accent",
           )}
         />
       ))}

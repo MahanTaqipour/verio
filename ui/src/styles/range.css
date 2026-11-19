@@ -18,44 +18,97 @@
 
 @layer components {
   .verio-range {
+    --slider-track-size: 4px;
+    --slider-thumb-w: 12px;
+    --slider-thumb-h: 16px;
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
-    height: 16px; /* hit area; the visible track is drawn inside */
+    height: 18px; /* generous hit area */
+    margin: 0;
+    padding: 0;
+    border: 0;
     background: transparent;
     cursor: pointer;
+    background-image: linear-gradient(
+      to right,
+      var(--range-fill-color, var(--accent-lavender, #b9a7e6)) 0 var(--range-fill, 0%),
+      transparent var(--range-fill, 0%) 100%
+    );
+    background-repeat: no-repeat;
+    background-position: 0 center;
+    background-size: 100% 4px;
   }
 
+  .verio-range:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 3px;
+    border-radius: 3px;
+  }
+
+  /* WebKit / Blink */
   .verio-range::-webkit-slider-runnable-track {
-    height: 4px;
-    border-radius: 2px;
-    background: var(--color-bg);
-    border: 1px solid var(--color-border);
+    height: var(--slider-track-size);
+    border-radius: 9999px;
+    background: rgba(14, 10, 26, 0.68);
+    border: 1px solid rgba(185, 167, 230, 0.34);
   }
 
   .verio-range::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
-    width: 12px;
-    height: 16px;
-    margin-top: -7px; /* centre the 16px thumb on the 4px track */
-    border-radius: 2px;
-    border: 1px solid var(--color-border-2);
-    background-color: var(--color-text);
-    /* fine vertical grip ridges, per design.md */
+    width: var(--slider-thumb-w);
+    height: var(--slider-thumb-h);
+    margin-block-start: -7px;
+    border-radius: 5px;
+    border: 1px solid var(--accent-lavender-bright, #d4c7f7);
+    background-color: var(--accent-lavender, #b9a7e6);
     background-image: repeating-linear-gradient(
       to right,
       transparent 0 2px,
-      color-mix(in srgb, var(--color-bg) 55%, transparent) 2px 3px
+      rgba(18, 13, 29, 0.55) 2px 3px
     );
     background-position: center;
     background-repeat: no-repeat;
     background-size: 8px 8px;
-    transition: border-color var(--duration-fast) var(--ease-verio);
+    transition: border-color var(--duration-fast) var(--ease-verio),
+      background-color var(--duration-fast) var(--ease-verio);
   }
 
-  .verio-range:hover::-webkit-slider-thumb {
+  .verio-range:hover::-webkit-slider-thumb,
+  .verio-range:focus-visible::-webkit-slider-thumb {
     border-color: var(--color-accent);
+    background-color: var(--accent-lavender-bright, #d4c7f7);
+  }
+
+  /* Firefox */
+  .verio-range::-moz-range-track {
+    height: var(--slider-track-size);
+    border-radius: 9999px;
+    background: rgba(14, 10, 26, 0.68);
+    border: 1px solid rgba(185, 167, 230, 0.34);
+  }
+
+  .verio-range::-moz-range-progress {
+    height: var(--slider-track-size);
+    border-radius: 9999px;
+    background: var(--range-fill-color, var(--accent-lavender, #b9a7e6));
+  }
+
+  .verio-range::-moz-range-thumb {
+    width: var(--slider-thumb-w);
+    height: var(--slider-thumb-h);
+    border-radius: 5px;
+    border: 1px solid var(--accent-lavender-bright, #d4c7f7);
+    background-color: var(--accent-lavender, #b9a7e6);
+    background-image: repeating-linear-gradient(
+      to right,
+      transparent 0 2px,
+      rgba(18, 13, 29, 0.55) 2px 3px
+    );
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 8px 8px;
   }
 
   .verio-range:disabled {
@@ -68,20 +121,8 @@
     border-color: var(--color-border);
   }
 
-  /* Filled portion, driven by a CSS custom property the component sets.
-     Chromium cannot style the pre-thumb track without this technique. */
-  .verio-range {
-    background-image: linear-gradient(
-      to right,
-      var(--range-fill-color, var(--color-accent)) 0 var(--range-fill, 0%),
-      transparent var(--range-fill, 0%) 100%
-    );
-    background-repeat: no-repeat;
-    background-position: 0 center;
-    background-size: 100% 4px;
-  }
-
-  .verio-range::-webkit-slider-runnable-track {
-    background: color-mix(in srgb, var(--color-bg) 100%, transparent);
+  .verio-range:disabled::-moz-range-thumb {
+    background-color: var(--color-text-faint);
+    border-color: var(--color-border);
   }
 }

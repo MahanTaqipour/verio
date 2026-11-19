@@ -1,183 +1,268 @@
+import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
-import { IconCopy } from "@/components/verio/icons";
-// 96px derivative of design/logo/verio-logo-primary.png (1254px, 863 kB).
-// Rendered at 24 CSS px, so the master was a ~52x downscale decoded on every
-// startup and 863 kB of the bundle. The 96px copy is 5,315 bytes (99.38%
-// smaller) and measured pixel-identical at 1x (0/576 perceptible pixels) and
-// 0.3% at 2x. The master stays in design/logo/ as the source the Tauri icons
-// are generated from — do not delete it.
+import {
+  IconCheck,
+  IconCopy,
+  IconMessageSquare,
+  IconMinus,
+  IconWindowMaximize,
+  IconX,
+  IconZap,
+} from "@/components/verio/icons";
 import verioLogo from "@/assets/verio-logo-primary-96.png";
+import type { NavView } from "@/components/verio/left-rail";
 
-/**
- * AppHeader — the shell's top bar.
- *
- * Direction: the Stitch decks' `win-titlebar` (brand + screen breadcrumb on the
- * left, a live status cluster on the right). The deck also draws minimise /
- * maximise / close buttons; those are deliberately NOT implemented, because
- * Verio uses Tauri's native window decorations — drawing our own would be three
- * controls that look functional and do nothing.
- *
- * Behaviour preserved from the previous header: the brand mark, the ping read
- * out, and the room chip that copies the room code.
- *
- * Behaviour fixed here (see REDESIGN-PLAN.md §6):
- *   - the status dot's `connected` / `connecting` / `idle` classes had no CSS
- *     at all, so the dot never changed colour. It is now driven by `state`.
- *   - the status control was a `<button>` with no `onClick` — it looked
- *     interactive and did nothing. It is now a real button that opens the
- *     diagnostics drawer while in a call, and a plain read-only chip otherwise.
- *     That also makes the diagnostics drawer reachable; it previously had no
- *     caller at all.
- *
- * REMOVED (Session 22): the live transport suffix in the status chip.
- *
- * It read `diagnostics.mode` via `describeLiveTransport` and rendered as
- * `Connected · Relay`. The user's decision was that it should not be shown, and
- * the backend agrees it is not a distinction worth a permanent header slot:
- * `room.rs` sets `effective_mode` to `CloudRelay` unconditionally, and the only
- * remaining input to the label is `Settings.transport_mode`, which the UI has
- * not been able to change since Session 11 removed the transport plumbing.
- * With its `auto` default that resolves to `cloud_relay` — so in the real app
- * the chip could only ever read "Relay". The `direct_p2p` branch is reachable
- * only through `activate_session`, whose callers are the direct-LAN and invite
- * paths that no longer have any UI.
- *
- * A value that cannot vary is not information, so it is gone from the header
- * rather than kept as decoration. It then lived on only in the diagnostics
- * drawer, until Session 24 removed it there too — see the note in `App.tsx`.
- * With that row gone, `lib/transport.ts` had no consumer left and was deleted.
- * The diagnostics drawer now shows only values the app measured.
- */
-
-/** Mirrors the `RoomState` union the app already keeps; structural, so the
- *  caller's own type is assignable without a shared import. */
 type RoomState = "idle" | "connecting" | "connected" | "closed";
 
 export interface AppHeaderProps {
-  /** Round-trip time in ms, or null while unmeasured. */
+  activeView: NavView;
   rttMs: number | null;
-  /** Connection state reported by the backend. */
   state: RoomState;
-  /** Room code, present only once a room exists. */
   roomCode?: string | null;
-  /** True once a call exists — gates the room chip and the diagnostics toggle. */
   isInCall: boolean;
-  /** Whether the diagnostics drawer is currently open. */
-  diagnosticsOpen?: boolean;
+  elapsedSeconds: number;
+  copied?: boolean;
   onCopyCode: () => void;
-  onToggleDiagnostics: () => void;
+  onJoinMainRoom: () => void;
+  chatOpen: boolean;
+  onToggleChat: () => void;
+  unreadChatCount?: number;
 }
 
-/**
- * Connection state → label + dot colour.
- *
- * `connected` uses --idle (the teal), not --accent: the accent is reserved for
- * things that want attention, and a healthy call should read as calm.
- */
+const VIEW_LABELS: Record<NavView, string> = {
+  stage: "ROOM",
+  music: "MUSIC",
+  settings: "SETTINGS",
+};
+
 const STATE_STYLE: Record<RoomState, { label: string; dot: string; text: string }> = {
-  idle: { label: "Idle", dot: "bg-text-faint", text: "text-text-dim" },
-  connecting: { label: "Connecting", dot: "bg-accent", text: "text-accent" },
-  connected: { label: "Connected", dot: "bg-idle", text: "text-idle" },
+  idle: { label: "Idle", dot: "bg-[#94a3b8]", text: "text-text-dim" },
+  connecting: {
+    label: "Connecting",
+    dot: "bg-accent shadow-[0_0_8px_rgba(232,255,58,0.85)]",
+    text: "text-accent",
+  },
+  connected: {
+    label: "Connected",
+    dot: "bg-[#10b981] shadow-[0_0_8px_rgba(16,185,129,0.75)]",
+    text: "text-[#10b981]",
+  },
   closed: { label: "Closed", dot: "bg-warn", text: "text-warn" },
 };
 
+function formatTimer(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  return `${String(hrs).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
 export function AppHeader({
+  activeView,
   rttMs,
   state,
   roomCode,
   isInCall,
-  diagnosticsOpen = false,
+  elapsedSeconds,
+  copied = false,
   onCopyCode,
-  onToggleDiagnostics,
+  onJoinMainRoom,
+  chatOpen,
+  onToggleChat,
+  unreadChatCount = 0,
 }: AppHeaderProps) {
   const connection = STATE_STYLE[state] ?? STATE_STYLE.idle;
+  const inMainRoom = isInCall && roomCode === "1111";
 
-  const statusContent = (
-    <>
-      <span aria-hidden="true" className={cn("size-1.5 shrink-0 rounded-full", connection.dot)} />
-      <span className={connection.text}>{connection.label}</span>
-    </>
-  );
-
-  const statusClasses =
-    "inline-flex items-center gap-2 rounded-sm border border-border bg-surface-2 px-2.5 py-1 " +
-    "font-mono text-10 uppercase tracking-[0.08em] transition-colors ease-verio";
+  const handleHeaderMouseDown = (e: React.MouseEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("button, input, select, textarea, a")) {
+      return;
+    }
+    void invoke("window_start_drag").catch(() => {});
+  };
 
   return (
-    <header className="flex h-header shrink-0 items-center justify-between gap-4 border-b border-border px-5">
-      {/* Brand + screen breadcrumb */}
-      <div className="flex min-w-0 items-center gap-3">
-        <div className="flex shrink-0 items-center gap-2.5">
-          <img src={verioLogo} alt="" width={24} height={24} className="size-6" />
-          <span className="font-mono text-11 font-semibold uppercase tracking-[0.22em] text-text">
-            Verio
-          </span>
-          <span aria-hidden="true" className="size-1 rounded-full bg-accent" />
-        </div>
-
-        {/* The screen name. Always shown: measured with header-metrics.mjs, the
-            widest case (in a call, so the room chip and status chip are both
-            present) occupies 498.8px of the 700px floor — 201.2px of slack, on
-            one 56px row. No breakpoint is needed. */}
-        <span aria-hidden="true" className="text-border-2">
+    <header
+      data-tauri-drag-region
+      onMouseDown={handleHeaderMouseDown}
+      className={cn(
+        "relative z-30 flex h-[48px] shrink-0 items-center justify-between gap-4",
+        "rounded-2xl border border-border bg-[var(--bg-titlebar-glass)] px-4 backdrop-blur-2xl",
+      )}
+    >
+      {/* Left: Brand + active view */}
+      <div className="pointer-events-none flex min-w-0 items-center gap-2.5">
+        <img
+          src={verioLogo}
+          alt=""
+          width={24}
+          height={24}
+          className="size-6 shrink-0 rounded-lg"
+        />
+        <span className="font-mono text-13 font-bold uppercase tracking-[0.22em] text-text">
+          Verio
+        </span>
+        <span aria-hidden="true" className="text-text-faint">
           /
         </span>
-        <span className="whitespace-nowrap text-11 text-text-dim">
-          {isInCall ? "In call" : "Lobby"}
+        <span className="mono-num truncate text-11 font-medium uppercase tracking-chip text-lavender-bright">
+          {VIEW_LABELS[activeView]}
         </span>
       </div>
 
-      {/* Status cluster */}
-      <div className="flex shrink-0 items-center gap-4">
-        <div className="flex items-center gap-2 font-mono text-11 text-text-dim">
-          <span>Ping</span>
-          <b className="font-medium text-text">
-            {rttMs !== null ? `${rttMs} ms` : "--"}
-          </b>
+      {/* Center: Single authoritative Room Code + Copy + Timer (or quick Main #1111 jump when idle) */}
+      <div className="flex shrink-0 items-center gap-2">
+        {isInCall ? (
+          <>
+            <div
+              className={cn(
+                "inline-flex h-8 items-center gap-2 rounded-full border px-3",
+                inMainRoom
+                  ? "border-[rgba(232,255,58,0.45)] bg-[rgba(232,255,58,0.14)] text-accent"
+                  : "border-border-2 bg-[var(--bg-input)] text-text",
+              )}
+            >
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "size-1.5 rounded-full",
+                  inMainRoom ? "bg-accent" : "bg-idle",
+                )}
+              />
+              <span className="mono-num font-mono text-11 font-bold tracking-chip">
+                {inMainRoom ? "ROOM #1111 · MAIN" : `ROOM #${roomCode || "----"}`}
+              </span>
+            </div>
+
+            {roomCode && (
+              <button
+                type="button"
+                onClick={onCopyCode}
+                aria-live="polite"
+                title="Copy room code"
+                className={cn(
+                  "inline-flex h-8 items-center gap-1.5 rounded-full border px-3",
+                  "border-border bg-[var(--bg-input)] text-11 font-medium text-text-dim",
+                  "transition-colors ease-verio hover:border-border-2 hover:bg-surface-2 hover:text-text press",
+                )}
+              >
+                {copied ? (
+                  <IconCheck size={14} className="text-idle" />
+                ) : (
+                  <IconCopy size={14} />
+                )}
+                <span>{copied ? "Copied" : "Copy"}</span>
+              </button>
+            )}
+
+            <span
+              aria-label="Call duration"
+              className="mono-num hidden h-8 items-center rounded-full border border-border bg-[var(--bg-input)] px-3 font-mono text-11 text-text-dim md:inline-flex"
+            >
+              {formatTimer(elapsedSeconds)}
+            </span>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={onJoinMainRoom}
+            disabled={state === "connecting"}
+            title="Join permanent Main Squad Room #1111 in one click"
+            className={cn(
+              "inline-flex h-8 items-center gap-1.5 rounded-full border px-3.5 press",
+              "border-[rgba(232,255,58,0.45)] bg-[rgba(232,255,58,0.14)] text-accent",
+              "font-mono text-11 font-bold tracking-chip transition-colors ease-verio",
+              "hover:bg-accent hover:text-on-accent",
+              "disabled:pointer-events-none disabled:opacity-50",
+            )}
+          >
+            <IconZap size={14} />
+            <span>MAIN #1111</span>
+          </button>
+        )}
+      </div>
+
+      {/* Right: Connection Status + Single Chat Toggle + Custom Window Chrome */}
+      <div className="flex shrink-0 items-center gap-2">
+        <div
+          aria-label={`Connection status: ${connection.label}`}
+          className="inline-flex h-8 items-center gap-2 rounded-full border border-border bg-[var(--bg-input)] px-3 mono-num text-11"
+        >
+          <span aria-hidden="true" className={cn("size-1.5 rounded-full", connection.dot)} />
+          <span className={cn("font-medium uppercase tracking-chip", connection.text)}>
+            {connection.label}
+          </span>
+          {isInCall && (
+            <>
+              <span aria-hidden="true" className="text-text-faint">
+                ·
+              </span>
+              <span className="text-text">
+                {rttMs !== null ? `${Math.round(rttMs)} ms` : "-- ms"}
+              </span>
+            </>
+          )}
         </div>
 
-        {isInCall && roomCode && (
+        {isInCall && (
           <button
             type="button"
-            onClick={onCopyCode}
-            title="Copy room code"
+            onClick={onToggleChat}
+            aria-expanded={chatOpen}
+            aria-label={chatOpen ? "Hide room chat" : "Show room chat"}
+            title={chatOpen ? "Hide room chat" : "Show room chat"}
             className={cn(
-              "inline-flex items-center gap-2.5 rounded-sm border border-border bg-surface px-3 py-1.5",
-              "font-mono text-13 tracking-[0.08em] text-text",
-              "transition-colors ease-verio",
-              "hover:border-border-2 hover:bg-surface-2",
+              "inline-flex h-8 items-center gap-1.5 rounded-full border px-3",
+              "text-11 font-medium transition-colors ease-verio press",
+              chatOpen
+                ? "border-accent/55 bg-accent/14 text-accent"
+                : "border-border bg-[var(--bg-input)] text-text-dim hover:border-border-2 hover:text-text",
             )}
           >
-            <span className="label-caps text-text-dim">Room</span>
-            <span>{roomCode}</span>
-            <IconCopy
-              size={14}
-              className="opacity-50 transition-opacity ease-verio"
-            />
+            <IconMessageSquare size={14} />
+            <span>Chat</span>
+            {!chatOpen && unreadChatCount > 0 && (
+              <span className="mono-num rounded-full bg-accent px-1.5 py-0.5 font-mono text-10 font-bold leading-none text-on-accent">
+                {unreadChatCount > 9 ? "9+" : unreadChatCount}
+              </span>
+            )}
           </button>
         )}
 
-        {isInCall ? (
+        <span aria-hidden="true" className="mx-0.5 h-4 w-px bg-border" />
+
+        {/* Frameless window controls */}
+        <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={onToggleDiagnostics}
-            aria-expanded={diagnosticsOpen}
-            title={`${connection.label}. Show network diagnostics.`}
-            className={cn(
-              statusClasses,
-              "cursor-pointer hover:border-border-2 hover:bg-surface-3",
-            )}
+            aria-label="Minimize window"
+            title="Minimize"
+            onClick={() => void invoke("window_minimize").catch(() => {})}
+            className="grid size-7 place-items-center rounded-xl text-text-dim transition-colors hover:bg-[rgba(185,167,230,0.14)] hover:text-text"
           >
-            {statusContent}
+            <IconMinus size={14} />
           </button>
-        ) : (
-          <span
-            title="Not in a call — no voice path is established."
-            className={statusClasses}
+          <button
+            type="button"
+            aria-label="Toggle maximize window"
+            title="Maximize / Restore"
+            onClick={() => void invoke("window_toggle_maximize").catch(() => {})}
+            className="grid size-7 place-items-center rounded-xl text-text-dim transition-colors hover:bg-[rgba(185,167,230,0.14)] hover:text-text"
           >
-            {statusContent}
-          </span>
-        )}
+            <IconWindowMaximize size={14} />
+          </button>
+          <button
+            type="button"
+            aria-label="Close window"
+            title="Close"
+            onClick={() => void invoke("window_close").catch(() => {})}
+            className="grid size-7 place-items-center rounded-xl text-text-dim transition-colors hover:bg-danger/25 hover:text-[#fca5a5]"
+          >
+            <IconX size={14} />
+          </button>
+        </div>
       </div>
     </header>
   );

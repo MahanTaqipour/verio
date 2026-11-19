@@ -38,11 +38,11 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
   return (
     <div
       className={cn(
-        "flex h-8 w-full items-center gap-2 rounded-sm border bg-bg px-3",
+        "flex h-9 w-full items-center gap-2 rounded-xl border bg-[var(--bg-input)] px-3",
         "transition-[border-color] ease-verio",
         invalid
           ? "border-danger"
-          : "border-border hover:border-border-2 focus-within:border-border-2",
+          : "border-border hover:border-border-2 focus-within:border-accent/60",
         wrapperClassName,
       )}
     >

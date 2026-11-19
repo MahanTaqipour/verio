@@ -50,21 +50,21 @@ export function SegmentedControl<T extends string>({
       >
         {legend}
       </legend>
-      <div className="inline-flex rounded-sm border border-border bg-surface-2 p-1">
+      <div className="inline-flex rounded-xl border border-border bg-[var(--bg-input)] p-1 backdrop-blur-md">
         {options.map((opt) => {
           const checked = opt.value === value;
           return (
             <label
               key={opt.value}
               className={cn(
-                "relative inline-flex select-none items-center gap-2 rounded-sm px-3 py-1.5 text-13",
-                "transition-[background-color,color] ease-verio",
+                "relative inline-flex select-none items-center gap-2 rounded-lg px-3 py-1.5 text-13 font-medium",
+                "transition-[background-color,color,border-color,box-shadow] ease-verio",
                 opt.disabled
                   ? "cursor-not-allowed text-text-faint opacity-50"
                   : "cursor-pointer",
                 checked
-                  ? "bg-surface-3 text-text"
-                  : !opt.disabled && "text-text-dim hover:text-text",
+                  ? "border border-border-2 bg-surface-3 text-accent shadow-[inset_0_0_0_1px_rgba(185,167,230,0.16)]"
+                  : !opt.disabled && "border border-transparent text-text-dim hover:bg-surface-2/60 hover:text-text",
               )}
             >
               <input

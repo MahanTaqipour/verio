@@ -796,6 +796,12 @@ export function installMockTransport(scenarioId: string): MockTransport {
         console.debug("[verio mock] debug_log:", args.msg);
         return null;
 
+      case "window_minimize":
+      case "window_toggle_maximize":
+      case "window_close":
+      case "window_start_drag":
+        return null;
+
       default:
         // eslint-disable-next-line no-console
         console.warn(`[verio mock] unhandled command: ${cmd}`);

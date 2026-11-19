@@ -5493,3 +5493,39 @@ Verified (real command output):
   - `ui/src-tauri/src/lib.rs` (require exact zero modifiers on single-key PTT): `single_key_ptt_tolerates_held_game_modifiers_while_strict_rejects` FAILED (`exit=101`). Restored (`4256ffd36805dbcf30d26b76c206d3cfcdd19f36`).
 - Release binary built:
   - Linux musl server: `target\x86_64-unknown-linux-musl\release\verio-server` (2,923,864 bytes)
+
+### Session 34 & Session 35 (2026-11-19) — Soft-Rounded Floating Glass UI, WebSocket Pong Flush (60s Kick Fix), Relay Candidate Probing & Read Timeout Restoration
+
+Goal:
+1. Complete soft-rounded floating glass UI redesign (true translucent acrylic, 60/30/10 palette `#241B3A` / `#B9A7E6` / `#E8FF3A`, 3-tab rail `Room`/`Music`/`Settings`, 2-column widescreen Music Studio, 340px Room Chat, eliminate duplicate controls and telemetry clutter).
+2. Fix WebSocket 60-second inactivity kick (`run_listener` Pong flush), raise server inactivity timeout to 90s, resolve UDP relay 3478 vs 9092 deadlock, restore socket read timeout after non-blocking burst drain, deploy Linux musl server to VPS `89.116.72.30`, and rebuild release `verio.exe` directly on `C:`.
+
+Work done:
+1. **Soft-Rounded Glass UI Architecture (Session 34)**:
+   - Eliminated `HeroTelemetryCard` and telemetry clutter from Lobby and Room views, keeping 3 clean tabs in `LeftIconRail` (`Room`, `Music`, `Settings`).
+   - Removed duplicate room code banners, room timers, chat toggle buttons, and leave call buttons across `room.tsx` and header/dock.
+   - Built full-height 340px Room Chat with pill badges, responsive 2-column widescreen Music Player & Playlist Studio, and frameless Acrylic window styling.
+   - Verified `pnpm test` (13/13 passing in `hotkey.test.ts`), `pnpm exec tsc --noEmit`, and `pnpm build`.
+2. **WebSocket Pong Flush (Session 35)** (`crates/verio-discovery/src/vps.rs`):
+   - In `VpsSignaling::run_listener`, added explicit handling for `Message::Ping(payload)` that sends `Message::Pong(payload)` and calls `self.socket.flush()`, ensuring Pong keepalive frames are immediately pushed over the wire rather than remaining stuck in tungstenite's internal write buffer.
+   - Added unit test `test_vps_run_listener_flushes_pong_on_ping` proving loopback server receives flushed Pong on Ping.
+3. **Server Inactivity Timeout (Session 35)** (`crates/verio-server/src/main.rs`):
+   - Raised the server-side inactivity timeout in `handle_socket` from 60s to 90s, allowing plenty of tolerance for periodic 20s ping intervals.
+4. **Relay Port 3478 / 9092 Deadlock & Read Timeout Restoration (Session 35)** (`crates/verio-transport/src/lib.rs`):
+   - In `verio-relay-driver`: updated `PeerCommand::Control`, 1s heartbeat, and 2s ping to probe all `candidate_addrs` (`primary` + `fallbacks`) whenever `last_recv_time` is `None` or older than 5 seconds (`last_recv_time.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(true)`). This breaks the chicken-and-egg deadlock when primary (3478) is occupied or unreachable.
+   - Restored `socket.set_read_timeout(Some(Duration::from_millis(10)))` immediately after exiting the non-blocking burst packet drain loop (`socket.set_nonblocking(false)`).
+   - Added unit test `test_relay_sessions_probe_fallbacks_when_primary_unreachable` proving two relay sessions seamlessly discover and lock onto the fallback relay when primary is an unreachable unbound port, measuring RTT and switching `endpoint`.
+5. **VPS Deployment (`89.116.72.30`)**:
+   - Compiled Linux musl release binary: `cargo rustc --target x86_64-unknown-linux-musl --release -p verio-server -- -C linker=rust-lld`.
+   - Uploaded binary via SCP to `/root/verio-server-linux` on `89.116.72.30` and restarted inside `tmux` session `verio` (`./verio-server-linux -p 9091 -mr active`). Verified listening on TCP 9091 and UDP 9092 via `ss -lunpt | grep verio`.
+6. **Windows Release Build**:
+   - Rebuilt standalone `verio.exe` release binary directly on `C:` with `CARGO_BUILD_JOBS=1` using `pnpm tauri build --no-bundle`.
+
+Verified (real command output):
+- `cargo clippy --workspace --all-targets -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test --workspace --exclude verio`: Exit code 0 (all passed)
+- `cargo test -p verio --lib`: Exit code 0 (9 passed; 0 failed)
+- `cargo test -p verio-discovery`: Exit code 0 (11 passed, including `test_vps_run_listener_flushes_pong_on_ping`)
+- `cargo test -p verio-transport`: Exit code 0 (19 passed, including `test_relay_sessions_probe_fallbacks_when_primary_unreachable`)
+- Linux musl cross-compile: `target\x86_64-unknown-linux-musl\release\verio-server` compiled cleanly and deployed to `89.116.72.30`.
+

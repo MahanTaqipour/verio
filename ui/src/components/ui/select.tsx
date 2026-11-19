@@ -37,7 +37,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(function Select
       <select
         ref={ref}
         className={cn(
-          "h-8 w-full appearance-none rounded-sm border border-border bg-bg",
+          "h-9 w-full appearance-none rounded-xl border border-border bg-[var(--bg-input)]",
           "pl-3 pr-8 text-13 text-text",
           "transition-[border-color] ease-verio",
           "hover:border-border-2",

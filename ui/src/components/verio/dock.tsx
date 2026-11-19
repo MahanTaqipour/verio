@@ -1,73 +1,37 @@
 import type { RefObject } from "react";
 import { Button, IconButton } from "@/components/ui/button";
-import { StateChip } from "@/components/verio/state-chip";
 import { KbdChip } from "@/components/verio/kbd-chip";
+import { StateChip } from "@/components/verio/state-chip";
 import { MicLevelMeter, type LevelMeterHandle } from "@/components/verio/level-meter";
 import {
+  IconActivity,
   IconCheck,
   IconHeadphoneOff,
   IconHeadphones,
+  IconLeave,
   IconMic,
   IconMicOff,
   IconMusic,
   IconPause,
   IconPencil,
   IconPlay,
-  IconSettings,
+  IconSkipForward,
 } from "@/components/verio/icons";
 import { cn } from "@/lib/utils";
 
-/**
- * Dock — the persistent bottom bar.
- *
- * Direction: the Stitch in-call deck's bottom rail (utility cluster left, call
- * controls right, monospace telemetry chips). Two things from that deck are
- * deliberately NOT reproduced:
- *
- *   1. Its left cluster is `SHARE SM7B (BUS 01)` / `MONITOR OUT 82%` — device
- *      routing controls. Verio has no device-selection or monitor-output
- *      capability, so those would be dead controls describing features that do
- *      not exist. The left cluster here shows what Verio actually knows: who you
- *      are, how you are transmitting, and your live input level.
- *   2. Its button row is a 1080px-wide text-label rail. At Verio's 860px default
- *      the same rail does not fit, so controls are icon+label at 13px.
- *
- * Defects fixed here, all measured before the change:
- *
- *   - **The dock changed height.** `.dock` had `min-height: 72px` with
- *     content-sized children: 72px normally, 76px once the music strip appeared.
- *     Now a fixed `h-18` (72px).
- *   - **The identity block wrapped to two lines** when the music strip squeezed
- *     the left region, pushing the avatar off-centre. `.me-meta` had
- *     `flex-wrap: wrap`. Now a single non-wrapping row whose name truncates.
- *   - **The mic meter shrank from 90px to 78px** when the music strip appeared,
- *     because it had no `flex-shrink: 0`. The meter is a fixed-scale readout, so
- *     its width must not depend on what else is in the bar. Now `shrink-0`, at
- *     40px — see the note on `MicLevelMeter` below for why not 90px.
- *   - **Deafen showed no hotkey while Mic did**, although both hotkeys exist in
- *     settings. Both now show one.
- *   - **The music strip was a clickable `<div>`** — unreachable by keyboard.
- *     Now a real `<button>`.
- *
- * The mic meter remains imperative: `MicLevelMeter` writes `style.width` on a
- * ref and causes zero React renders at ~20 Hz. See level-meter.tsx.
- */
-
 export interface DockMusic {
-  /** True once a track is loaded (playing or paused). */
   active: boolean;
   playing: boolean;
   title?: string | null;
-  /** File path — used only for the tooltip, never rendered as text. */
   path?: string | null;
 }
 
 export interface DockProps {
   nickname: string;
-  /** Transmission mode. Both states are real; neither is a placeholder. */
   mode: "open" | "ptt";
-  /** The configured push-to-talk hotkey, shown while in PTT mode. */
   pttHotkey: string;
+  speaking: boolean;
+  isInCall: boolean;
 
   isEditingNickname: boolean;
   nicknameInput: string;
@@ -78,35 +42,26 @@ export interface DockProps {
 
   muted: boolean;
   deafened: boolean;
+  loopback: boolean;
   onToggleMute: () => void;
   onToggleDeafen: () => void;
+  onToggleLoopback: () => void;
   muteHotkey: string;
   deafenHotkey: string;
-  onOpenSettings: () => void;
 
   musicPanelOpen: boolean;
   onToggleMusicPanel: () => void;
   onOpenMusicPanel: () => void;
-  /** Null when nothing has been loaded — the strip is then not rendered. */
   music: DockMusic | null;
-  /** 0–100 playback position. */
   musicPercent: number;
+  hasTrack: boolean;
+  onMusicPlayPause: () => void;
+  onMusicNext: () => void;
+  onLeaveCall?: () => void;
 
   meterRef: RefObject<LevelMeterHandle | null>;
 }
 
-/**
- * A dock control. `Button` with its height and padding overridden.
- *
- * design.md puts buttons at 13px, which is `Button`'s `md` size — but `md` is
- * 32px tall, and the dock's controls were 38px. `lg` is the right height (40px)
- * but the wrong type size (14px). So the height and padding are overridden on top
- * of `md`, keeping one variant/hover/press/focus implementation rather than a
- * second button written by hand.
- */
-const DOCK_BUTTON = "h-10 px-4";
-
-/** Strip the `Ctrl+Shift+` prefix so the chip shows only the distinguishing key. */
 function shortKey(hotkey: string): string {
   return hotkey.replace(/^Ctrl\+Shift\+/, "");
 }
@@ -115,6 +70,8 @@ export function Dock({
   nickname,
   mode,
   pttHotkey,
+  speaking,
+  isInCall,
   isEditingNickname,
   nicknameInput,
   onNicknameInputChange,
@@ -123,36 +80,44 @@ export function Dock({
   onCancelEditNickname,
   muted,
   deafened,
+  loopback,
   onToggleMute,
   onToggleDeafen,
+  onToggleLoopback,
   muteHotkey,
   deafenHotkey,
-  onOpenSettings,
   musicPanelOpen,
   onToggleMusicPanel,
   onOpenMusicPanel,
   music,
   musicPercent,
+  hasTrack,
+  onMusicPlayPause,
+  onMusicNext,
+  onLeaveCall,
   meterRef,
 }: DockProps) {
   const initial = (nickname || "User").slice(0, 1).toUpperCase();
-  const showStrip = !!music && (music.active || music.playing);
-  const playing = !!music?.playing;
+  const showStrip = Boolean(music && (music.active || music.playing || hasTrack));
+  const playing = Boolean(music?.playing);
 
   return (
-    /* `@container` makes the dock the reference for its own capacity. The dock
-       holds seven things (identity, transmission mode, mic level, music toggle,
-       now-playing strip, and two labelled call controls plus settings); measured,
-       that needs ~800px. Below that something has to give, and it must not be the
-       user's own name or the call controls — so the now-playing strip is dropped
-       and the music toggle (which is still there, and still opens the panel that
-       shows the same title and a real seek bar) carries that state alone. */
-    <footer className="@container flex h-18 shrink-0 items-center gap-5 border-t border-border bg-linear-to-b from-bg to-bg-deep px-5">
-      {/* ── Identity + live input level ───────────────────────────────────── */}
+    <footer
+      className={cn(
+        "@container relative z-30 flex h-[60px] shrink-0 items-center justify-between gap-4",
+        "rounded-2xl border border-border bg-[var(--bg-titlebar-glass)] px-5 backdrop-blur-2xl",
+      )}
+    >
+      {/* Left Cluster: Identity + Mode + Imperative 20 Hz Mic Meter */}
       <div className="flex min-w-0 flex-1 items-center gap-3">
         <div
           aria-hidden="true"
-          className="grid size-9 shrink-0 place-items-center rounded-full bg-accent font-mono text-13 font-semibold text-bg"
+          className={cn(
+            "grid size-9 shrink-0 place-items-center rounded-full font-mono text-13 font-bold transition-colors ease-verio",
+            speaking
+              ? "bg-accent text-on-accent shadow-[0_0_12px_rgba(232,255,58,0.45)]"
+              : "border border-border-2 bg-surface-2 text-lavender-bright",
+          )}
         >
           {initial}
         </div>
@@ -169,140 +134,174 @@ export function Dock({
               }}
               aria-label="Display name"
               autoFocus
-              /* 96px is a component dimension, not a spacing value. design.md
-                 defines a spacing scale (4·8·12·16·20·24·32·40·60) and no
-                 dimension scale, so there is no on-scale step for an input that
-                 must show a name. 96px is the nearest step below the 100px this
-                 input used before. */
-              className="h-8 w-24 rounded-sm border border-border bg-surface-2 px-2 text-13 text-text outline-none focus-visible:border-border-2"
+              className="h-8 w-28 rounded-xl border border-border-2 bg-[var(--bg-input)] px-3 text-13 text-text outline-none focus-visible:border-accent"
             />
-            <IconButton label="Save display name" onClick={onSaveNickname}>
-              <IconCheck size={16} />
+            <IconButton label="Save display name" size="sm" onClick={onSaveNickname}>
+              <IconCheck size={14} />
             </IconButton>
           </div>
         ) : (
           <div className="flex min-w-0 items-center gap-2">
-            {/* The name is the only element allowed to shrink: it is the one
-                piece of user-supplied text that can be any length. `min-w-8`
-                keeps it from collapsing to nothing — a name that vanishes
-                entirely is worse than a truncated one. */}
-            <span className="min-w-8 truncate text-14 font-medium text-text">
-              {nickname || "User"}
-            </span>
-            <StateChip tone="neutral">
-              {mode === "ptt" ? `Push to talk (${pttHotkey})` : "Open mic"}
+            <button
+              type="button"
+              onClick={onStartEditNickname}
+              title="Click to edit display name"
+              className="group flex min-w-0 items-center gap-1.5 rounded-xl px-1.5 py-1 text-left hover:bg-[rgba(185,167,230,0.12)]"
+            >
+              <span className="max-w-28 truncate text-13 font-semibold text-text">
+                {nickname}
+              </span>
+              <IconPencil
+                size={14}
+                className="shrink-0 text-text-faint opacity-0 transition-opacity group-hover:opacity-100"
+              />
+            </button>
+
+            <StateChip
+              tone={mode === "ptt" ? "accent" : "neutral"}
+              title={
+                mode === "ptt"
+                  ? `Push-to-Talk (${pttHotkey || "Unbound"})`
+                  : "Voice Activity Detection (Open Mic)"
+              }
+            >
+              {mode === "ptt" ? (pttHotkey ? `PTT ${shortKey(pttHotkey)}` : "PTT") : "VAD"}
             </StateChip>
-            <IconButton label="Change your display name" onClick={onStartEditNickname}>
-              <IconPencil size={16} />
-            </IconButton>
           </div>
         )}
 
         <MicLevelMeter
           ref={meterRef}
-          label="Microphone level"
-          /* 40px. The old meter was 90px, which is off design.md's spacing scale
-             (4·8·12·16·20·24·32·40·60), so it had to move. 60px was tried first
-             and measured: at the 700px floor it clips the display name to its
-             32px minimum in every scenario. The name is worth more than 20px of
-             meter, so 40px it is — the nearest on-scale step that still reads as
-             a level. Do not raise this without re-running dock-metrics.mjs. */
-          className="h-1 w-10 shrink-0"
+          className="@max-[880px]:hidden max-w-28 min-w-16"
+          fillClassName={speaking ? "bg-accent" : "bg-[#b9a7e6]"}
         />
       </div>
 
-      {/* ── Music ─────────────────────────────────────────────────────────── */}
-      {/* Below the dock's container breakpoint the now-playing strip is hidden,
-          so this button is the only music affordance left. It therefore carries
-          the playing state itself: the icon takes the accent while a track is
-          playing, and the button takes the pressed background while the panel is
-          open. Both are facts the backend reports; neither is decoration.
-
-          The accessible name stays "Toggle music player panel" — an action, as a
-          toggle's name should be — and the state goes in `aria-pressed` and the
-          title. Folding "(playing)" into the name would conflate state with
-          name, and it silently broke the screenshot harness, which drives this
-          button by that label. */}
-      <IconButton
-        label="Toggle music player panel"
-        title={playing ? "Music player (playing)" : "Music player"}
-        onClick={onToggleMusicPanel}
-        aria-pressed={musicPanelOpen}
-        variant={musicPanelOpen ? "secondary" : "ghost"}
-        size="lg"
-        className={cn(
-          (musicPanelOpen || playing) && "text-accent",
-          musicPanelOpen && "border-accent/30",
-        )}
-      >
-        <IconMusic size={16} />
-      </IconButton>
-
-      {showStrip && (
-        <button
-          type="button"
-          onClick={onOpenMusicPanel}
-          title={music.title ? `${music.title} — ${music.path ?? ""}` : "Music"}
-          className={cn(
-            // Session 29d: the strip fades in when a track starts rather than
-            // popping into the bar. Opacity only, because `dock-metrics.mjs`
-            // measures this bar's height and budget.
-            "animate-fade flex min-w-0 shrink items-center gap-2.5 rounded-sm border border-border bg-surface px-3 py-2",
-            "text-left transition-colors ease-verio",
-            "hover:border-border-2 hover:bg-surface-2",
-            // Container query, not a viewport breakpoint: what matters is how
-            // much room the dock has, which is a property of the dock.
-            "@max-[800px]:hidden",
-          )}
-        >
-          <span aria-hidden="true" className="grid size-5.5 shrink-0 place-items-center text-accent">
-            {music.playing ? <IconPause size={16} filled /> : <IconPlay size={16} filled />}
-          </span>
-          <span className="flex min-w-0 w-20 flex-col gap-1">
-            <span className="truncate text-13 text-text">{music.title || "Music"}</span>
-            <span className="h-0.5 overflow-hidden rounded-sm bg-surface-3">
-              <span
-                className="block h-full bg-accent transition-[width] duration-200 ease-verio"
-                style={{ width: `${musicPercent}%` }}
-              />
-            </span>
-          </span>
-        </button>
-      )}
-
-      {/* ── Call controls ─────────────────────────────────────────────────── */}
-      {/* Icon-only, on the user's instruction. The word was redundant next to an
-          icon that already says it, and the hotkey chip beside it carries the part
-          the icon cannot. The accessible name is therefore explicit rather than
-          inherited from text that is no longer rendered — an icon-only control with
-          no name is unusable with a screen reader, and `dock-metrics.mjs` finds
-          these by their title, which is unchanged. */}
+      {/* Center Cluster: Tactile Audio Hardware Controls */}
       <div className="flex shrink-0 items-center gap-2">
         <Button
           variant="secondary"
-          className={cn(DOCK_BUTTON, muted && "border-warn/30 bg-warn/6 text-warn")}
+          size="md"
+          className={cn(
+            "h-9 px-3.5",
+            muted && "border-warn/45 bg-warn/15 text-warn hover:border-warn hover:bg-warn/20",
+          )}
           onClick={onToggleMute}
           aria-pressed={muted}
-          aria-label="Toggle mute"
-          title={`Toggle mute (${muteHotkey})`}
+          aria-label="Toggle Mic mute"
+          title={`Mic mute (${muteHotkey || "Unbound"})`}
           icon={muted ? <IconMicOff size={16} /> : <IconMic size={16} />}
-          trailingIcon={<KbdChip decorative>{shortKey(muteHotkey)}</KbdChip>}
-        />
+          trailingIcon={muteHotkey ? <KbdChip decorative>{shortKey(muteHotkey)}</KbdChip> : undefined}
+        >
+          <span>{muted ? "Unmute" : "Mic"}</span>
+        </Button>
 
         <Button
           variant="secondary"
-          className={cn(DOCK_BUTTON, deafened && "border-danger/35 bg-danger/8 text-danger")}
+          size="md"
+          className={cn(
+            "h-9 px-3.5",
+            deafened &&
+              "border-danger/50 bg-danger/15 text-[#fca5a5] hover:border-danger hover:bg-danger/25",
+          )}
           onClick={onToggleDeafen}
           aria-pressed={deafened}
-          aria-label="Toggle deafen"
-          title={`Toggle deafen (${deafenHotkey})`}
+          aria-label="Toggle Deafen"
+          title={`Deafen (${deafenHotkey || "Unbound"})`}
           icon={deafened ? <IconHeadphoneOff size={16} /> : <IconHeadphones size={16} />}
-          trailingIcon={<KbdChip decorative>{shortKey(deafenHotkey)}</KbdChip>}
-        />
+          trailingIcon={
+            deafenHotkey ? <KbdChip decorative>{shortKey(deafenHotkey)}</KbdChip> : undefined
+          }
+        >
+          <span>{deafened ? "Deafened" : "Deafen"}</span>
+        </Button>
 
-        <IconButton label="Settings" variant="secondary" size="lg" onClick={onOpenSettings}>
-          <IconSettings size={16} />
+        <Button
+          variant="secondary"
+          size="md"
+          className={cn(
+            "h-9 px-3.5",
+            loopback &&
+              "border-[rgba(232,255,58,0.45)] bg-[rgba(232,255,58,0.14)] text-accent hover:border-accent",
+          )}
+          onClick={onToggleLoopback}
+          aria-pressed={loopback}
+          aria-label="Toggle microphone loopback test"
+          title="Hear your own microphone locally (Loopback test)"
+          icon={<IconActivity size={14} />}
+        >
+          <span>Loopback</span>
+        </Button>
+      </div>
+
+      {/* Right Cluster: Mini Music Transport & Single Leave Call Action */}
+      <div className="flex min-w-0 flex-1 items-center justify-end gap-2">
+        <IconButton
+          label="Open music studio"
+          title={playing ? "Music studio (playing)" : "Music studio"}
+          onClick={onToggleMusicPanel}
+          aria-pressed={musicPanelOpen}
+          variant={musicPanelOpen ? "secondary" : "ghost"}
+          size="md"
+          className={cn(
+            (musicPanelOpen || playing) && "text-accent",
+            musicPanelOpen && "border-[rgba(232,255,58,0.45)] bg-[rgba(232,255,58,0.14)]",
+          )}
+        >
+          <IconMusic size={16} />
         </IconButton>
+
+        {showStrip && (
+          <div className="@max-[940px]:hidden flex min-w-0 items-center gap-1.5 rounded-xl border border-border bg-[var(--bg-input)] p-1 pr-1.5">
+            <button
+              type="button"
+              onClick={onOpenMusicPanel}
+              title={music?.title ? `${music.title} — open Music studio` : "Open Music studio"}
+              className="flex min-w-0 items-center gap-2 rounded-lg px-2 py-0.5 text-left hover:bg-surface-2"
+            >
+              <span className="flex w-24 min-w-0 flex-col gap-0.5">
+                <span className="truncate text-11 font-medium text-text">
+                  {music?.title || "Music loaded"}
+                </span>
+                <span className="h-1 overflow-hidden rounded-full bg-surface-3">
+                  <span
+                    className="block h-full rounded-full bg-[#b9a7e6] transition-[width] duration-200 ease-verio"
+                    style={{ width: `${musicPercent}%` }}
+                  />
+                </span>
+              </span>
+            </button>
+            <IconButton
+              label={playing ? "Pause track (dock)" : "Play track (dock)"}
+              size="sm"
+              onClick={onMusicPlayPause}
+              disabled={!hasTrack}
+              className="text-accent hover:bg-[rgba(232,255,58,0.14)]"
+            >
+              {playing ? <IconPause size={14} filled /> : <IconPlay size={14} filled />}
+            </IconButton>
+            <IconButton
+              label="Next track (dock)"
+              size="sm"
+              onClick={onMusicNext}
+              disabled={!hasTrack}
+            >
+              <IconSkipForward size={14} />
+            </IconButton>
+          </div>
+        )}
+
+        {isInCall && onLeaveCall && (
+          <Button
+            variant="danger-outline"
+            size="md"
+            onClick={onLeaveCall}
+            icon={<IconLeave size={14} />}
+            className="h-9 shrink-0 px-4 font-semibold"
+          >
+            Leave Call
+          </Button>
+        )}
       </div>
     </footer>
   );

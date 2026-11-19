@@ -1,46 +1,7 @@
 /**
- * Settings — a full-screen, two-pane surface: a nav rail on the left, one
- * section's content on the right.
- *
- * PRESENTATION ONLY. Every value, every command, and the hotkey-capture keyboard
- * handling live in App.tsx and arrive here as props. That is deliberate: the
- * capture logic is the single highest-risk behaviour in the app (see below), and
- * leaving it exactly where it is means this rebuild cannot change it.
- *
- * NOT A ROUTE. It still opens over both the lobby and the room, and still closes
- * back to wherever you were. The legacy version was a centred 560px modal on a
- * translucent scrim; `REDESIGN-PLAN.md` R6 decided the design's full-screen
- * surface is what to build, so the scrim and the 560px cap are gone and the
- * surface is opaque. Escape closes it (the legacy modal had no keyboard exit at
- * all — with no scrim left to click, a close button alone would strand
- * keyboard-only users).
- *
- * Escape while CAPTURING A HOTKEY does not close this screen. The capture
- * handler in App.tsx listens on `window` in the *capture* phase and calls
- * `stopPropagation()`, so it consumes the key before this component's
- * bubble-phase listener ever sees it. That ordering is load-bearing, not luck.
- *
- * SECTIONS ARE ONLY BUILT WHERE THERE IS REAL CONTENT
- * --------------------------------------------------
- * Six of them: transmission, shortcuts, audio, quality, server, diagnostics.
- *
- * The legacy modal also had a "Voice Transport" section whose entire body was a
- * static row reading *"Encrypted relay — Every call runs through the Verio relay
- * server. Nothing to configure."* plus an "Active" badge. A settings screen row
- * that says there is nothing to configure is not content, so it is not carried
- * over — and it would have contradicted the header decision in the same session,
- * where the same constant value was removed from the status chip for the same
- * reason. The live transport is still described in the diagnostics drawer.
- *
- * `debug_wavs` is the opposite case: the command (`set_debug_wavs`) and the
- * persisted field both exist and it has been unreachable from the UI. It gets a
- * real row under Diagnostics (`REDESIGN-PLAN.md` B4).
- *
- * DELIBERATELY NOT HERE: signalling port, host port, transport mode. Session 11
- * removed the transport plumbing from the UI on purpose; the plan's §6 lists
- * those commands as live-but-intentionally-unexposed, so re-surfacing them would
- * undo a decision rather than fix an omission. The VPS address stays because it
- * is already user-facing today and works.
+ * Settings — floating two-pane glass surface: sections nav on the left,
+ * active configuration card on the right. Preserves Escape dismissal,
+ * hotkey-capture cancellation, and `role="dialog"` semantics.
  */
 
 import { useEffect, useState, type ReactNode } from "react";
@@ -59,7 +20,6 @@ import {
   IconMic,
   IconServer,
   IconSliders,
-  IconTerminal,
   IconTrash,
   IconX,
 } from "@/components/verio/icons";
@@ -73,8 +33,6 @@ export interface DeviceOption {
   is_default: boolean;
 }
 
-/** Only the fields this screen reads. The caller's own `Settings` is wider and
- *  therefore assignable without a shared import. */
 export interface SettingsValues {
   input_device: string | null;
   output_device: string | null;
@@ -90,10 +48,8 @@ export interface SettingsValues {
 export interface SettingsProps {
   settings: SettingsValues | null;
   devices: { inputs: DeviceOption[]; outputs: DeviceOption[] };
-  /** Which action is currently awaiting a keypress, or null. */
   capturingAction: HotkeyAction | null;
   onCancelCapture?: () => void;
-  /** Controlled value for the VPS address field. */
   vpsAddress: string;
   onVpsAddressChange: (next: string) => void;
   onSaveVpsAddress: () => void;
@@ -118,7 +74,6 @@ const SECTIONS = [
   { id: "audio", label: "Audio", icon: IconSliders },
   { id: "quality", label: "Quality", icon: IconGauge },
   { id: "server", label: "Server", icon: IconServer },
-  { id: "diagnostics", label: "Diagnostics", icon: IconTerminal },
 ] as const;
 
 type SectionId = (typeof SECTIONS)[number]["id"];
@@ -126,15 +81,6 @@ type SectionId = (typeof SECTIONS)[number]["id"];
 const VOICE_RATES = [24, 32, 48, 64, 96] as const;
 const MUSIC_RATES = [64, 96, 128, 160, 192] as const;
 
-/**
- * The keybind control.
- *
- * A button, not a `<kbd>`: `KbdChip` is a read-only display (the dock uses it to
- * advertise a binding), whereas this is the thing you press to *change* one. The
- * legacy markup used a bare `<button class="keybind-chip">` with no accessible
- * name, so a screen reader announced only the current combo and never that it
- * was editable.
- */
 function KeybindButton({
   combo,
   placeholder,
@@ -154,11 +100,11 @@ function KeybindButton({
       onClick={onBegin}
       aria-label={`${label} hotkey: ${combo || "not set"}. Activate to record a new key.`}
       className={cn(
-        "inline-flex h-8 min-w-28 items-center justify-center rounded-sm border px-3",
+        "inline-flex h-9 min-w-28 items-center justify-center rounded-xl border px-3.5",
         "font-mono text-11 tracking-normal transition-colors ease-verio",
         capturing
-          ? "border-accent bg-accent/15 text-accent"
-          : "border-border bg-bg text-text hover:border-border-2 hover:bg-surface-2",
+          ? "border-accent bg-accent/15 text-accent shadow-[0_0_0_2px_rgba(232,255,58,0.18)]"
+          : "border-border bg-[var(--bg-input)] text-text hover:border-border-2 hover:bg-surface-2",
       )}
     >
       {capturing ? "Press a key…" : combo || placeholder}
@@ -166,7 +112,6 @@ function KeybindButton({
   );
 }
 
-/** A row's trailing control cluster, so every row's right edge lines up. */
 function Control({ children }: { children: ReactNode }) {
   return <div className="flex shrink-0 items-center gap-2">{children}</div>;
 }
@@ -195,9 +140,6 @@ export function Settings({
 }: SettingsProps) {
   const [section, setSection] = useState<SectionId>("transmission");
 
-  // Escape closes — but never while a key is being captured. The capture
-  // handler is registered on `window` with `capture: true` and calls
-  // `stopPropagation()`, so it runs first and this listener never fires.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -219,7 +161,9 @@ export function Settings({
               <SegmentedControl
                 legend="Transmission mode"
                 value={isPttMode ? "ptt" : "voice"}
-                onChange={(v) => (v === "ptt" ? onSelectPushToTalk() : onSelectVoiceActivity())}
+                onChange={(v) =>
+                  v === "ptt" ? onSelectPushToTalk() : onSelectVoiceActivity()
+                }
                 options={[
                   { value: "voice", label: "Voice activity", icon: <IconMic size={14} /> },
                   { value: "ptt", label: "Push to talk", icon: <IconKeyboard size={14} /> },
@@ -277,7 +221,10 @@ export function Settings({
               </Control>
             </SettingsRow>
 
-            <SettingsRow label="Toggle deafen" hint="Silences incoming audio and your microphone">
+            <SettingsRow
+              label="Toggle deafen"
+              hint="Silences incoming audio and your microphone"
+            >
               <Control>
                 <KeybindButton
                   combo={settings?.hotkeys.deafen ?? ""}
@@ -305,15 +252,6 @@ export function Settings({
         return (
           <>
             <SettingsRow label="Input device" hint="Where your voice is captured">
-              {/* Width lives on a wrapper, not on the Select. `Select`'s own
-                  wrapper is `w-full` unless `auto` is set, and `auto` sizes it to
-                  the widest *option* — which would leave the chevron (positioned
-                  against the wrapper) detached from the control's right edge
-                  whenever a device name is longer than the width you asked for.
-                  `flex-1` + `max-w-80` uses the row's spare space and stops the
-                  native control clipping real device names, which a fixed 240px
-                  did: "Shure SM7B (Elgato Wave XLR)" rendered as
-                  "Shure SM7B (Elgato Wave XL". */}
               <div className="min-w-0 max-w-80 flex-1">
                 <Select
                   aria-label="Input device"
@@ -375,7 +313,10 @@ export function Settings({
               </Control>
             </SettingsRow>
 
-            <SettingsRow label="Noise suppression" hint="RNNoise background-noise filter">
+            <SettingsRow
+              label="Noise suppression"
+              hint="RNNoise background-noise filter"
+            >
               <Switch
                 checked={settings?.noise_suppression ?? false}
                 onChange={(e) => onSetNoiseSuppression(e.target.checked)}
@@ -388,6 +329,17 @@ export function Settings({
                 checked={settings?.loopback ?? false}
                 onChange={(e) => onSetLoopback(e.target.checked)}
                 label="Loopback test"
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Capture debug WAVs"
+              hint="Writes audio pipeline stage recordings to disk for offline inspection"
+            >
+              <Switch
+                checked={settings?.debug_wavs ?? false}
+                onChange={(e) => onSetDebugWavs(e.target.checked)}
+                label="Capture debug WAVs"
               />
             </SettingsRow>
           </>
@@ -437,20 +389,12 @@ export function Settings({
             label="Signalling server"
             hint="WebSocket host every call is negotiated through"
           >
-            {/* Not <Control>: this cluster grows into the row's spare space
-                rather than sitting at its natural width, so it cannot carry the
-                `shrink-0` that Control hardcodes — `shrink-0` and `flex-1` set
-                `flex-shrink` to opposite values and which one wins would depend
-                on Tailwind's emission order rather than on anything here. */}
             <div className="flex min-w-0 max-w-80 flex-1 items-center gap-2">
               <Input
                 value={vpsAddress}
                 onChange={(e) => onVpsAddressChange(e.target.value)}
                 aria-label="Signalling server address"
                 spellCheck={false}
-                /* The width goes on the wrapper: `className` styles the inner
-                   <input>, which is `flex-1` inside a wrapper that is itself
-                   `w-full` — a width there would be ignored. */
                 wrapperClassName="min-w-0 flex-1"
               />
               <Button
@@ -465,20 +409,6 @@ export function Settings({
             </div>
           </SettingsRow>
         );
-
-      case "diagnostics":
-        return (
-          <SettingsRow
-            label="Capture debug WAVs"
-            hint="Writes each pipeline stage to disk for offline inspection"
-          >
-            <Switch
-              checked={settings?.debug_wavs ?? false}
-              onChange={(e) => onSetDebugWavs(e.target.checked)}
-              label="Capture debug WAVs"
-            />
-          </SettingsRow>
-        );
     }
   };
 
@@ -487,16 +417,16 @@ export function Settings({
       role="dialog"
       aria-modal="true"
       aria-label="Settings"
-      // Session 29d: fade only. This overlay covers the window, so translating it
-      // would slide the whole surface rather than settle it.
-      className="animate-fade fixed inset-0 z-100 flex bg-bg"
+      className="animate-fade flex h-full min-h-0 flex-1 gap-2.5 overflow-hidden"
     >
-      {/* Nav rail */}
+      {/* Left Settings Nav Floating Island */}
       <nav
         aria-label="Settings sections"
-        className="flex w-44 shrink-0 flex-col gap-1 border-r border-border p-3"
+        className="glass-card flex w-52 shrink-0 flex-col gap-1.5 rounded-[22px] p-3.5"
       >
-        <SectionLabel className="px-2 pb-1">System config</SectionLabel>
+        <SectionLabel className="px-2.5 pb-1 text-lavender">
+          Settings
+        </SectionLabel>
         {SECTIONS.map((s) => {
           const Icon = s.icon;
           const selected = s.id === section;
@@ -512,21 +442,28 @@ export function Settings({
               }}
               aria-current={selected ? "true" : undefined}
               className={cn(
-                "flex items-center gap-2.5 rounded-sm px-2 py-1.5 text-left text-13",
+                "relative flex items-center gap-2.5 rounded-xl px-3 py-2 text-left text-13 font-medium",
                 "transition-colors ease-verio",
                 selected
-                  ? "bg-surface-3 text-text"
-                  : "text-text-dim hover:bg-surface-2 hover:text-text",
+                  ? "bg-surface-3/80 text-text shadow-[inset_0_0_0_1px_rgba(185,167,230,0.22)]"
+                  : "text-text-dim hover:bg-surface-2/60 hover:text-text",
               )}
             >
-              <Icon size={14} className="shrink-0" />
+              {selected && (
+                <span
+                  aria-hidden="true"
+                  className="absolute inset-y-2 left-0.5 w-[3px] rounded-full bg-accent"
+                />
+              )}
+              <Icon
+                size={14}
+                className={cn("shrink-0", selected ? "text-accent" : "text-lavender")}
+              />
               <span className="truncate">{s.label}</span>
             </button>
           );
         })}
 
-        {/* The current keying mode, stated in the rail so it is visible from
-            every section — it changes what the mic button in the dock does. */}
         <div className="mt-auto px-2 pt-3">
           <Badge tone={isPttMode ? "accent" : "idle"}>
             {isPttMode ? "Push to talk" : "Open mic"}
@@ -534,9 +471,9 @@ export function Settings({
         </div>
       </nav>
 
-      {/* Content */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-border px-5">
+      {/* Right Settings Content Floating Island */}
+      <div className="glass-card flex min-w-0 flex-1 flex-col overflow-hidden rounded-[22px]">
+        <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-border px-6">
           <h2 className="text-15 font-semibold text-text">{active.label}</h2>
           <Button
             variant="ghost"
@@ -549,8 +486,10 @@ export function Settings({
           </Button>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          <div className="mx-auto flex w-full max-w-160 flex-col gap-5">{body()}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-6">
+          <div className="mx-auto flex w-full max-w-[680px] flex-col gap-5 rounded-2xl border border-border bg-[var(--bg-input)] p-6">
+            {body()}
+          </div>
         </div>
       </div>
     </div>

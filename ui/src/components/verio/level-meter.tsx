@@ -85,7 +85,7 @@ export const MicLevelMeter = forwardRef<LevelMeterHandle, LevelMeterProps>(
     return (
       <div
         className={cn(
-          "h-1.5 w-full overflow-hidden rounded-sm bg-surface-3",
+          "h-1.5 w-full overflow-hidden rounded-full border border-border/60 bg-[var(--bg-input)]",
           className,
         )}
         role="meter"
@@ -95,7 +95,7 @@ export const MicLevelMeter = forwardRef<LevelMeterHandle, LevelMeterProps>(
       >
         <div
           ref={fillRef}
-          className={cn("h-full rounded-sm transition-none", fillClassName)}
+          className={cn("h-full rounded-full transition-none", fillClassName)}
           style={{ width: "0%" } satisfies CSSProperties}
         />
       </div>

@@ -30,6 +30,7 @@ import {
   CircleDot,
   Clock,
   Copy,
+  EarOff,
   ExternalLink,
   FileAudio,
   FolderOpen,
@@ -47,6 +48,7 @@ import {
   Mic,
   MicOff,
   Minimize2,
+  Minus,
   Music,
   Pause,
   Pencil,
@@ -75,6 +77,7 @@ import {
   Wifi,
   WifiOff,
   X,
+  Zap,
 } from "lucide-react";
 
 /** design.md: 14px inline, 16px in buttons, 20px for header brand marks. */
@@ -153,7 +156,9 @@ export const IconLeave = makeIcon(PhoneOff, "leave");
 export const IconUsers = makeIcon(Users, "users");
 export const IconVolume = makeIcon(Volume2, "volume");
 export const IconVolumeOff = makeIcon(VolumeX, "volumeOff");
+export const IconEarOff = makeIcon(EarOff, "earOff");
 export const IconSignal = makeIcon(Signal, "signal");
+export const IconZap = makeIcon(Zap, "zap");
 export const IconWifi = makeIcon(Wifi, "wifi");
 export const IconWifiOff = makeIcon(WifiOff, "wifiOff");
 export const IconHash = makeIcon(Hash, "hash");
@@ -173,6 +178,8 @@ export const IconMonitor = makeIcon(Headphones, "monitor");
 // --- Generic controls ------------------------------------------------------
 export const IconCheck = makeIcon(Check, "check");
 export const IconX = makeIcon(X, "close");
+export const IconMinus = makeIcon(Minus, "minus");
+export const IconWindowMaximize = makeIcon(Square, "windowMaximize");
 export const IconPlus = makeIcon(Plus, "plus");
 export const IconCopy = makeIcon(Copy, "copy");
 export const IconPencil = makeIcon(Pencil, "pencil");

@@ -392,6 +392,11 @@ impl VpsSignaling {
                         }
                     }
                 }
+                Ok(Message::Ping(payload)) => {
+                    let _ = self.socket.send(Message::Pong(payload));
+                    let _ = self.socket.flush();
+                }
+                Ok(Message::Pong(_)) => {}
                 Ok(Message::Close(_)) => break,
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
@@ -781,5 +786,74 @@ mod tests {
         let res = VpsSignaling::join(&format!("ws://{addr}/ws"), "1111", &id);
         assert!(res.is_err());
         assert!(start.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn test_vps_run_listener_flushes_pong_on_ping() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let local_id = Identity {
+            uuid: Uuid::from_u128(101),
+            user_id: "user-pong".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Alice".into(),
+            version: "0.1.0".into(),
+        };
+
+        let (saw_pong_tx, saw_pong_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let Message::Text(req_txt) = ws.read().unwrap() else {
+                panic!("expected join message");
+            };
+            let WireClientMessage::Join { room, .. } =
+                serde_json::from_str(&req_txt).unwrap()
+            else {
+                panic!("expected Join variant");
+            };
+            let joined = WireServerMessage::Joined {
+                room,
+                peers: Vec::new(),
+            };
+            ws.send(Message::Text(serde_json::to_string(&joined).unwrap()))
+                .unwrap();
+
+            // Send Ping with payload
+            let ping_payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+            ws.send(Message::Ping(ping_payload.clone())).unwrap();
+
+            // Wait to receive Pong back
+            loop {
+                match ws.read() {
+                    Ok(Message::Pong(payload)) => {
+                        let _ = saw_pong_tx.send(payload);
+                        break;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}/ws");
+        let mut session = VpsSignaling::join(&url, "1111", &local_id).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        session.set_stop_flag(Arc::clone(&stop));
+
+        let listener_thread = std::thread::spawn(move || {
+            session.run_listener(|_| {});
+        });
+
+        let pong_payload = saw_pong_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server must receive flushed Pong from client");
+        assert_eq!(pong_payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        stop.store(true, Ordering::Relaxed);
+        listener_thread.join().unwrap();
+        server_thread.join().unwrap();
     }
 }

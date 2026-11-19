@@ -1699,17 +1699,36 @@ pub fn spawn_relay_session_with_candidates(
                                     pkt.push(RELAY_TAG_CONTROL);
                                     pkt.extend_from_slice(json.as_bytes());
                                     let framed = wrap_stun_envelope(&pkt);
-                                    let _ = socket.send_to(&framed, active_relay_addr);
-                                    log_relay_packet(
-                                        "send",
-                                        &room_log,
-                                        &local_uuid_short,
-                                        active_relay_addr,
-                                        framed.len(),
-                                        "control",
-                                        &mut tx_log,
-                                    );
-                                    bump_relay_sent(&diag_clone, framed.len());
+                                    let probe_all = last_recv_time
+                                        .map(|t| t.elapsed() >= Duration::from_secs(5))
+                                        .unwrap_or(true);
+                                    if probe_all {
+                                        for target in &candidate_addrs {
+                                            let _ = socket.send_to(&framed, *target);
+                                            log_relay_packet(
+                                                "send",
+                                                &room_log,
+                                                &local_uuid_short,
+                                                *target,
+                                                framed.len(),
+                                                "control",
+                                                &mut tx_log,
+                                            );
+                                            bump_relay_sent(&diag_clone, framed.len());
+                                        }
+                                    } else {
+                                        let _ = socket.send_to(&framed, active_relay_addr);
+                                        log_relay_packet(
+                                            "send",
+                                            &room_log,
+                                            &local_uuid_short,
+                                            active_relay_addr,
+                                            framed.len(),
+                                            "control",
+                                            &mut tx_log,
+                                        );
+                                        bump_relay_sent(&diag_clone, framed.len());
+                                    }
                                 }
                             }
                             PeerCommand::Disconnect => {
@@ -1732,7 +1751,7 @@ pub fn spawn_relay_session_with_candidates(
                 let now = Instant::now();
                 // 1s heartbeat keeps NAT open
                 if now.duration_since(last_heartbeat) >= Duration::from_secs(1) {
-                    if last_recv_time.is_none() {
+                    if last_recv_time.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(true) {
                         // Probe all candidates until inbound traffic locks onto one
                         for target in &candidate_addrs {
                             let _ = socket.send_to(&framed_prefix, *target);
@@ -1774,17 +1793,36 @@ pub fn spawn_relay_session_with_candidates(
                         pkt.push(RELAY_TAG_CONTROL);
                         pkt.extend_from_slice(json.as_bytes());
                         let framed = wrap_stun_envelope(&pkt);
-                        let _ = socket.send_to(&framed, active_relay_addr);
-                        log_relay_packet(
-                            "send",
-                            &room_log,
-                            &local_uuid_short,
-                            active_relay_addr,
-                            framed.len(),
-                            "control",
-                            &mut tx_log,
-                        );
-                        bump_relay_sent(&diag_clone, framed.len());
+                        let probe_all = last_recv_time
+                            .map(|t| t.elapsed() >= Duration::from_secs(5))
+                            .unwrap_or(true);
+                        if probe_all {
+                            for target in &candidate_addrs {
+                                let _ = socket.send_to(&framed, *target);
+                                log_relay_packet(
+                                    "send",
+                                    &room_log,
+                                    &local_uuid_short,
+                                    *target,
+                                    framed.len(),
+                                    "control",
+                                    &mut tx_log,
+                                );
+                                bump_relay_sent(&diag_clone, framed.len());
+                            }
+                        } else {
+                            let _ = socket.send_to(&framed, active_relay_addr);
+                            log_relay_packet(
+                                "send",
+                                &room_log,
+                                &local_uuid_short,
+                                active_relay_addr,
+                                framed.len(),
+                                "control",
+                                &mut tx_log,
+                            );
+                            bump_relay_sent(&diag_clone, framed.len());
+                        }
                     }
                     last_ping = now;
                 }
@@ -1926,6 +1964,7 @@ pub fn spawn_relay_session_with_candidates(
                                 }
                             }
                             let _ = socket.set_nonblocking(false);
+                            let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
@@ -2659,6 +2698,118 @@ mod tests {
             h_a.disconnect();
             h_o.disconnect();
         }
+    }
+
+    #[test]
+    fn test_relay_sessions_probe_fallbacks_when_primary_unreachable() {
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable_primary = probe.local_addr().unwrap();
+        drop(probe);
+
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fallback_addr = relay_socket.local_addr().unwrap();
+
+        let relay_sock_clone = relay_socket.try_clone().unwrap();
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_flag);
+        let relay_handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let mut clients: std::collections::HashMap<String, std::collections::HashMap<[u8; 16], SocketAddr>> = std::collections::HashMap::new();
+            relay_sock_clone.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((n, from)) = relay_sock_clone.recv_from(&mut buf) {
+                    if n >= 20 {
+                        let inner: &[u8] = if n > 20
+                            && buf[0..2] == [0x00, 0x01]
+                            && buf[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                        {
+                            &buf[20..n]
+                        } else {
+                            &buf[..n]
+                        };
+                        if inner.len() >= 20 {
+                            let room = String::from_utf8_lossy(&inner[0..4]).to_string();
+                            let mut sender_uuid = [0u8; 16];
+                            sender_uuid.copy_from_slice(&inner[4..20]);
+                            let room_map = clients.entry(room).or_default();
+                            room_map.insert(sender_uuid, from);
+                            if inner.len() > 20 {
+                                for (&uuid, &target) in room_map.iter() {
+                                    if uuid != sender_uuid && target != from {
+                                        let _ = relay_sock_clone.send_to(inner, target);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let id_a = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(501),
+            user_id: "user-a".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Alice".into(),
+            version: "0.1.0".into(),
+        };
+        let id_b = verio_discovery::Identity {
+            uuid: verio_discovery::Uuid::from_u128(502),
+            user_id: "user-b".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Bob".into(),
+            version: "0.1.0".into(),
+        };
+        let silence = Arc::new(vec![0u8; 2]);
+        let (tx_a, rx_a) = mpsc::channel();
+        let (tx_b, rx_b) = mpsc::channel();
+
+        let handle_a = spawn_relay_session_with_candidates(
+            unreachable_primary,
+            vec![fallback_addr],
+            "7777".into(),
+            id_a.clone(),
+            id_b.clone(),
+            silence.clone(),
+            tx_a,
+            "cloud_relay",
+        )
+        .unwrap();
+
+        let handle_b = spawn_relay_session_with_candidates(
+            unreachable_primary,
+            vec![fallback_addr],
+            "7777".into(),
+            id_b,
+            id_a.clone(),
+            silence,
+            tx_b,
+            "cloud_relay",
+        )
+        .unwrap();
+
+        assert!(matches!(rx_a.recv_timeout(Duration::from_secs(1)).unwrap(), TransportEvent::Connected));
+        assert!(matches!(rx_b.recv_timeout(Duration::from_secs(1)).unwrap(), TransportEvent::Connected));
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut got_rtt = false;
+        while Instant::now() < deadline {
+            if let Ok(TransportEvent::Rtt { ms }) = rx_a.recv_timeout(Duration::from_millis(50)) {
+                assert!(ms >= 0.0);
+                got_rtt = true;
+                break;
+            }
+        }
+        assert!(got_rtt, "Alice should receive Rtt via fallback relay");
+        assert_eq!(handle_a.diagnostics().endpoint, fallback_addr.to_string());
+        assert_eq!(handle_b.diagnostics().endpoint, fallback_addr.to_string());
+
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = relay_handle.join();
+        handle_a.disconnect();
+        handle_b.disconnect();
     }
 }
 

@@ -15,7 +15,7 @@ export interface ChatMessage {
 export interface ChatPanelProps {
   messages: ChatMessage[];
   onSendMessage: (text: string) => void;
-  onClose: () => void;
+  onClose?: () => void;
   className?: string;
 }
 
@@ -36,7 +36,7 @@ function renderMessageContent(content: string): ReactNode {
       return (
         <code
           key={idx}
-          className="rounded-sm border border-border bg-surface-2 px-1 py-0.5 font-mono text-11 text-text"
+          className="rounded-md border border-border bg-[var(--bg-input)] px-1.5 py-0.5 font-mono text-11 text-text"
         >
           {code}
         </code>
@@ -90,27 +90,29 @@ export function ChatPanel({
     <aside
       aria-label="Room chat"
       className={cn(
-        "flex min-h-0 flex-col rounded-md border border-border bg-surface",
+        "glass-card flex h-full min-h-0 flex-col overflow-hidden rounded-[22px]",
         className,
       )}
     >
       {/* Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
+      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="label-caps text-text-dim">Room Chat</span>
-          <span className="rounded-sm border border-border px-1.5 py-0.5 text-10 font-mono mono-num text-text-dim">
+          <span className="label-caps text-lavender">Room Chat</span>
+          <span className="mono-num rounded-full border border-border bg-[var(--bg-input)] px-2 py-0.5 font-mono text-10 text-text-dim">
             Ephemeral
           </span>
         </div>
-        <IconButton label="Close chat" variant="ghost" size="sm" onClick={onClose}>
-          <IconX size={14} />
-        </IconButton>
+        {onClose && (
+          <IconButton label="Close chat" variant="ghost" size="sm" onClick={onClose}>
+            <IconX size={14} />
+          </IconButton>
+        )}
       </div>
 
       {/* Message List */}
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-3.5">
         {messages.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center p-4 text-center text-13 text-text-dim">
+          <div className="flex flex-1 items-center justify-center p-5 text-center text-13 text-text-dim">
             No messages yet. Messages disappear when you leave the room.
           </div>
         ) : (
@@ -124,7 +126,7 @@ export function ChatPanel({
               <div
                 key={msg.id}
                 className={cn(
-                  "group relative flex flex-col gap-0.5 rounded-sm px-2 py-1 transition-colors hover:bg-surface-2",
+                  "group relative flex flex-col gap-0.5 rounded-xl px-3 py-1.5 transition-colors hover:bg-surface-2/60",
                   !isGrouped && i > 0 && "mt-1",
                 )}
               >
@@ -133,18 +135,18 @@ export function ChatPanel({
                     <span
                       className={cn(
                         "text-13 font-medium",
-                        msg.isSelf ? "text-accent" : "text-text",
+                        msg.isSelf ? "text-accent" : "text-lavender",
                       )}
                     >
                       {msg.isSelf ? "You" : msg.senderName}
                     </span>
-                    <span className="text-10 font-mono mono-num text-text-dim">
+                    <span className="mono-num font-mono text-10 text-text-dim">
                       {formatChatTime(msg.timestampMs)}
                     </span>
                   </div>
                 )}
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1 whitespace-pre-wrap break-words text-13 leading-[1.4] text-text select-text">
+                  <div className="min-w-0 flex-1 select-text whitespace-pre-wrap break-words text-13 leading-[1.45] text-text">
                     {renderMessageContent(msg.text)}
                   </div>
                   <IconButton
@@ -167,8 +169,8 @@ export function ChatPanel({
       </div>
 
       {/* Composer Footer */}
-      <div className="flex shrink-0 flex-col gap-2 border-t border-border bg-surface p-3">
-        <div className="flex items-center justify-between text-10 font-mono mono-num">
+      <div className="flex shrink-0 flex-col gap-2 border-t border-border bg-[rgba(14,10,26,0.38)] p-3.5">
+        <div className="flex items-center justify-between font-mono text-10 mono-num">
           <span className="text-text-dim">In-call chat</span>
           {text.length > 0 && (
             <span
@@ -187,7 +189,7 @@ export function ChatPanel({
             rows={1}
             maxLength={500}
             className={cn(
-              "max-h-24 min-h-8 flex-1 resize-none rounded-sm border border-border bg-bg px-3 py-1.5",
+              "max-h-24 min-h-9 flex-1 resize-none rounded-xl border border-border bg-[var(--bg-input)] px-3 py-2",
               "text-13 text-text placeholder:text-text-faint",
               "focus-visible:border-accent focus-visible:outline-none",
               "transition-colors",
@@ -196,11 +198,12 @@ export function ChatPanel({
           />
           <Button
             variant="primary"
-            size="sm"
+            size="md"
             disabled={!text.trim()}
             onClick={handleSend}
             icon={<IconSend size={14} />}
             aria-label="Send message"
+            className="h-9 rounded-xl px-3.5"
           >
             Send
           </Button>

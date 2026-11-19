@@ -364,8 +364,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 break;
             }
             _ = ping_interval.tick() => {
-                if last_rx.elapsed() >= std::time::Duration::from_secs(60) {
-                    tracing::warn!(conn_id, "closing inactive signaling websocket after 60s without traffic");
+                if last_rx.elapsed() >= std::time::Duration::from_secs(90) {
+                    tracing::warn!(conn_id, "closing inactive signaling websocket after 90s without traffic");
                     break;
                 }
                 if tx.send(Message::Ping(Vec::new().into())).is_err() {

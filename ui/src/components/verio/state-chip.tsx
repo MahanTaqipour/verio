@@ -30,11 +30,11 @@ import { cn } from "@/lib/utils";
 export type ChipTone = "neutral" | "accent" | "idle" | "warn" | "danger";
 
 const TONES: Record<ChipTone, string> = {
-  neutral: "border-border bg-surface-2 text-text-dim",
-  accent: "border-accent/25 bg-accent/8 text-accent",
-  idle: "border-idle/30 bg-idle/8 text-idle",
-  warn: "border-warn/25 bg-warn/6 text-warn",
-  danger: "border-danger/35 bg-danger/8 text-danger",
+  neutral: "border-border bg-surface-2/85 text-text-dim",
+  accent: "border-accent/40 bg-accent/12 text-accent",
+  idle: "border-idle/35 bg-idle/12 text-idle",
+  warn: "border-warn/35 bg-warn/12 text-warn",
+  danger: "border-danger/45 bg-danger/15 text-[#fca5a5]",
 };
 
 /** The dot colour that matches each tone, for callers that show a leading dot. */
@@ -84,7 +84,7 @@ export function StateChip({
   expanded,
 }: StateChipProps) {
   const classes = cn(
-    "inline-flex select-none items-center gap-2 whitespace-nowrap rounded-sm border px-2 py-1",
+    "inline-flex select-none items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1",
     "font-mono text-10 uppercase tracking-chip",
     "transition-colors ease-verio",
     TONES[tone],

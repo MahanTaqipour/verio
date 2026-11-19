@@ -5,46 +5,47 @@ This file contains only tokens. No layout, no components, no behavior.
 
 ## Brand direction
 
-Warm, quiet, serious. Dark mode only. Not gamer RGB, not Discord, not a
-corporate SaaS dashboard. Precision-instrument feel — closer to a piece of
-hi-fi audio gear than to a chat app.
+Midnight Violet / Electric Lavender / Acid Cyber Lime 60/30/10 glass & tactical
+instrumentation system (`1280 × 720` widescreen horizontal shell). Dark mode only.
 
 ## Color
 
-### Base surfaces
+### Base surfaces (60% Midnight Violet over Deep Violet Void)
 
-| Token           | Hex       | Use                                                    |
-|-----------------|-----------|--------------------------------------------------------|
-| `--bg`          | `#171412` | App background. Warm espresso, not pure black.         |
-| `--surface`     | `#211c18` | Cards, panels, list rows.                              |
-| `--surface-2`   | `#2a2420` | Hover states, inset wells, dropdown backgrounds.       |
-| `--surface-3`   | `#332b25` | Deepest wells, active row backgrounds, pressed states. |
+| Token           | Value       | Use                                                    |
+|-----------------|-------------|--------------------------------------------------------|
+| `--bg`          | `#120d1d`   | Deep anchor void for outer window and rail contrast.   |
+| `--surface`     | `#241b3a`   | Primary Midnight Violet panel and card base.           |
+| `--surface-2`   | `#2e234a`   | Hover states, inset wells, dropdown backgrounds.       |
+| `--surface-3`   | `#392c5a`   | Active rows, pressed states.                           |
 
-### Borders
+### Borders & Glass Speculars (30% Electric Lavender)
 
-| Token             | Hex       | Use                                     |
-|-------------------|-----------|-----------------------------------------|
-| `--border`        | `#2a241f` | Default hairline. Barely visible.       |
-| `--border-2`      | `#3a322b` | Hovered or focused borders.             |
+| Token              | Value                         | Use                                     |
+|--------------------|-------------------------------|-----------------------------------------|
+| `--border`         | `rgba(185, 167, 230, 0.22)`   | Default hairline.                       |
+| `--border-2`       | `rgba(185, 167, 230, 0.42)`   | Hovered, focused, and glass card edge.  |
+| `--accent-lavender`| `#b9a7e6`                     | Glass specular accents, sliders, bars.  |
 
 ### Text
 
-| Token           | Hex       | Use                                              |
-|-----------------|-----------|--------------------------------------------------|
-| `--text`        | `#e8dfd1` | Primary text. Warm bone, not pure white.         |
-| `--text-dim`    | `#7d7166` | Labels, secondary info, timestamps.              |
-| `--text-faint`  | `#57504a` | Placeholders, disabled text.                     |
+| Token              | Value     | Use                                              |
+|--------------------|-----------|--------------------------------------------------|
+| `--text`           | `#f8fafc` | Primary headings, hero numbers, active titles.   |
+| `--text-dim`       | `#b8b0cc` | Labels, secondary info, metadata (>= 4.5:1).     |
+| `--text-faint`     | `#7e7498` | Section eyebrows, placeholders, disabled text.   |
+| `--text-on-accent` | `#120d1d` | Ink on `#e8ff3a` buttons/badges/pills (~14:1).   |
 
-### Semantic
+### Semantic (10% Acid Cyber Lime & Status)
 
-| Token           | Hex       | Use                                                    |
+| Token           | Value     | Use                                                    |
 |-----------------|-----------|--------------------------------------------------------|
-| `--accent`      | `#c9873f` | Primary action + speaking indicator. Nothing else.     |
-| `--accent-hi`   | `#d9994f` | Hover state for accent elements.                       |
-| `--accent-lo`   | `#a86f2f` | Pressed state for accent elements.                     |
-| `--idle`        | `#5b7a72` | Quiet / connected / at-rest. Mossy green-grey.         |
-| `--warn`        | `#b86a4a` | Muted, deafened, non-critical warnings.                |
-| `--danger`      | `#8a3a30` | Destructive actions only (leave call, remove peer).    |
+| `--accent`      | `#e8ff3a` | Primary CTA, active rail bar, speaking, unread badge.  |
+| `--accent-hi`   | `#f1ff7a` | Hover state for accent elements.                       |
+| `--accent-lo`   | `#c8df18` | Pressed state for accent elements.                     |
+| `--idle`        | `#10b981` | Connected / active online dot & chip.                  |
+| `--warn`        | `#f59e0b` | Muted mic / warning.                                   |
+| `--danger`      | `#ef4444` | Destructive border/wash (`#fca5a5` for readable text). |
 
 ### Color rules
 
@@ -114,11 +115,11 @@ Common uses:
 
 | Token      | Value | Use                                                    |
 |------------|-------|--------------------------------------------------------|
-| `--r-sm`   | 5px   | Buttons, inputs, chips, small cards.                   |
-| `--r-md`   | 8px   | Standard cards, panels, list containers.               |
-| `--r-lg`   | 12px  | Modals, drawers, large surfaces.                       |
+| `--r-sm`   | 12px  | Buttons, inputs, select boxes, nav rail items, OTP.    |
+| `--r-md`   | 16px  | Inner cards, participant tiles, settings cards.        |
+| `--r-lg`   | 22px  | Floating glass islands, lobby cards, chat, music cards.|
 
-Full circles (`border-radius: 50%`) only for avatars and status dots.
+Full pill radii (`rounded-full`) for status chips, badges, unread counters, and avatars.
 
 ## Motion
 

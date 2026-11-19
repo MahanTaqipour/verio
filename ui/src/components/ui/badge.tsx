@@ -20,11 +20,11 @@ import { cn } from "@/lib/utils";
 export type BadgeTone = "neutral" | "accent" | "idle" | "warn" | "danger";
 
 const TONES: Record<BadgeTone, string> = {
-  neutral: "bg-surface-3 text-text-dim",
+  neutral: "bg-surface-3/90 text-text-dim",
   accent: "bg-accent/15 text-accent border-accent/50",
   idle: "bg-idle/15 text-idle border-idle/50",
   warn: "bg-warn/15 text-warn border-warn/50",
-  danger: "bg-danger/15 text-danger border-danger/50",
+  danger: "bg-danger/15 text-[#fca5a5] border-danger/50",
 };
 
 export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {
@@ -46,7 +46,7 @@ export function Badge({
   return (
     <span
       className={cn(
-        "inline-flex select-none items-center gap-1.5 rounded-sm px-2 py-1",
+        "inline-flex select-none items-center gap-1.5 rounded-full px-2.5 py-1",
         "label-caps whitespace-nowrap",
         TONES[tone],
         outlined && "border",

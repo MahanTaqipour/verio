@@ -34,7 +34,7 @@ export function KbdChip({ children, className, decorative = false }: KbdChipProp
       className={cn(
         // leading-none keeps the chip from inheriting a tall line box, which is
         // what made the old .kbd chip 17px tall for 10px text.
-        "inline-flex shrink-0 items-center rounded-sm bg-surface-3 px-1 py-1",
+        "inline-flex shrink-0 items-center rounded-md bg-surface-3/90 px-1.5 py-0.5",
         "font-mono text-10 leading-none tracking-normal text-text-dim",
         className,
       )}

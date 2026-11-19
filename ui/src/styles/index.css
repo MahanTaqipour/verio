@@ -92,67 +92,50 @@
    -------------------------------------------------------------------------- */
 
 @theme {
-  /* --- Base surfaces (4 tiers) ------------------------------------------ */
-  --color-bg: #171412;
-  --color-surface: #211c18;
-  --color-surface-2: #2a2420;
-  --color-surface-3: #332b25;
+  /* --- 60% Midnight Violet surfaces over Deep Violet Void ------------------ */
+  --color-bg: #120d1d;
+  --color-surface: #241b3a;
+  --color-surface-2: #2e234a;
+  --color-surface-3: #392c5a;
+  --color-bg-deep: #0e0a18;
 
-  /* --- Fixed-bar gradient stop -------------------------------------------
-     The bottom dock's background is `linear-gradient(180deg, --bg, #14110f)`.
-     design.md permits gradients on fixed bars and only there ("Gradients only
-     on fixed bars (e.g. a bottom dock) and only subtly"), so this stop is a
-     token rather than an arbitrary value. It is a slightly deeper espresso than
-     --bg, which makes the dock read as a separate plane without a hard edge. */
-  --color-bg-deep: #14110f;
+  /* --- 30% Electric Lavender borders & glass speculars -------------------- */
+  --color-border: rgba(185, 167, 230, 0.22);
+  --color-border-2: rgba(185, 167, 230, 0.42);
+  --color-lavender: #b9a7e6;
+  --color-lavender-bright: #d4c7f7;
 
-  /* --- Borders ----------------------------------------------------------- */
-  --color-border: #2a241f;
-  --color-border-2: #3a322b;
+  /* --- Text hierarchy (WCAG >= 4.5:1 for readable copy) ------------------- */
+  --color-text: #f8fafc;
+  --color-text-dim: #b8b0cc;
+  --color-text-faint: #7e7498;
+  --color-on-accent: #120d1d;
 
-  /* --- Text -------------------------------------------------------------- */
-  --color-text: #e8dfd1;
-  --color-text-dim: #7d7166;
-  --color-text-faint: #57504a;
+  /* --- 10% Acid Cyber Lime & Semantic ------------------------------------- */
+  --color-accent: #e8ff3a;
+  --color-accent-hi: #f1ff7a;
+  --color-accent-lo: #c8df18;
+  --color-idle: #10b981;
+  --color-warn: #f59e0b;
+  --color-danger: #ef4444;
+  --color-danger-text: #fca5a5;
 
-  /* --- Semantic ---------------------------------------------------------- */
-  --color-accent: #c9873f;
-  --color-accent-hi: #d9994f;
-  --color-accent-lo: #a86f2f;
-  --color-idle: #5b7a72;
-  --color-warn: #b86a4a;
-  --color-danger: #8a3a30;
-
-  /* --- Spacing: the 4px baseline grid ----------------------------------- */
+  /* --- Spacing: the 4px baseline grid ------------------------------------- */
   --spacing: 4px;
 
-  /* --- Shell metrics: the header's height, as one number -----------------
-     A named member of the spacing scale, so `h-header` and `top-header` read
-     from the same declaration and cannot drift apart.
+  /* --- Shell metrics ------------------------------------------------------ */
+  --spacing-header: 48px;
 
-     They were two independent literals (`h-14` on the header in app-header.tsx,
-     `top-14` on the diagnostics drawer in App.tsx) that had to agree. They have
-     already disagreed once: the drawer was `fixed top-0`, spanning the full
-     window and covering the header's right side, so its own close button sat on
-     top of the toggle that opens it and the toggle could not be pressed twice.
-     Fixing that by editing one of the two numbers is what left the hazard in
-     place. */
-  --spacing-header: 56px;
+  /* --- Soft Squircle Radii (Arc / VisionOS Inspired) ---------------------- */
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 22px;
 
-  /* --- Radii ------------------------------------------------------------- */
-  --radius-sm: 5px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-
-  /* --- Type families ----------------------------------------------------- */
+  /* --- Type families ------------------------------------------------------ */
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 
-  /* --- Type scale --------------------------------------------------------
-     Named by pixel size on purpose: `text-17` cannot be written because there
-     is no `--text-17`, so an off-scale size fails visibly instead of quietly
-     inventing a new step. Line heights follow design.md: 1.4 body,
-     1.2 headings, 1.0 for large numerals. */
+  /* --- Type scale --------------------------------------------------------- */
   --text-10: 10px;
   --text-10--line-height: 1.4;
   --text-11: 11px;
@@ -167,53 +150,31 @@
   --text-18--line-height: 1.2;
   --text-24: 24px;
   --text-24--line-height: 1;
+  --text-32: 32px;
+  --text-32--line-height: 1;
 
-  /* --- Tracking ---------------------------------------------------------- */
-  /* design.md specifies 0.15em for uppercase section labels. Chips are not
-     section labels — they are smaller and denser, and 0.15em on a 10px chip
-     makes short words like "IDLE" read as scattered letters. 0.08em keeps them
-     legible as words while staying visibly mono-spaced. Both are tokens so no
-     component writes an arbitrary tracking value. */
+  /* --- Tracking ----------------------------------------------------------- */
   --tracking-label: 0.15em;
   --tracking-chip: 0.08em;
 
-  /* --- Breakpoints -------------------------------------------------------
-     The four widths the design is checked at, replacing Tailwind's defaults so
-     every `sm:`/`md:`/`lg:`/`xl:` in the codebase means a width the design
-     actually specifies. Verio's window has no minimum size and defaults to
-     860×640, so `sm` (700px) is the floor the layout must survive, not an
-     edge case. Layouts are designed at 860 first and then allowed to breathe
-     upward. */
+  /* --- Breakpoints -------------------------------------------------------- */
   --breakpoint-*: initial;
   --breakpoint-sm: 700px;
   --breakpoint-md: 900px;
   --breakpoint-lg: 1100px;
   --breakpoint-xl: 1400px;
 
-  /* --- Motion ------------------------------------------------------------ */
+  /* --- Motion ------------------------------------------------------------- */
   --default-transition-duration: 140ms;
   --default-transition-timing-function: ease;
   --duration-fast: 140ms;
   --duration-slow: 200ms;
   --ease-verio: ease;
-  /* Session 29d: entrance animations, and only entrances.
-     Every *state* change in the app already transitions — that is what
-     `--default-transition-duration` above is for, and the components opt in with
-     `transition-colors` / `transition-[width]`. What was missing was the moment an
-     element appears: a banner, a peer tile, a panel. Those popped in at full size,
-     which reads as a glitch rather than as something arriving.
-
-     Two rules govern the set. Nothing here animates *continuously* — design.md
-     permits that for the speaking indicator alone — and every animation is
-     `both`-filled so the element is at its final state before the animation starts
-     and after it ends, never mid-way in a way that could be measured.
-
-     `--animate-*` is Tailwind v4's theme hook, so each name below becomes a real
-     utility. That matters: Session 27 used `animate-speak-ring` when no
-     `--animate-speak-ring` existed, and the class silently did nothing. */
   --animate-rise: verio-rise var(--duration-slow) var(--ease-verio) both;
   --animate-fade: verio-fade var(--duration-fast) var(--ease-verio) both;
   --animate-lift: verio-lift var(--duration-slow) var(--ease-verio) both;
+  --animate-orbit-cw: verio-spin 7s linear infinite;
+  --animate-orbit-ccw: verio-spin-reverse 4.5s linear infinite;
 
   @keyframes verio-rise {
     from {
@@ -243,88 +204,74 @@
       transform: none;
     }
   }
+  @keyframes verio-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes verio-spin-reverse {
+    to {
+      transform: rotate(-360deg);
+    }
+  }
 
-  /* --- Elevation ---------------------------------------------------------
-     design.md permits exactly one shadow, for floating overlays only. Cards,
-     buttons and inputs never get one. */
-  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.4);
+  /* --- Elevation ---------------------------------------------------------- */
+  --shadow-overlay: 0 12px 32px rgba(8, 5, 15, 0.65);
+}
+
+:root {
+  color-scheme: dark;
+  --bg-window-glass: rgba(20, 14, 34, 0.62);
+  --bg-titlebar-glass: rgba(28, 20, 46, 0.55);
+  --bg-rail-glass: rgba(28, 20, 46, 0.55);
+  --bg-input: rgba(14, 10, 26, 0.56);
+  --accent-lavender: #b9a7e6;
+  --accent-lavender-bright: #d4c7f7;
+  --accent-lavender-wash: rgba(185, 167, 230, 0.16);
+  --glass-card-bg: linear-gradient(
+    135deg,
+    rgba(185, 167, 230, 0.16) 0%,
+    rgba(36, 27, 58, 0.58) 100%
+  );
+  --glass-card-bg-hover: linear-gradient(
+    135deg,
+    rgba(185, 167, 230, 0.24) 0%,
+    rgba(46, 35, 74, 0.68) 100%
+  );
+  --glass-card-bg-active: linear-gradient(
+    135deg,
+    rgba(185, 167, 230, 0.30) 0%,
+    rgba(57, 44, 90, 0.78) 100%
+  );
+  --shadow-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 12px 32px rgba(8, 5, 15, 0.42);
+  --text-on-accent: #120d1d;
+  --scrollbar-thumb: rgba(185, 167, 230, 0.48);
+  --scrollbar-thumb-hover: rgba(185, 167, 230, 0.75);
 }
 
 /* --------------------------------------------------------------------------
    Base layer
-   --------------------------------------------------------------------------
-   Tailwind's preflight is enabled (imported by `@import "tailwindcss"`). It is
-   required: it supplies `border: 0 solid` on every element, without which the
-   `border` utility would set a width against `border-style: none` and render
-   nothing.
-
-   Preflight is correct for a Tailwind-first app but it is NOT automatically
-   inert against an existing stylesheet. Rather than assume, every property it
-   touches was measured. `probe-all.mjs` enumerates the full computed style of
-   50 selectors across 4 screens × 2 widths and diffs pre/post Tailwind; the
-   result is 39 changed properties, of which exactly two were real.
-
-   Neutralised below (these changed visible rendering):
-     html { line-height: 1.5 }        App.css never set line-height, so the app
-                                      rendered at the UA default (`normal`).
-                                      1.5 reflowed every line box: 2.16% of
-                                      pixels changed on the lobby, 2.92% on the
-                                      room screen.
-     form controls letter-spacing:    Chromium's UA sets `normal` on controls;
-     inherit                          preflight makes them inherit. `.room-tag`
-                                      is 10px × 0.1em = exactly 1px and the
-                                      "Copy Code" button is its child, so the
-                                      button grew 89.88px → 98.88px.
-
-   Reviewed and accepted (measured to have no visual effect):
-     * { border: 0 solid }            width is 0, so nothing paints. Required
-                                      for the `border` utility. Changes only
-                                      `border-*-style` from none to solid.
-     img { max-width:100%;            `.brand-mark img` sets its own size and
-           height:auto;               sits in a flex row — geometry unchanged.
-           vertical-align:middle }
-     button/input/select font:inherit Bare `input` on these screens is
-                                      `input[type=range].slider-control`, which
-                                      App.css styles with `appearance: none`, so
-                                      font and colour do not paint. Every other
-                                      control sets its own font in App.css.
-     appearance: button               same as the native rendering for a
-                                      <button>.
-     tab-size 8 → 4,                  no <pre>/<textarea> with tabs; desktop
-     text-size-adjust,                only; touch-only.
-     -webkit-tap-highlight-color
-
-   The screenshot diff and the probe dumps in `design/screens/` are the
-   empirical record.
    -------------------------------------------------------------------------- */
-
 @layer base {
   html,
-  body {
+  body,
+  #root {
     height: 100%;
-
-    /* Preflight sets `html { line-height: 1.5 }`. The app previously rendered
-       at the UA default, so leaving this in place reflowed every line box on
-       every screen. Restored to the UA value to keep the foundation inert.
-       design.md's line-height ratios are not lost — they are carried as the
-       `--text-*--line-height` tokens and applied per component as each screen
-       is migrated, where the change is visible and reviewable. */
+    background: transparent !important;
     line-height: normal;
   }
 
   body {
-    background-color: var(--color-bg);
     color: var(--color-text);
     font-family: var(--font-ui);
     font-size: 14px;
+    overflow: hidden;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
 
-  /* Preflight sets `letter-spacing: inherit` on form controls, but Chromium's
-     UA stylesheet sets `normal` — controls are not meant to inherit tracking
-     from a label-like ancestor. Restored, because otherwise a button inside a
-     letterspaced tag silently inherits that tracking (see the header note). */
   button,
   input,
   select,
@@ -334,8 +281,6 @@
     letter-spacing: normal;
   }
 
-  /* design.md: a 2px accent outline offset by 2px, visible via :focus-visible
-     only — never on mouse click. */
   :focus-visible {
     outline: 2px solid var(--color-accent);
     outline-offset: 2px;
@@ -347,38 +292,49 @@
 
   ::selection {
     background-color: var(--color-accent);
-    color: var(--color-bg);
+    color: var(--color-on-accent);
   }
 
-  /* Custom warm scrollbars, per design.md: 6px wide, 3px radius, thumb
-     --surface-3 at rest and --border-2 on hover, transparent track.
-
-     The ::-webkit-scrollbar pseudo-elements are used deliberately instead of
-     `scrollbar-width`/`scrollbar-color`: in Chromium, setting either of those
-     standard properties disables ::-webkit-scrollbar styling entirely, and
-     design.md specifies an exact 6px width and 3px radius that the standard
-     properties cannot express. Verio ships on WebView2 (Chromium). */
-  ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+  /* Custom Midnight Violet / Electric Lavender scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
-  ::-webkit-scrollbar-track {
-    background: transparent;
-  }
+  @supports not (scrollbar-color: auto) {
+    * {
+      scrollbar-width: auto;
+    }
 
-  ::-webkit-scrollbar-thumb {
-    background-color: var(--color-surface-3);
-    border-radius: 3px;
-  }
+    ::-webkit-scrollbar {
+      width: 5px;
+      height: 0px !important;
+    }
 
-  ::-webkit-scrollbar-thumb:hover {
-    background-color: var(--color-border-2);
-  }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
 
-  ::-webkit-scrollbar-corner {
-    background: transparent;
+    ::-webkit-scrollbar-thumb {
+      background-color: rgba(185, 167, 230, 0.35);
+      border-radius: 9999px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: rgba(185, 167, 230, 0.65);
+    }
+
+    ::-webkit-scrollbar-corner {
+      background: transparent;
+    }
   }
+}
+
+@utility glass-card {
+  background: var(--glass-card-bg);
+  border: 1px solid var(--color-border-2);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(24px) saturate(180%);
 }
 
 /* --------------------------------------------------------------------------
