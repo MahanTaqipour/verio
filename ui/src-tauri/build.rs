@@ -1,15 +1,17 @@
 fn main() {
     // Verio registers global hotkeys (mute / deafen / PTT). Windows only delivers
     // key events to an elevated process while a game holds the foreground, so the
-    // app requests administrator at launch.
+    // app requests administrator at launch in release builds. Debug/test builds
+    // remain asInvoker so `cargo test --workspace` does not fail with os error 740.
     //
     // NOTE: supplying a custom manifest REPLACES the one tauri-build would generate,
     // so this must carry everything the default had - in particular the
     // comctl32 v6 assembly dependency, without which the loader binds comctl32 v5
     // and "TaskDialogIndirect" (used by the native file dialog) is missing.
-    let attrs = tauri_build::Attributes::new().windows_attributes(
-        tauri_build::WindowsAttributes::new().app_manifest(
-            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+    let attrs = if std::env::var("PROFILE").as_deref() == Ok("release") {
+        tauri_build::Attributes::new().windows_attributes(
+            tauri_build::WindowsAttributes::new().app_manifest(
+                r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="ir.verio.app" version="0.1.0.0" processorArchitecture="*" />
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -47,7 +49,10 @@ fn main() {
     </windowsSettings>
   </application>
 </assembly>"#,
-        ),
-    );
+            ),
+        )
+    } else {
+        tauri_build::Attributes::new()
+    };
     tauri_build::try_build(attrs).expect("failed to run tauri build script");
 }

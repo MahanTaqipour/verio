@@ -45,6 +45,11 @@ export interface SettingsValues {
   hotkeys: { ptt: string; mute: string; deafen: string };
 }
 
+export interface UpdateCheckStatus {
+  state: "idle" | "checking" | "up-to-date" | "available" | "error";
+  message?: string;
+}
+
 export interface SettingsProps {
   settings: SettingsValues | null;
   devices: { inputs: DeviceOption[]; outputs: DeviceOption[] };
@@ -66,6 +71,10 @@ export interface SettingsProps {
   onSetDebugWavs: (on: boolean) => void;
   onSetVoiceQuality: (kbps: number) => void;
   onSetMusicQuality: (kbps: number) => void;
+  appVersion?: string;
+  updateCheckStatus?: UpdateCheckStatus;
+  onCheckForUpdates?: () => void;
+  onOpenUpdateDialog?: () => void;
 }
 
 const SECTIONS = [
@@ -137,6 +146,10 @@ export function Settings({
   onSetDebugWavs,
   onSetVoiceQuality,
   onSetMusicQuality,
+  appVersion = "0.1.0",
+  updateCheckStatus,
+  onCheckForUpdates,
+  onOpenUpdateDialog,
 }: SettingsProps) {
   const [section, setSection] = useState<SectionId>("transmission");
 
@@ -464,10 +477,52 @@ export function Settings({
           );
         })}
 
-        <div className="mt-auto px-2 pt-3">
-          <Badge tone={isPttMode ? "accent" : "idle"}>
-            {isPttMode ? "Push to talk" : "Open mic"}
-          </Badge>
+        <div className="mt-auto flex flex-col gap-2 px-1.5 pt-3">
+          <div>
+            <Badge tone={isPttMode ? "accent" : "idle"}>
+              {isPttMode ? "Push to talk" : "Open mic"}
+            </Badge>
+          </div>
+          <div className="mt-1 flex flex-col gap-2 border-t border-border pt-3">
+            <span className="mono-num px-0.5 text-11 font-medium text-text-dim">
+              Verio v{appVersion}
+            </span>
+            {onCheckForUpdates && (
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={updateCheckStatus?.state === "checking"}
+                onClick={onCheckForUpdates}
+                className="w-full justify-center text-11"
+              >
+                Check for updates
+              </Button>
+            )}
+            {updateCheckStatus?.message && (
+              updateCheckStatus.state === "available" && onOpenUpdateDialog ? (
+                <button
+                  type="button"
+                  onClick={onOpenUpdateDialog}
+                  className="px-0.5 text-left text-11 font-medium text-accent underline-offset-2 hover:underline"
+                >
+                  {updateCheckStatus.message}
+                </button>
+              ) : (
+                <p
+                  className={cn(
+                    "px-0.5 text-11 leading-snug break-words",
+                    updateCheckStatus.state === "error"
+                      ? "text-[#fca5a5]"
+                      : updateCheckStatus.state === "up-to-date"
+                        ? "text-idle"
+                        : "text-text-dim",
+                  )}
+                >
+                  {updateCheckStatus.message}
+                </p>
+              )
+            )}
+          </div>
         </div>
       </nav>
 

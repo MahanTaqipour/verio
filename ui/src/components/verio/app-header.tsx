@@ -14,6 +14,13 @@ import type { NavView } from "@/components/verio/left-rail";
 
 type RoomState = "idle" | "connecting" | "connected" | "closed";
 
+export interface UpdateAvailableInfo {
+  version: string;
+  current_version: string;
+  date: string | null;
+  body: string | null;
+}
+
 export interface AppHeaderProps {
   activeView: NavView;
   rttMs: number | null;
@@ -27,6 +34,8 @@ export interface AppHeaderProps {
   chatOpen: boolean;
   onToggleChat: () => void;
   unreadChatCount?: number;
+  availableUpdate?: UpdateAvailableInfo | null;
+  onOpenUpdateDialog?: () => void;
 }
 
 const VIEW_LABELS: Record<NavView, string> = {
@@ -71,6 +80,8 @@ export function AppHeader({
   chatOpen,
   onToggleChat,
   unreadChatCount = 0,
+  availableUpdate = null,
+  onOpenUpdateDialog,
 }: AppHeaderProps) {
   const connection = STATE_STYLE[state] ?? STATE_STYLE.idle;
   const inMainRoom = isInCall && roomCode === "1111";
@@ -184,8 +195,19 @@ export function AppHeader({
         )}
       </div>
 
-      {/* Right: Connection Status + Single Chat Toggle + Custom Window Chrome */}
+      {/* Right: Update Pill + Connection Status + Single Chat Toggle + Custom Window Chrome */}
       <div className="flex shrink-0 items-center gap-2">
+        {availableUpdate && (
+          <button
+            type="button"
+            onClick={onOpenUpdateDialog}
+            title={`Update available: v${availableUpdate.version}`}
+            className="inline-flex h-7 shrink-0 items-center rounded-full bg-accent px-3 text-11 font-bold text-[#120D1D] transition-colors ease-verio hover:bg-accent-hi press"
+          >
+            Update v{availableUpdate.version}
+          </button>
+        )}
+
         <div
           aria-label={`Connection status: ${connection.label}`}
           className="inline-flex h-8 items-center gap-2 rounded-full border border-border bg-[var(--bg-input)] px-3 mono-num text-11"

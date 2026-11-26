@@ -211,6 +211,115 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState<{ text: string; isError?: boolean } | null>(null);
   const [toastPaused, setToastPaused] = useState(false);
 
+  // Auto-updater state (Session 36)
+  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [availableUpdate, setAvailableUpdate] = useState<{
+    version: string;
+    current_version: string;
+    date: string | null;
+    body: string | null;
+  } | null>(null);
+  const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState(false);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<{
+    downloaded: number;
+    total: number | null;
+  } | null>(null);
+  const [updateInstallError, setUpdateInstallError] = useState<string | null>(null);
+  const [updateCheckStatus, setUpdateCheckStatus] = useState<{
+    state: "idle" | "checking" | "up-to-date" | "available" | "error";
+    message?: string;
+  }>({ state: "idle" });
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenProgress: (() => void) | null = null;
+
+    invoke<string>("get_app_version")
+      .then((v) => {
+        if (!disposed && v) setAppVersion(v);
+      })
+      .catch(() => {});
+
+    void listen<{ downloaded: number; total: number | null }>("update_progress", (ev) => {
+      if (!disposed) setUpdateProgress(ev.payload);
+    }).then((u) => {
+      if (disposed) u();
+      else unlistenProgress = u;
+    });
+
+    const timer = window.setTimeout(() => {
+      if (disposed) return;
+      invoke<{
+        version: string;
+        current_version: string;
+        date: string | null;
+        body: string | null;
+      } | null>("check_for_update")
+        .then((u) => {
+          if (disposed || !u) return;
+          setAvailableUpdate(u);
+          setUpdateCheckStatus({
+            state: "available",
+            message: `Update v${u.version} available`,
+          });
+        })
+        .catch(() => {
+          // Ignore background network/release errors on startup.
+        });
+    }, 3000);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      unlistenProgress?.();
+    };
+  }, []);
+
+  const handleCheckForUpdates = async () => {
+    if (updateCheckStatus.state === "checking") return;
+    setUpdateCheckStatus({ state: "checking" });
+    try {
+      const u = await invoke<{
+        version: string;
+        current_version: string;
+        date: string | null;
+        body: string | null;
+      } | null>("check_for_update");
+      if (u) {
+        setAvailableUpdate(u);
+        setUpdateCheckStatus({
+          state: "available",
+          message: `Update v${u.version} available`,
+        });
+      } else {
+        setAvailableUpdate(null);
+        setUpdateCheckStatus({
+          state: "up-to-date",
+          message: `Up to date (v${appVersion})`,
+        });
+      }
+    } catch (e: any) {
+      setUpdateCheckStatus({
+        state: "error",
+        message: String(e),
+      });
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (isInstallingUpdate) return;
+    setIsInstallingUpdate(true);
+    setUpdateInstallError(null);
+    setUpdateProgress({ downloaded: 0, total: null });
+    try {
+      await invoke("install_update");
+    } catch (e: any) {
+      setIsInstallingUpdate(false);
+      setUpdateInstallError(String(e));
+    }
+  };
+
   // Auto-dismiss non-error toast notifications after 2500 ms unless hovered/focused
   useEffect(() => {
     if (!statusMsg || statusMsg.isError || toastPaused) return;
@@ -1111,6 +1220,11 @@ export default function App() {
         chatOpen={isChatOpen}
         onToggleChat={handleToggleChat}
         unreadChatCount={unreadChatCount}
+        availableUpdate={availableUpdate}
+        onOpenUpdateDialog={() => {
+          setUpdateInstallError(null);
+          setIsUpdateDialogOpen(true);
+        }}
       />
 
       {/* Zone 2 + Zone 3: Floating Left Rail & Dynamic Stage */}
@@ -1204,6 +1318,13 @@ export default function App() {
               onSetDebugWavs={(on) => void handleSetDebugWavs(on)}
               onSetVoiceQuality={(k) => void handleSetVoiceQuality(k)}
               onSetMusicQuality={(k) => void handleSetMusicQuality(k)}
+              appVersion={appVersion}
+              updateCheckStatus={updateCheckStatus}
+              onCheckForUpdates={() => void handleCheckForUpdates()}
+              onOpenUpdateDialog={() => {
+                setUpdateInstallError(null);
+                setIsUpdateDialogOpen(true);
+              }}
             />
           )}
         </main>
@@ -1318,6 +1439,113 @@ export default function App() {
               Leave call
             </button>
           ) : null}
+        </div>
+      )}
+
+      {/* Software Update Dialog */}
+      {isUpdateDialogOpen && availableUpdate && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm animate-fade"
+          onClick={() => {
+            if (!isInstallingUpdate) setIsUpdateDialogOpen(false);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Software update"
+            onClick={(e) => e.stopPropagation()}
+            className="glass-card w-full max-w-md rounded-[22px] p-6 shadow-[var(--shadow-overlay)] animate-lift"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex flex-col gap-1">
+                <span className="label-caps text-lavender">Update Available</span>
+                <h2 className="text-15 font-semibold text-text">
+                  Verio Update
+                </h2>
+                <p className="mono-num text-13 text-text-dim">
+                  v{availableUpdate.current_version} →{" "}
+                  <span className="font-semibold text-accent">
+                    v{availableUpdate.version}
+                  </span>
+                </p>
+              </div>
+              {!isInstallingUpdate && (
+                <button
+                  type="button"
+                  onClick={() => setIsUpdateDialogOpen(false)}
+                  aria-label="Close update dialog"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-text-dim transition-colors hover:bg-[rgba(185,167,230,0.14)] hover:text-text"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+
+            {availableUpdate.body && (
+              <div className="mt-4 max-h-40 overflow-y-auto rounded-2xl border border-border bg-[var(--bg-input)] p-4 text-13 leading-relaxed text-text-dim whitespace-pre-wrap">
+                {availableUpdate.body}
+              </div>
+            )}
+
+            {isInstallingUpdate && (
+              <div className="mt-4 flex flex-col gap-2">
+                {(() => {
+                  const downloaded = updateProgress?.downloaded ?? 0;
+                  const total = updateProgress?.total ?? null;
+                  const pct =
+                    total && total > 0
+                      ? Math.min(100, Math.round((downloaded / total) * 100))
+                      : 0;
+                  return (
+                    <>
+                      <div className="flex items-center justify-between text-11 text-text-dim">
+                        <span>Downloading &amp; installing update…</span>
+                        <span className="mono-num font-semibold text-text">
+                          {total && total > 0
+                            ? `${pct}%`
+                            : `${(downloaded / 1048576).toFixed(1)} MB`}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full overflow-hidden rounded-full border border-border bg-[var(--bg-input)]">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-[#B9A7E6] to-[#E8FF3A] transition-[width] duration-150"
+                          style={{
+                            width: `${total && total > 0 ? pct : 35}%`,
+                          }}
+                        />
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
+            {updateInstallError && (
+              <p className="mt-3 rounded-xl border border-danger/45 bg-danger/15 px-3 py-2 text-13 text-[#fca5a5]">
+                {updateInstallError}
+              </p>
+            )}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={isInstallingUpdate}
+                onClick={() => setIsUpdateDialogOpen(false)}
+                className="h-9 rounded-xl border border-border bg-surface-2/85 px-4 text-13 font-medium text-text transition-colors hover:border-border-2 hover:bg-surface-3 disabled:pointer-events-none disabled:opacity-50 press"
+              >
+                Later
+              </button>
+              <button
+                type="button"
+                disabled={isInstallingUpdate}
+                onClick={() => void handleInstallUpdate()}
+                className="h-9 rounded-xl bg-accent px-4 text-13 font-bold text-[#120D1D] transition-colors hover:bg-accent-hi disabled:pointer-events-none disabled:opacity-60 press"
+              >
+                {isInstallingUpdate ? "Installing…" : "Update & Restart"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </AmbientGlassCanvas>

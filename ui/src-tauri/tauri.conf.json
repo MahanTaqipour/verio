@@ -29,6 +29,30 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "windows": {
+        "installMode": "passive"
+      },
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNTk3QTNEQTMzRTdGNzAKUldSd2Z6NmpQWHBaZzE2NDd5Ry8weUg1THU3MXRVT1JkclRIditiQlJaZkEwNm5RTGV4Yk9rcjIK",
+      "endpoints": [
+        "https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

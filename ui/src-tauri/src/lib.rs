@@ -1490,6 +1490,78 @@ fn enable_windows_acrylic(hwnd: *mut core::ffi::c_void) {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateAvailable {
+    pub version: String,
+    pub current_version: String,
+    pub date: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateProgress {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+}
+
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateAvailable>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(update.map(|u| UpdateAvailable {
+        version: u.version,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        date: u.date.map(|d| d.to_string()),
+        body: u.body,
+    }))
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let Some(update) = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("No update is currently available.".to_string());
+    };
+
+    let mut downloaded: u64 = 0;
+    let progress_app = app.clone();
+    update
+        .download_and_install(
+            move |chunk_len, content_len| {
+                downloaded = downloaded.saturating_add(chunk_len as u64);
+                let _ = progress_app.emit(
+                    "update_progress",
+                    UpdateProgress {
+                        downloaded,
+                        total: content_len,
+                    },
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tauri::Manager::state::<Bridge>(&app).settings.flush();
+    app.restart();
+}
+
 /// Build and run the Tauri application.
 pub fn run() {
     #[cfg(target_os = "windows")]
@@ -1497,8 +1569,8 @@ pub fn run() {
 
     let launch = parse_launch_args();
     tauri::Builder::default()
-
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             ping,
@@ -1570,6 +1642,9 @@ pub fn run() {
             music_pick_files,
             set_voice_quality,
             set_music_quality,
+            get_app_version,
+            check_for_update,
+            install_update,
         ])
         .setup(move |app| {
             let launch: LaunchArgs = launch;

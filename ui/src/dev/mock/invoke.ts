@@ -338,6 +338,12 @@ export function installMockTransport(scenarioId: string): MockTransport {
           : null;
       case "music_status":
         return structuredClone(state.music);
+      case "get_app_version":
+        return "0.1.0";
+      case "check_for_update":
+        return null;
+      case "install_update":
+        return null;
       case "ping":
         return {
           message: `Hello ${String(args.name ?? "")}! The Rust ↔ frontend bridge is working.`,

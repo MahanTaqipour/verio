@@ -5529,3 +5529,37 @@ Verified (real command output):
 - `cargo test -p verio-transport`: Exit code 0 (19 passed, including `test_relay_sessions_probe_fallbacks_when_primary_unreachable`)
 - Linux musl cross-compile: `target\x86_64-unknown-linux-musl\release\verio-server` compiled cleanly and deployed to `89.116.72.30`.
 
+### Session 36 (2026-11-26) — Windows NSIS Installer, Signed Auto-Updater (`tauri-plugin-updater`), & Release Pipeline
+
+Goal:
+1. Enable signed Windows NSIS installer builds and `tauri-plugin-updater` auto-updates pointing at GitHub Releases (`MahanTaqipour/verio`).
+2. Gate Windows `requireAdministrator` manifest to release builds only so debug/test builds (`cargo test --workspace`) run without `os error 740`.
+3. Provide clean non-blocking Rust-driven update commands + soft-rounded glass header pill, update modal, and Settings check UI + CI/local release scripts.
+
+Work done:
+1. **Signing Keypair & Updater Endpoint Config**:
+   - Derived GitHub remote `MahanTaqipour/verio` from `git remote -v`.
+   - Generated minisign keypair outside the repository at `%USERPROFILE%\.tauri\verio.key` / `verio.key.pub` via `pnpm tauri signer generate --ci` (`*.key` and `*.key.pub` remain gitignored).
+   - Configured `ui/src-tauri/tauri.conf.json` for `targets: ["nsis"]`, `createUpdaterArtifacts: true`, `installMode: "perMachine"`, full icon set, updater `pubkey`, `installMode: "passive"`, and endpoint `https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json`.
+   - Added `tauri-plugin-updater = "2"` to `ui/src-tauri/Cargo.toml` and `"updater:default"` to `ui/src-tauri/capabilities/default.json`.
+2. **Debug-Friendly UAC Manifest Gate (`ui/src-tauri/build.rs`)**:
+   - Gated the custom `requireAdministrator` manifest strictly on `PROFILE == "release"`, keeping debug/test binaries as `asInvoker` while preserving elevated global hotkey delivery in release installs.
+3. **Rust Updater Commands (`ui/src-tauri/src/lib.rs`)**:
+   - Registered `tauri_plugin_updater::Builder::new().build()` and added `get_app_version`, `check_for_update`, and `install_update` (streaming `"update_progress"` events with `{ downloaded, total }`, flushing settings before calling `app.restart()`).
+4. **Glass Update UI & Mock Support (`ui/src/App.tsx`, `app-header.tsx`, `settings.tsx`, `ui/src/dev/mock/invoke.ts`)**:
+   - Added non-blocking 3 s post-mount silent background update check, `"update_progress"` listener, Acid Lime `#E8FF3A` `Update v{version}` pill in `AppHeader`, rounded glass Update dialog (`v{current} -> v{new}`, release notes, `#B9A7E6 -> #E8FF3A` progress bar, `Update & Restart` + `Later` buttons), and version + manual `Check for updates` status row at the bottom of the Settings rail.
+   - Wired mock handlers (`get_app_version`, `check_for_update`, `install_update`) so `?mock=1` stays clean.
+5. **Release Script & GitHub Actions (`scripts/build-release.ps1`, `.github/workflows/release.yml`)**:
+   - Created `scripts/build-release.ps1` (supports optional `-UseRsproxy` / `-Offline` Cargo flags while keeping standard `pnpm tauri build --ci` default, reads `%USERPROFILE%\.tauri\verio.key`, generates BOM-free `latest.json` with `windows-x86_64` signature and GitHub download URL).
+   - Created `.github/workflows/release.yml` triggered on tag push `v*` on `windows-latest` via `tauri-apps/tauri-action@v0`.
+
+Verified (real command output):
+- `cargo clippy --offline --workspace --all-targets --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test --offline --workspace --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'"`: Exit code 0 (full workspace incl. `verio_lib` 9, `verio_app` 100 unit + 4 + 2 integration, `verio_audio` 2, `verio_discovery` 11, `verio_dsp` 33, `verio_server` 11, `verio_transport` 19 — 0 failed)
+- `cd ui && pnpm exec tsc --noEmit && pnpm test && pnpm build`: Exit code 0 (`13/13` passed in `hotkey.test.ts`, Vite built cleanly)
+- `.\scripts\build-release.ps1 -UseRsproxy -Offline`: Exit code 0; produced:
+  - `target\release\bundle\nsis\Verio_0.1.0_x64-setup.exe` (6,506,494 bytes, SHA-256 `a14305c79600ebe1fe4c82320178555363b48f2eec329847302658c3816a9580`)
+  - `target\release\bundle\nsis\Verio_0.1.0_x64-setup.exe.sig` (416 bytes)
+  - `target\release\bundle\nsis\latest.json` (valid JSON, `version: "0.1.0"`, non-empty `signature` matching `.sig`, `url: https://github.com/MahanTaqipour/verio/releases/download/v0.1.0/Verio_0.1.0_x64-setup.exe`)
+
+
