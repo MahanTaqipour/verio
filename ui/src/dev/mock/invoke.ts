@@ -87,6 +87,8 @@ export interface MockTransport {
   pulseMicLevel(): void;
   /** Simulate incoming chat message from a peer. */
   simulateIncomingChat(text?: string, senderName?: string): void;
+  /** Session 37B: toggle Dan's mock Watch-on-Demand screen share in room. */
+  togglePeerScreenShare(): void;
   /** Count of commands handled, for a quick sanity read. */
   readonly commandCount: number;
 }
@@ -165,6 +167,137 @@ export function installMockTransport(scenarioId: string): MockTransport {
   }
 
   syncQueueShape();
+
+  // --- Session 37B: mock Watch-on-Demand screen share WebRTC loopback -----
+  let screenShares: Record<string, string> = structuredClone(
+    state.screenShares ?? {},
+  );
+  interface MockShareSession {
+    pc: RTCPeerConnection;
+    timer: number;
+    stream: MediaStream;
+    pendingIce: RTCIceCandidateInit[];
+  }
+  const mockSharePcs = new Map<string, MockShareSession>();
+
+  function stopMockShareSession(peerId: string): void {
+    const sess = mockSharePcs.get(peerId);
+    if (!sess) return;
+    window.clearInterval(sess.timer);
+    for (const track of sess.stream.getTracks()) {
+      try {
+        track.stop();
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      sess.pc.close();
+    } catch {
+      // ignore
+    }
+    mockSharePcs.delete(peerId);
+  }
+
+  function stopAllMockShares(): void {
+    for (const peerId of Array.from(mockSharePcs.keys())) {
+      stopMockShareSession(peerId);
+    }
+  }
+
+  function createMockCanvasStream(
+    sharerName: string,
+    label: string,
+  ): { stream: MediaStream; timer: number } | null {
+    if (typeof document === "undefined") return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 1280;
+    canvas.height = 720;
+    const ctx = canvas.getContext("2d");
+    const capture = (
+      canvas as HTMLCanvasElement & { captureStream?: (fps?: number) => MediaStream }
+    ).captureStream;
+    if (!ctx || typeof capture !== "function") return null;
+
+    let frame = 0;
+    const draw = () => {
+      frame += 1;
+      const w = canvas.width;
+      const h = canvas.height;
+      const bg = ctx.createLinearGradient(0, 0, w, h);
+      bg.addColorStop(0, "#120D1D");
+      bg.addColorStop(1, "#241B3A");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+
+      // Subtle lavender perspective grid
+      ctx.strokeStyle = "rgba(185, 167, 230, 0.12)";
+      ctx.lineWidth = 1;
+      for (let x = 80; x < w; x += 80) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = 80; y < h; y += 80) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      // Floating glass card card frame
+      ctx.fillStyle = "rgba(46, 35, 74, 0.72)";
+      ctx.strokeStyle = "rgba(185, 167, 230, 0.36)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(140, 120, w - 280, h - 240, 22);
+      ctx.fill();
+      ctx.stroke();
+
+      // Animated Cyber Lime scan orb & sweep bar
+      const cx = w / 2 + Math.cos(frame * 0.04) * 240;
+      const cy = h / 2 + Math.sin(frame * 0.06) * 70;
+      ctx.fillStyle = "rgba(232, 255, 58, 0.16)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 48, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#E8FF3A";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "#F8FAFC";
+      ctx.font = "600 32px Inter, system-ui, sans-serif";
+      ctx.fillText(`VERIO MOCK STREAM · ${sharerName}`, 200, 210);
+
+      ctx.fillStyle = "#B9A7E6";
+      ctx.font = "500 20px 'JetBrains Mono', monospace";
+      ctx.fillText(`Preset: ${label} · Frame #${String(frame).padStart(4, "0")}`, 200, 255);
+
+      const barW = w - 400;
+      const sweep = ((frame * 8) % barW);
+      ctx.fillStyle = "rgba(14, 10, 26, 0.65)";
+      ctx.fillRect(200, h - 200, barW, 10);
+      ctx.fillStyle = "#E8FF3A";
+      ctx.fillRect(200 + Math.max(0, sweep - 120), h - 200, Math.min(120, barW - Math.max(0, sweep - 120)), 10);
+    };
+
+    draw();
+    const stream = capture.call(canvas, 30);
+    const timer = window.setInterval(draw, 33);
+    timers.push(timer);
+    return { stream, timer };
+  }
+
+  function emitActiveScreenShares(): void {
+    const t = window.setTimeout(() => {
+      for (const [peerId, label] of Object.entries(screenShares)) {
+        void emit("screen_state", { peer_id: peerId, sharing: true, label });
+      }
+    }, 60);
+    timers.push(t);
+  }
 
   const log: CommandLogEntry[] = [];
   let commandCount = 0;
@@ -339,7 +472,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
       case "music_status":
         return structuredClone(state.music);
       case "get_app_version":
-        return "0.1.0";
+        return "0.2.0";
       case "check_for_update":
         return null;
       case "install_update":
@@ -348,7 +481,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return {
           message: `Hello ${String(args.name ?? "")}! The Rust ↔ frontend bridge is working.`,
           rust_timestamp_ms: Date.now(),
-          app: { name: "Verio", version: "0.1.0" },
+          app: { name: "Verio", version: "0.2.0" },
         };
 
       // --- audio controls ---
@@ -468,6 +601,92 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return null;
       }
 
+      // --- Session 37A/37B: screen share & ICE config -----------------------
+      case "get_ice_servers":
+        emitActiveScreenShares();
+        return [];
+
+      case "send_screen_state":
+        return null;
+
+      case "send_screen_signal": {
+        const target = String(args.target ?? "");
+        const payload = (args.payload ?? {}) as {
+          type?: string;
+          sdp?: string;
+          candidate?: RTCIceCandidateInit;
+        };
+        if (!target || typeof payload.type !== "string") return null;
+
+        if (payload.type === "watch_request") {
+          const label = screenShares[target];
+          if (!label) return null;
+          stopMockShareSession(target);
+          const sharerName =
+            state.room.peers.find((p) => p.uuid === target)?.name ?? "Dan";
+          const created = createMockCanvasStream(sharerName, label);
+          if (!created) return null;
+
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          const sess: MockShareSession = {
+            pc,
+            timer: created.timer,
+            stream: created.stream,
+            pendingIce: [],
+          };
+          mockSharePcs.set(target, sess);
+          for (const track of created.stream.getTracks()) {
+            pc.addTrack(track, created.stream);
+          }
+          pc.onicecandidate = (ev) => {
+            if (ev.candidate && mockSharePcs.get(target) === sess) {
+              void emit("screen_signal", {
+                from: target,
+                payload: { type: "ice", candidate: ev.candidate.toJSON() },
+              });
+            }
+          };
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          if (mockSharePcs.get(target) === sess && offer.sdp) {
+            void emit("screen_signal", {
+              from: target,
+              payload: { type: "offer", sdp: offer.sdp },
+            });
+          }
+          return null;
+        }
+
+        if (payload.type === "watch_stop") {
+          stopMockShareSession(target);
+          return null;
+        }
+
+        const sess = mockSharePcs.get(target);
+        if (!sess) return null;
+
+        if (payload.type === "answer" && typeof payload.sdp === "string") {
+          await sess.pc.setRemoteDescription({ type: "answer", sdp: payload.sdp });
+          const queued = sess.pendingIce.splice(0, sess.pendingIce.length);
+          for (const cand of queued) {
+            await sess.pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+          }
+          return null;
+        }
+
+        if (payload.type === "ice" && payload.candidate) {
+          if (sess.pc.remoteDescription) {
+            await sess.pc
+              .addIceCandidate(new RTCIceCandidate(payload.candidate))
+              .catch(() => {});
+          } else {
+            sess.pendingIce.push(payload.candidate);
+          }
+          return null;
+        }
+        return null;
+      }
+
       // --- room ---
       case "create_room": {
         state.room.state = "connecting";
@@ -476,6 +695,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
         const code = "7391";
         state.room.state = "connected";
         state.room.room_code = code;
+        screenShares = {};
         state.room.diagnostics = structuredClone(
           getScenario("room-1").state.room.diagnostics,
         );
@@ -490,15 +710,18 @@ export function installMockTransport(scenarioId: string): MockTransport {
         void emit("room_state", "connecting");
         await sleep(600);
         state.room.state = "connected";
-        state.room.peers = structuredClone(getScenario("room-3").state.room.peers);
-        state.room.diagnostics = structuredClone(
-          getScenario("room-3").state.room.diagnostics,
-        );
+        const room3 = getScenario("room-3").state;
+        state.room.peers = structuredClone(room3.room.peers);
+        state.room.diagnostics = structuredClone(room3.room.diagnostics);
+        screenShares = structuredClone(room3.screenShares ?? {});
         void emit("room_joined", { code });
         void emit("room_state", "connected");
+        emitActiveScreenShares();
         return null;
       }
       case "leave_room": {
+        stopAllMockShares();
+        screenShares = {};
         state.room.state = "idle";
         state.room.room_code = null;
         state.room.peers = [];
@@ -894,6 +1117,11 @@ export function installMockTransport(scenarioId: string): MockTransport {
     removeLastPeer() {
       const last = state.room.peers.pop();
       if (last) {
+        if (last.uuid in screenShares) {
+          delete screenShares[last.uuid];
+          stopMockShareSession(last.uuid);
+          void emit("screen_state", { peer_id: last.uuid, sharing: false, label: "" });
+        }
         void emit("peer_disconnected", { reason: "peer timed out", peer_id: last.uuid });
       }
     },
@@ -960,6 +1188,29 @@ export function installMockTransport(scenarioId: string): MockTransport {
         text,
         timestamp_ms,
       });
+    },
+    togglePeerScreenShare() {
+      const target =
+        state.room.peers.find((p) => !p.is_bot) ?? state.room.peers[0];
+      if (!target) return;
+      const currentlySharing = Boolean(screenShares[target.uuid]);
+      if (currentlySharing) {
+        delete screenShares[target.uuid];
+        stopMockShareSession(target.uuid);
+        void emit("screen_state", {
+          peer_id: target.uuid,
+          sharing: false,
+          label: "",
+        });
+      } else {
+        const label = "720p · 30fps";
+        screenShares[target.uuid] = label;
+        void emit("screen_state", {
+          peer_id: target.uuid,
+          sharing: true,
+          label,
+        });
+      }
     },
   };
 

@@ -146,7 +146,7 @@ export function Settings({
   onSetDebugWavs,
   onSetVoiceQuality,
   onSetMusicQuality,
-  appVersion = "0.1.0",
+  appVersion = "0.2.0",
   updateCheckStatus,
   onCheckForUpdates,
   onOpenUpdateDialog,
@@ -406,6 +406,7 @@ export function Settings({
               <Input
                 value={vpsAddress}
                 onChange={(e) => onVpsAddressChange(e.target.value)}
+                placeholder="verio.drfake.ir"
                 aria-label="Signalling server address"
                 spellCheck={false}
                 wrapperClassName="min-w-0 flex-1"

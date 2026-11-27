@@ -12,6 +12,7 @@ import {
 } from "./components/verio/level-meter";
 import { useMusic } from "./lib/use-music";
 import { useMusicBot } from "./lib/use-music-bot";
+import { useScreenShare } from "./lib/use-screen-share";
 import { comboFromEvent } from "./lib/hotkey";
 import { MusicPanel } from "./components/verio/music-panel";
 import { Lobby } from "./components/verio/lobby";
@@ -212,7 +213,7 @@ export default function App() {
   const [toastPaused, setToastPaused] = useState(false);
 
   // Auto-updater state (Session 36)
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("0.2.0");
   const [availableUpdate, setAvailableUpdate] = useState<{
     version: string;
     current_version: string;
@@ -354,6 +355,7 @@ export default function App() {
   }, [settings?.nickname]);
 
   const seenChatIds = useRef(new Set<string>());
+  const screenDisconnectRef = useRef<(peerId: string) => void>(() => {});
 
   // Imperative handle for the real-time mic meter. `input_level` arrives at
   // ~20 Hz; this writes `style.width` on a ref and causes zero React renders.
@@ -371,7 +373,7 @@ export default function App() {
       .then((s) => {
         setSettings(s);
         setNicknameInput(s.nickname);
-        setVpsAddressInput(s.vps_address || "ws://127.0.0.1:8443");
+        setVpsAddressInput(s.vps_address || "verio.drfake.ir");
       })
       .catch((e) => console.error("get_settings failed", e));
 
@@ -504,6 +506,7 @@ export default function App() {
       const gone = ev.payload.peer_id;
       if (gone) {
         setPeers((prev) => prev.filter((p) => p.uuid !== gone));
+        screenDisconnectRef.current(gone);
       }
       setStatusMsg({ text: `Peer disconnected: ${ev.payload.reason}` });
     });
@@ -801,6 +804,12 @@ export default function App() {
     botPeerPresent: botPeer !== undefined,
     onStatus: (text, isError) => setStatusMsg({ text, isError }),
   });
+
+  const screenShare = useScreenShare({
+    inCall: isInCall,
+    onStatus: (text, isError) => setStatusMsg({ text, isError }),
+  });
+  screenDisconnectRef.current = screenShare.handlePeerDisconnected;
 
   /**
    * The host is the person whose *voice* peer shares the bot's persistent id.
@@ -1270,6 +1279,15 @@ export default function App() {
                 roomMusicHost={roomMusicHost}
                 onRequestMusicStop={handleRequestMusicStop}
                 onOpenMusicTab={() => selectView("music")}
+                isSharingScreen={screenShare.isSharing}
+                screenWatcherCount={screenShare.watcherCount}
+                localScreenStream={screenShare.localStream}
+                screenSharers={screenShare.screenSharers}
+                watchingPeerId={screenShare.watchingPeerId}
+                remoteScreenStream={screenShare.remoteStream}
+                screenStats={screenShare.streamStats}
+                onWatchPeer={(id) => void screenShare.watchPeer(id)}
+                onStopWatching={() => void screenShare.stopWatching()}
               />
             ) : (
               <div className="glass-card min-h-0 flex-1 overflow-y-auto rounded-[22px]">
@@ -1354,6 +1372,12 @@ export default function App() {
         onToggleLoopback={() => void handleSetLoopback(!isLoopback)}
         muteHotkey={settings?.hotkeys.mute || "Ctrl+Shift+M"}
         deafenHotkey={settings?.hotkeys.deafen || "Ctrl+Shift+D"}
+        isSharingScreen={screenShare.isSharing}
+        screenWatcherCount={screenShare.watcherCount}
+        onStartScreenShare={(preset, audio) =>
+          void screenShare.startSharing(preset, audio)
+        }
+        onStopScreenShare={() => void screenShare.stopSharing()}
         musicPanelOpen={isMusicTabActive}
         onToggleMusicPanel={() =>
           selectView(activeView === "music" ? "stage" : "music")

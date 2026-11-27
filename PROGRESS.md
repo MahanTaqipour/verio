@@ -5594,5 +5594,55 @@ Verified (real command output):
 - `cargo test --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace`: Exit code 0 (`verio_lib` 9, `verio_app` 101 unit + 4 + 2 integration, `verio_audio` 2, `verio_discovery` 12, `verio_dsp` 33, `verio_server` 16, `verio_transport` 19 — 0 failed)
 - `ss -lunpt` on `193.24.105.202`: `verio-server-linux` bound on `0.0.0.0:9091` (TCP), `0.0.0.0:9092` (UDP), `0.0.0.0:3478` (UDP); `turnserver` active and bound on `193.24.105.202:3479` (UDP & TCP).
 
+### Session 37B (2026-11-27) — Watch-on-Demand WebRTC Screen Sharing Engine & Screen Theater UI
+
+Goal:
+1. Build Watch-on-Demand WebRTC screen sharing (`useScreenShare` + `extractScreenStatsFromReport` + `SCREEN_QUALITY_PRESETS`) with zero `RTCPeerConnection`s or media traffic until a peer clicks `Watch`.
+2. Add the rounded glass Dock `Share` button + quality/audio popover, peer `Watch`/`Watching` + `LIVE · N watching` + `Preview` pills, and the fullscreen-capable `ScreenStage` Theater with live measured `RTCPeerConnection.getStats()` badges and Deafen-integrated volume/mute controls.
+3. Add real `<canvas>.captureStream(30)` WebRTC loopback mock support in `ui/src/dev/mock/invoke.ts` (`room-3` seeded + `MockHarness` toggle) and verify in headless/browser Web Preview at `http://127.0.0.1:1420/?mock=1&scenario=room-3`.
+
+Work done:
+1. **Screen Share Utils & Hook (`ui/src/lib/screen-share-utils.ts`, `ui/src/lib/use-screen-share.ts`)**:
+   - Defined presets (`720p30` 1.5 Mbps default, `720p60` 2.5 Mbps, `1080p30` 2.8 Mbps, `1080p60` 4.5 Mbps) and `extractScreenStatsFromReport` parsing only live `candidate-pair`/`inbound-rtp` stats (`P2P` vs `Relay`, measured `width`, `height`, `fps`, `null` when absent).
+   - Wired exact Session 37A Tauri commands (`send_screen_state`, `send_screen_signal` `{ target, payload }`, `get_ice_servers`) and events (`ice_config` `{ servers }`, `screen_state`, `screen_signal` `{ from, payload }`), lazy watcher `RTCPeerConnection` creation with `maxBitrate` + `degradationPreference: "balanced"`, pending ICE candidate queues on both sides, `NotSupportedError`/`TypeError` video-only fallback, `videoTrack.onended` teardown, and room-exit/peer-disconnect cleanup.
+2. **Icons, Dock, Room, & Theater Stage (`ui/src/components/verio/{icons.tsx,dock.tsx,room.tsx,screen-stage.tsx}`, `ui/src/App.tsx`)**:
+   - Added `IconScreen`, `IconScreenOff`, `IconEye` (`1.4px` stroke), preserving `IconHeadphoneOff`, `IconEarOff`, `IconVolumeOff`, `IconMonitor`.
+   - Added in-call Dock `Share` button + light-dismiss quality popover (`Low Traffic` 720p30 default, system audio switch default `true`, Acid Lime `Start Sharing`) and one-click `Sharing · N` stop.
+   - Added remote `Watch`/`Watching` pill, self `LIVE · N watching` + `Preview` toggle, horizontal compact participant strip under `ScreenStage`, independent stream mute + 0–100% slider synced with `deafened`, fullscreen toggle, and `Stop Watching`.
+3. **Mock Loopback & Browser Verification (`ui/src/dev/mock/*`, `ui/tests/screen-share.test.ts`)**:
+   - Added `<canvas>.captureStream(30)` loopback `RTCPeerConnection` for mock peers (`room-3` Dan seeded + `MockHarness` `"dan share"` button) and unit tests in `ui/tests/screen-share.test.ts`.
+   - Verified `pnpm exec tsc --noEmit`, `pnpm test` (`17/17` passed), and `http://127.0.0.1:1420/?mock=1&scenario=room-3` browser inspection (`1280×720`, 0 console errors, live `VERIO MOCK STREAM · Dan` frames and `P2P` + resolution/fps stats via `getStats()`).
+
+### Session 38 (2026-11-27) — Default `verio.drfake.ir` Domain Signaling, Branded NSIS Installer, & Signed `v0.2.0` Release
+
+Goal:
+1. Default signaling cleanly to bare hostname `"verio.drfake.ir"` (`ws://verio.drfake.ir:9091/ws`, UDP relay `3478`/`9092`), preserving explicit `:port` and `wss://` (TLS 443), and auto-migrating legacy hardcoded IPs / empty / `ws://127.0.0.1:8443` while keeping custom user addresses untouched.
+2. Check GitHub visibility & updater manifest reachability, improve `check_for_update` error messaging on unpublished GitHub releases, create custom 24-bit Verio NSIS BMP artwork, bump to `0.2.0`, update `CHANGELOG.md`, mutation-test, verify full gate, and build the signed NSIS `v0.2.0` release on `C:`.
+
+Work done:
+1. **Default Domain & URL Normalization (`crates/verio-discovery/src/vps.rs`, `crates/verio-app/src/{room.rs,music_bot.rs,settings.rs}`, `ui/src/components/verio/settings.tsx`, `ui/src/App.tsx`, `ui/src/dev/mock/fixtures.ts`)**:
+   - Exported `pub fn normalize_ws_url` defaulting bare `ws://` / hostname URLs without explicit ports to `:9091/ws` while keeping explicit `:port` and bare `wss://` (port 443) intact; updated `extract_host_and_ports` with bracket-aware IPv6 splitting and `normalize_ws_url` pre-normalization.
+   - Added `RoomManager::parse_vps_relay_targets` and ensured both `room.rs` and `music_bot.rs` normalize `vps_addr` before resolving UDP relay/STUN ports (`3478` + `9092`).
+   - Changed `Settings::default().vps_address` to `"verio.drfake.ir"`, auto-migrated empty / `ws://127.0.0.1:8443` / legacy IPs (`141.11.1.110`, `87.107.165.14`, `89.116.72.30`, `193.24.105.202`) in `Settings::sanitize` (persisted via `SettingsStore::load`), updated UI placeholder & mock default.
+2. **GitHub Checks & Updater UX (`ui/src-tauri/src/lib.rs`)**:
+   - Verified `https://api.github.com/repos/MahanTaqipour/verio` returns HTTP `200` and `https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json` returns HTTP `404` prior to upload.
+   - Added `tracing::warn!` logging in `check_for_update` and mapped `"Could not fetch a valid release JSON"` to `"No published release found on GitHub yet (upload latest.json to a public Release)."`.
+3. **Custom Branded 24-Bit NSIS Artwork & `v0.2.0` Bump (`ui/src-tauri/icons/nsis-{sidebar,header}.bmp`, `ui/src-tauri/tauri.conf.json`, `Cargo.toml`, `ui/package.json`, `ui/src-tauri/build.rs`, `ui/src/dev/mock/invoke.ts`, `CHANGELOG.md`)**:
+   - Generated uncompressed 24-bit BI_RGB BMPs: `nsis-sidebar.bmp` (`164×314`, 154,542 bytes) and `nsis-header.bmp` (`150×57`, 25,818 bytes).
+   - Configured `tauri.conf.json` `nsis` (`installerIcon`, `headerImage`, `sidebarImage`, `startMenuFolder: "Verio"`, `uninstallerIcon`, `uninstallerHeaderImage` on `tauri-cli 2.11.4`), bumped workspace `0.1.0` -> `0.2.0`, and updated `CHANGELOG.md`.
+4. **Mutation Tests (reverted byte-exact; baseline hashes `c39996c0686c124b7d0a42d457888a5ca8fe537d`, `cce82080ec45ba7c5b2860fe218f0d9212e9f732`)**:
+   - `normalize_ws_url` default port `:9091` -> `:8443`: `vps::tests::test_normalize_ws_url` FAILED.
+   - `Settings::sanitize` legacy IP matcher disabled: `settings::tests::legacy_vps_addresses_migrate_while_custom_servers_remain_untouched` FAILED.
+
+Verified (real command output):
+- `cargo clippy --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace --all-targets -- -D warnings`: Exit code 0 (0 warnings)
+- `cargo test --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace`: Exit code 0 (`verio_lib` 9, `verio_app` 103 unit + 4 + 2 integration, `verio_audio` 2, `verio_discovery` 12, `verio_dsp` 33, `verio_server` 16, `verio_transport` 19 — 0 failed)
+- `cd ui && pnpm exec tsc --noEmit && pnpm test && pnpm build`: Exit code 0 (`17/17` passed; Vite built cleanly)
+- `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -UseRsproxy -Offline`: Exit code 0; produced:
+  - `C:\dev\verio\target\release\bundle\nsis\Verio_0.2.0_x64-setup.exe` (`6,601,249` bytes, SHA-256 `B528850E6C5FFDEE72E656B6436F153B23EE1A9B3D696C652DB350AF99143151`)
+  - `C:\dev\verio\target\release\bundle\nsis\Verio_0.2.0_x64-setup.exe.sig` (`416` bytes)
+  - `C:\dev\verio\target\release\bundle\nsis\latest.json` (`859` bytes, valid JSON, `"version": "0.2.0"`, URL `https://github.com/MahanTaqipour/verio/releases/download/v0.2.0/Verio_0.2.0_x64-setup.exe`)
+
+
 
 

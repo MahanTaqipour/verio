@@ -1158,9 +1158,15 @@ impl RoomManager {
         }
     }
 
+    /// Normalize and parse VPS host, signaling TCP port, and fallback UDP relay port.
+    pub fn parse_vps_relay_targets(vps_addr: &str) -> (String, u16, u16) {
+        let normalized = verio_discovery::vps::normalize_ws_url(vps_addr);
+        verio_discovery::vps::extract_host_and_ports(&normalized)
+    }
+
     /// Helper to resolve the VPS UDP STUN addresses (standard port 3478 preferred, then configured UDP port).
     fn resolve_vps_stuns(vps_addr: &str) -> Vec<SocketAddr> {
-        let (host, _tcp, udp_port) = verio_discovery::vps::extract_host_and_ports(vps_addr);
+        let (host, _tcp, udp_port) = Self::parse_vps_relay_targets(vps_addr);
         let mut stuns = Vec::new();
         // 1. Try standard STUN port 3478 (whitelisted for VoIP/WebRTC)
         if let Ok(mut it) = format!("{host}:3478").to_socket_addrs() {
@@ -1181,7 +1187,7 @@ impl RoomManager {
 
     /// Helper to resolve all candidate VPS UDP Relay addresses (standard port 3478 + configured UDP port).
     pub fn resolve_vps_relay_candidates(vps_addr: &str) -> Result<Vec<SocketAddr>, String> {
-        let (host, _tcp, udp_port) = verio_discovery::vps::extract_host_and_ports(vps_addr);
+        let (host, _tcp, udp_port) = Self::parse_vps_relay_targets(vps_addr);
         let mut candidates = Vec::new();
         // 1. Try standard VoIP port 3478 (whitelisted across firewalls/NATs)
         if let Ok(mut it) = format!("{host}:3478").to_socket_addrs() {
@@ -3308,6 +3314,20 @@ mod tests {
         m.teardown_session("done");
         assert!(m.signaling_tx.is_none());
         assert!(m.ice_servers().is_empty());
+    }
+
+    #[test]
+    fn parse_vps_relay_targets_normalizes_bare_domain_to_9091_and_9092() {
+        let (host, tcp, udp) = RoomManager::parse_vps_relay_targets("verio.drfake.ir");
+        assert_eq!(host, "verio.drfake.ir");
+        assert_eq!(tcp, 9091);
+        assert_eq!(udp, 9092);
+
+        let local_addrs = RoomManager::resolve_vps_relay_candidates("localhost").unwrap();
+        let ports: Vec<u16> = local_addrs.iter().map(|a| a.port()).collect();
+        assert!(ports.contains(&3478));
+        assert!(ports.contains(&9092));
+        assert!(!ports.contains(&8444));
     }
 }
 

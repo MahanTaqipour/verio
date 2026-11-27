@@ -1,5 +1,6 @@
-import type { RefObject } from "react";
+import { useEffect, useId, useRef, useState, type RefObject } from "react";
 import { Button, IconButton } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { KbdChip } from "@/components/verio/kbd-chip";
 import { StateChip } from "@/components/verio/state-chip";
 import { MicLevelMeter, type LevelMeterHandle } from "@/components/verio/level-meter";
@@ -15,8 +16,16 @@ import {
   IconPause,
   IconPencil,
   IconPlay,
+  IconScreen,
+  IconScreenOff,
   IconSkipForward,
+  IconX,
 } from "@/components/verio/icons";
+import {
+  SCREEN_PRESET_ORDER,
+  SCREEN_QUALITY_PRESETS,
+  type ScreenPresetId,
+} from "@/lib/screen-share-utils";
 import { cn } from "@/lib/utils";
 
 export interface DockMusic {
@@ -48,6 +57,11 @@ export interface DockProps {
   onToggleLoopback: () => void;
   muteHotkey: string;
   deafenHotkey: string;
+
+  isSharingScreen?: boolean;
+  screenWatcherCount?: number;
+  onStartScreenShare?: (presetId: ScreenPresetId, includeAudio: boolean) => void;
+  onStopScreenShare?: () => void;
 
   musicPanelOpen: boolean;
   onToggleMusicPanel: () => void;
@@ -86,6 +100,10 @@ export function Dock({
   onToggleLoopback,
   muteHotkey,
   deafenHotkey,
+  isSharingScreen = false,
+  screenWatcherCount = 0,
+  onStartScreenShare,
+  onStopScreenShare,
   musicPanelOpen,
   onToggleMusicPanel,
   onOpenMusicPanel,
@@ -100,6 +118,47 @@ export function Dock({
   const initial = (nickname || "User").slice(0, 1).toUpperCase();
   const showStrip = Boolean(music && (music.active || music.playing || hasTrack));
   const playing = Boolean(music?.playing);
+
+  const [shareMenuOpen, setShareMenuOpen] = useState(false);
+  const [selectedPreset, setSelectedPreset] = useState<ScreenPresetId>("720p30");
+  const [includeAudio, setIncludeAudio] = useState(true);
+  const sharePopoverWrapRef = useRef<HTMLDivElement>(null);
+  const shareTriggerRef = useRef<HTMLButtonElement>(null);
+  const systemAudioSwitchId = useId();
+  const sharePopoverId = useId();
+
+  // Close popover if user leaves the room or begins sharing.
+  useEffect(() => {
+    if (!isInCall || isSharingScreen) {
+      setShareMenuOpen(false);
+    }
+  }, [isInCall, isSharingScreen]);
+
+  // Light-dismiss on Escape (returning focus to trigger) or click outside.
+  useEffect(() => {
+    if (!shareMenuOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (
+        sharePopoverWrapRef.current &&
+        !sharePopoverWrapRef.current.contains(e.target as Node)
+      ) {
+        setShareMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setShareMenuOpen(false);
+        shareTriggerRef.current?.focus();
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [shareMenuOpen]);
 
   return (
     <footer
@@ -177,7 +236,7 @@ export function Dock({
         />
       </div>
 
-      {/* Center Cluster: Tactile Audio Hardware Controls */}
+      {/* Center Cluster: Tactile Audio & Screen Hardware Controls */}
       <div className="flex shrink-0 items-center gap-2">
         <Button
           variant="secondary"
@@ -232,6 +291,134 @@ export function Dock({
         >
           <span>Loopback</span>
         </Button>
+
+        {isInCall && (onStartScreenShare || onStopScreenShare) && (
+          <div ref={sharePopoverWrapRef} className="relative">
+            {shareMenuOpen && !isSharingScreen && (
+              <div
+                id={sharePopoverId}
+                role="region"
+                aria-label="Screen share quality options"
+                className="glass-card animate-lift absolute bottom-full left-1/2 z-50 mb-3 w-72 -translate-x-1/2 rounded-2xl p-4 shadow-[var(--shadow-overlay)]"
+              >
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div className="flex flex-col">
+                    <span className="text-13 font-semibold text-text">
+                      Share Screen
+                    </span>
+                    <span className="text-11 text-text-dim">
+                      Watch-on-Demand · 0 B/s until watched
+                    </span>
+                  </div>
+                  <IconButton
+                    label="Close share options"
+                    size="sm"
+                    onClick={() => {
+                      setShareMenuOpen(false);
+                      shareTriggerRef.current?.focus();
+                    }}
+                  >
+                    <IconX size={14} />
+                  </IconButton>
+                </div>
+
+                <div className="mb-3 grid grid-cols-2 gap-1.5">
+                  {SCREEN_PRESET_ORDER.map((presetId) => {
+                    const preset = SCREEN_QUALITY_PRESETS[presetId];
+                    const active = selectedPreset === presetId;
+                    return (
+                      <button
+                        key={presetId}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => setSelectedPreset(presetId)}
+                        className={cn(
+                          "flex min-h-9 flex-col items-start justify-center rounded-xl border px-3 py-1.5 text-left transition-colors ease-verio press",
+                          active
+                            ? "border-accent/55 bg-accent/14 text-accent"
+                            : "border-border bg-surface-2/85 text-text-dim hover:border-border-2 hover:text-text",
+                        )}
+                      >
+                        <span className="mono-num font-mono text-11 font-semibold">
+                          {preset.label}
+                        </span>
+                        {preset.badge && (
+                          <span className="text-10 text-lavender-bright">
+                            {preset.badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-[var(--bg-input)] px-3 py-2">
+                  <label
+                    htmlFor={systemAudioSwitchId}
+                    className="cursor-pointer text-13 font-medium text-text"
+                  >
+                    Share system audio
+                  </label>
+                  <Switch
+                    id={systemAudioSwitchId}
+                    checked={includeAudio}
+                    onChange={(e) => setIncludeAudio(e.target.checked)}
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShareMenuOpen(false);
+                    onStartScreenShare?.(selectedPreset, includeAudio);
+                  }}
+                  className="h-9 w-full rounded-xl bg-accent px-4 text-13 font-bold text-[#120D1D] transition-colors hover:bg-accent-hi active:bg-accent-lo press"
+                >
+                  Start Sharing
+                </button>
+              </div>
+            )}
+
+            <Button
+              ref={shareTriggerRef}
+              variant="secondary"
+              size="md"
+              className={cn(
+                "h-9 px-3.5",
+                isSharingScreen &&
+                  "border-[rgba(232,255,58,0.45)] bg-[rgba(232,255,58,0.14)] text-accent hover:border-accent",
+              )}
+              onClick={() => {
+                if (isSharingScreen) {
+                  setShareMenuOpen(false);
+                  onStopScreenShare?.();
+                } else {
+                  setShareMenuOpen((v) => !v);
+                }
+              }}
+              aria-pressed={isSharingScreen}
+              aria-expanded={isSharingScreen ? undefined : shareMenuOpen}
+              aria-controls={isSharingScreen ? undefined : sharePopoverId}
+              aria-label={isSharingScreen ? "Stop screen sharing" : "Share screen"}
+              title={
+                isSharingScreen
+                  ? "Stop screen sharing"
+                  : "Share screen (Watch-on-Demand)"
+              }
+              icon={
+                isSharingScreen ? (
+                  <IconScreenOff size={16} />
+                ) : (
+                  <IconScreen size={16} />
+                )
+              }
+            >
+              <span className="mono-num">
+                {isSharingScreen ? `Sharing · ${screenWatcherCount}` : "Share"}
+              </span>
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Right Cluster: Mini Music Transport & Single Leave Call Action */}

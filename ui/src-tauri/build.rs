@@ -12,7 +12,7 @@ fn main() {
         tauri_build::Attributes::new().windows_attributes(
             tauri_build::WindowsAttributes::new().app_manifest(
                 r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="ir.verio.app" version="0.1.0.0" processorArchitecture="*" />
+  <assemblyIdentity type="win32" name="ir.verio.app" version="0.2.0.0" processorArchitecture="*" />
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

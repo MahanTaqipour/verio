@@ -34,8 +34,8 @@ const LOCAL_NICKNAME = "Kaveh";
 /** Room code used by the in-call scenarios. */
 const ROOM_CODE = "4821";
 
-/** Default relay from `Settings::default()` in crates/verio-app/src/settings.rs. */
-const DEFAULT_VPS = "ws://127.0.0.1:8443";
+/** Default signaling address from `Settings::default()` in crates/verio-app/src/settings.rs. */
+const DEFAULT_VPS = "verio.drfake.ir";
 
 /** 9 remote peers → 10 total participants with the local user. Max supported. */
 const ROSTER_NAMES = [
@@ -160,6 +160,8 @@ export interface MockState {
    * real `music_bot_state` reports for a client that has not pressed Play.
    */
   bot?: MusicBotState;
+  /** Session 37B: active mock screen sharers keyed by peer uuid -> preset label. */
+  screenShares?: Record<string, string>;
 }
 
 export interface MockBehavior {
@@ -547,6 +549,7 @@ export const SCENARIOS: Scenario[] = [
         diagnostics: diag(),
       }),
       music: music(),
+      screenShares: { [peerUuid(0)]: "720p · 30fps" },
     },
     behavior: {
       latency: { read: 20, write: 30 },

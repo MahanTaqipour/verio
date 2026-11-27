@@ -1542,12 +1542,21 @@ fn get_app_version() -> String {
 #[tauri::command]
 async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateAvailable>, String> {
     use tauri_plugin_updater::UpdaterExt;
-    let update = app
-        .updater()
-        .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?;
+    let updater = app.updater().map_err(|e| {
+        let msg = e.to_string();
+        tracing::warn!(error = %msg, "update check initialization failed");
+        msg
+    })?;
+    let update = updater.check().await.map_err(|e| {
+        let raw = e.to_string();
+        tracing::warn!(error = %raw, "update check failed");
+        if raw.contains("Could not fetch a valid release JSON") {
+            "No published release found on GitHub yet (upload latest.json to a public Release)."
+                .to_string()
+        } else {
+            raw
+        }
+    })?;
     Ok(update.map(|u| UpdateAvailable {
         version: u.version,
         current_version: env!("CARGO_PKG_VERSION").to_string(),

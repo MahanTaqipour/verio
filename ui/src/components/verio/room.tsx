@@ -13,23 +13,26 @@
  *       step={0.01} (1% steps, 0-200%) peer sliders, imperative MicLevelMeter.
  */
 
-import type { ReactNode, RefObject } from "react";
+import { useEffect, useState, type ReactNode, type RefObject } from "react";
 import { Button, IconButton } from "@/components/ui/button";
 import { SectionLabel } from "@/components/ui/field";
 import { Slider } from "@/components/ui/slider";
 import { Panel } from "@/components/ui/surface";
 import { StateChip, type ChipTone } from "@/components/verio/state-chip";
+import { ScreenStage } from "@/components/verio/screen-stage";
 import {
   MicLevelMeter,
   type LevelMeterHandle,
 } from "@/components/verio/level-meter";
 import {
   IconEarOff,
+  IconEye,
   IconHeadphoneOff,
   IconMicOff,
   IconMusic,
   IconPause,
   IconPlay,
+  IconScreen,
   IconSkipForward,
   IconStop,
   IconUsers,
@@ -38,6 +41,10 @@ import {
 import { ChatPanel, type ChatMessage } from "@/components/verio/chat-panel";
 import type { MusicController } from "@/lib/use-music";
 import type { MusicBotController } from "@/lib/use-music-bot";
+import type {
+  ScreenSharerInfo,
+  ScreenStreamStats,
+} from "@/lib/use-screen-share";
 import { cn } from "@/lib/utils";
 
 export interface RoomPeer {
@@ -80,6 +87,16 @@ export interface RoomProps {
   roomMusicHost: string;
   onRequestMusicStop: () => void;
   onOpenMusicTab: () => void;
+  /** Session 37B: Watch-on-Demand screen sharing */
+  isSharingScreen?: boolean;
+  screenWatcherCount?: number;
+  localScreenStream?: MediaStream | null;
+  screenSharers?: Record<string, ScreenSharerInfo>;
+  watchingPeerId?: string | null;
+  remoteScreenStream?: MediaStream | null;
+  screenStats?: ScreenStreamStats | null;
+  onWatchPeer?: (peerId: string) => void;
+  onStopWatching?: () => void;
   className?: string;
 }
 
@@ -170,6 +187,15 @@ function PeerTile({
   onToggleMute,
   roomMuted,
   onToggleRoomMute,
+  screenShareLabel,
+  isWatching,
+  onWatch,
+  onStopWatch,
+  selfSharing,
+  selfWatcherCount,
+  previewingLocal,
+  onToggleLocalPreview,
+  compact,
   children,
 }: {
   name: string;
@@ -186,6 +212,15 @@ function PeerTile({
   onToggleMute?: () => void;
   roomMuted?: boolean;
   onToggleRoomMute?: () => void;
+  screenShareLabel?: string;
+  isWatching?: boolean;
+  onWatch?: () => void;
+  onStopWatch?: () => void;
+  selfSharing?: boolean;
+  selfWatcherCount?: number;
+  previewingLocal?: boolean;
+  onToggleLocalPreview?: () => void;
+  compact?: boolean;
   children?: ReactNode;
 }) {
   const locallyMuted = volume === 0;
@@ -196,7 +231,8 @@ function PeerTile({
       glass
       padding="none"
       className={cn(
-        "relative flex h-full flex-col gap-3 rounded-2xl p-4 transition-[border-color,box-shadow] ease-verio",
+        "relative flex h-full flex-col gap-3 rounded-2xl transition-[border-color,box-shadow] ease-verio",
+        compact ? "p-3" : "p-4",
         speaking &&
           "border-accent shadow-[0_0_24px_rgba(232,255,58,0.14)]",
       )}
@@ -213,12 +249,64 @@ function PeerTile({
         <Avatar name={name} speaking={speaking} isBot={isBot} />
 
         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-          <span className="truncate text-14 font-semibold text-text" title={name}>
-            {name}
-          </span>
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <span className="truncate text-14 font-semibold text-text" title={name}>
+              {name}
+            </span>
+
+            {!isSelf && !isBot && screenShareLabel !== undefined && (
+              <button
+                type="button"
+                onClick={isWatching ? onStopWatch : onWatch}
+                aria-pressed={isWatching}
+                title={
+                  isWatching
+                    ? `Stop watching ${name}'s screen`
+                    : `Watch ${name}'s screen (${screenShareLabel})`
+                }
+                className={cn(
+                  "inline-flex h-7 shrink-0 items-center gap-1 rounded-full px-3 text-11 font-bold transition-colors ease-verio press",
+                  isWatching
+                    ? "border border-accent bg-accent/18 text-accent hover:bg-accent/25"
+                    : "bg-accent text-[#120D1D] hover:bg-accent-hi active:bg-accent-lo",
+                )}
+              >
+                <IconScreen size={14} />
+                <span>{isWatching ? "Watching" : "Watch"}</span>
+              </button>
+            )}
+
+            {isSelf && selfSharing && onToggleLocalPreview && (
+              <button
+                type="button"
+                onClick={onToggleLocalPreview}
+                aria-pressed={previewingLocal}
+                title={previewingLocal ? "Hide local preview" : "Preview your shared screen"}
+                className={cn(
+                  "inline-flex h-7 shrink-0 items-center gap-1 rounded-full border px-2.5 text-11 font-semibold transition-colors ease-verio press",
+                  previewingLocal
+                    ? "border-accent bg-accent/18 text-accent"
+                    : "border-border bg-surface-2/85 text-text-dim hover:border-border-2 hover:text-text",
+                )}
+              >
+                <IconEye size={14} />
+                <span>{previewingLocal ? "Hide" : "Preview"}</span>
+              </button>
+            )}
+          </div>
 
           <div className="flex flex-wrap items-center gap-1">
             {isSelf && <Chip tone="neutral">You</Chip>}
+            {isSelf && selfSharing && (
+              <Chip
+                tone="accent"
+                title="You are currently advertising a Watch-on-Demand screen share"
+              >
+                <span className="mono-num">
+                  LIVE · {selfWatcherCount ?? 0} watching
+                </span>
+              </Chip>
+            )}
             {host && (
               <Chip tone="idle" title="Hosting the music for this room">
                 Host
@@ -361,8 +449,37 @@ export function Room({
   roomMusicHost,
   onRequestMusicStop,
   onOpenMusicTab,
+  isSharingScreen = false,
+  screenWatcherCount = 0,
+  localScreenStream = null,
+  screenSharers = {},
+  watchingPeerId = null,
+  remoteScreenStream = null,
+  screenStats = null,
+  onWatchPeer,
+  onStopWatching,
   className,
 }: RoomProps) {
+  const [previewingLocal, setPreviewingLocal] = useState(false);
+
+  // Close local preview when sharing ends or user switches to watching a remote peer.
+  useEffect(() => {
+    if (!isSharingScreen || watchingPeerId !== null) {
+      setPreviewingLocal(false);
+    }
+  }, [isSharingScreen, watchingPeerId]);
+
+  const isShowingLocalPreview = Boolean(
+    isSharingScreen && previewingLocal && watchingPeerId === null,
+  );
+  const theaterOpen = watchingPeerId !== null || isShowingLocalPreview;
+  const watchedPeer = watchingPeerId
+    ? peers.find((p) => p.uuid === watchingPeerId)
+    : undefined;
+  const theaterSharerName = isShowingLocalPreview
+    ? nickname || "You"
+    : watchedPeer?.name ?? "Peer";
+
   const humans = peers.filter((p) => !p.is_bot);
   const count = humans.length + 1;
   const selfHosts = botHostUserId !== "" && botHostUserId === selfUserId;
@@ -387,6 +504,77 @@ export function Room({
       ? `Hosted by ${roomMusicHost}`
       : "Playing in room";
 
+  const peerCards = (
+    <>
+      <li
+        className={cn(
+          "animate-fade min-w-0",
+          theaterOpen && "min-w-[230px] max-w-[270px] shrink-0",
+        )}
+      >
+        <PeerTile
+          name={nickname}
+          speaking={self.speaking}
+          muted={self.muted}
+          deafened={self.deafened}
+          isSelf
+          host={selfHosts}
+          selfSharing={isSharingScreen}
+          selfWatcherCount={screenWatcherCount}
+          previewingLocal={isShowingLocalPreview}
+          onToggleLocalPreview={() => {
+            if (watchingPeerId !== null) {
+              onStopWatching?.();
+            }
+            setPreviewingLocal((v) => !v);
+          }}
+          compact={theaterOpen}
+        >
+          <MicLevelMeter ref={micMeterRef} className="min-w-0 flex-1" />
+        </PeerTile>
+      </li>
+
+      {peers.map((p) => {
+        const shareInfo = !p.is_bot ? screenSharers[p.uuid] : undefined;
+        const isWatchingThisPeer = watchingPeerId === p.uuid;
+        return (
+          <li
+            key={p.uuid}
+            className={cn(
+              "animate-fade min-w-0",
+              theaterOpen && "min-w-[230px] max-w-[270px] shrink-0",
+            )}
+          >
+            <PeerTile
+              name={p.name}
+              speaking={p.speaking}
+              muted={p.mute}
+              deafened={p.deafen}
+              isBot={p.is_bot}
+              host={!p.is_bot && p.user_id !== "" && p.user_id === botHostUserId}
+              music={p.music}
+              musicTitle={p.music_title}
+              volume={peerVolumes[p.uuid] ?? 1}
+              onVolume={(v) => onPeerVolume(p.uuid, v)}
+              onToggleMute={() => onTogglePeerMute(p.uuid)}
+              roomMuted={isRoomMutedId(p.user_id)}
+              onToggleRoomMute={
+                p.user_id
+                  ? () => onToggleRoomMute(p.user_id, !isRoomMutedId(p.user_id))
+                  : undefined
+              }
+              screenShareLabel={shareInfo?.label}
+              isWatching={isWatchingThisPeer}
+              onWatch={() => onWatchPeer?.(p.uuid)}
+              onStopWatch={() => onStopWatching?.()}
+              compact={theaterOpen}
+            />
+          </li>
+        );
+      })}
+    </>
+  );
+
   return (
     <div
       className={cn(
@@ -395,7 +583,7 @@ export function Room({
       )}
     >
       {/* Left / Center Stage Floating Glass Island */}
-      <div className="glass-card flex min-w-0 flex-1 flex-col gap-4 overflow-hidden rounded-[22px] p-5">
+      <div className="glass-card flex min-w-0 flex-1 flex-col gap-3 overflow-hidden rounded-[22px] p-5">
         {/* Sleek 1-Line Now Playing Bar (only when music is active/bot present) */}
         {showNowPlayingBar && (
           <div className="flex h-12 shrink-0 items-center justify-between gap-4 rounded-2xl border border-border-2 bg-[rgba(185,167,230,0.12)] px-4 backdrop-blur-xl">
@@ -474,88 +662,78 @@ export function Room({
           </Panel>
         )}
 
-        <div className="flex shrink-0 items-center justify-between">
-          <SectionLabel level={2}>
-            In call — {count} {count === 1 ? "participant" : "participants"}
-          </SectionLabel>
-        </div>
+        {theaterOpen ? (
+          <>
+            <ScreenStage
+              stream={isShowingLocalPreview ? localScreenStream : remoteScreenStream}
+              sharerName={theaterSharerName}
+              isLocalPreview={isShowingLocalPreview}
+              deafened={self.deafened}
+              stats={isShowingLocalPreview ? null : screenStats}
+              onStopWatching={() => {
+                if (isShowingLocalPreview) {
+                  setPreviewingLocal(false);
+                } else {
+                  onStopWatching?.();
+                }
+              }}
+            />
 
-        {/* 3-Column Bento Grid */}
-        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-          <ul
-            className={cn(
-              "grid w-full list-none gap-4 auto-rows-fr",
-              chatOpen
-                ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3"
-                : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
-            )}
-          >
-            <li className="animate-fade min-w-0">
-              <PeerTile
-                name={nickname}
-                speaking={self.speaking}
-                muted={self.muted}
-                deafened={self.deafened}
-                isSelf
-                host={selfHosts}
+            {/* Compact Horizontal Participant Strip */}
+            <div className="shrink-0 overflow-x-auto pb-1">
+              <ul className="flex w-full list-none items-stretch gap-3">
+                {peerCards}
+              </ul>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex shrink-0 items-center justify-between">
+              <SectionLabel level={2}>
+                In call — {count} {count === 1 ? "participant" : "participants"}
+              </SectionLabel>
+            </div>
+
+            {/* 3-Column Bento Grid */}
+            <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+              <ul
+                className={cn(
+                  "grid w-full list-none gap-4 auto-rows-fr",
+                  chatOpen
+                    ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3"
+                    : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+                )}
               >
-                <MicLevelMeter ref={micMeterRef} className="min-w-0 flex-1" />
-              </PeerTile>
-            </li>
+                {peerCards}
 
-            {peers.map((p) => (
-              <li key={p.uuid} className="animate-fade min-w-0">
-                <PeerTile
-                  name={p.name}
-                  speaking={p.speaking}
-                  muted={p.mute}
-                  deafened={p.deafen}
-                  isBot={p.is_bot}
-                  host={
-                    !p.is_bot && p.user_id !== "" && p.user_id === botHostUserId
-                  }
-                  music={p.music}
-                  musicTitle={p.music_title}
-                  volume={peerVolumes[p.uuid] ?? 1}
-                  onVolume={(v) => onPeerVolume(p.uuid, v)}
-                  onToggleMute={() => onTogglePeerMute(p.uuid)}
-                  roomMuted={isRoomMutedId(p.user_id)}
-                  onToggleRoomMute={
-                    p.user_id
-                      ? () =>
-                          onToggleRoomMute(p.user_id, !isRoomMutedId(p.user_id))
-                      : undefined
-                  }
-                />
-              </li>
-            ))}
-
-            {humans.length === 0 && (
-              <li className="min-w-0">
-                <Panel
-                  padding="none"
-                  className="flex h-full flex-col items-start justify-center gap-2 rounded-2xl border-dashed border-border bg-[rgba(36,27,58,0.34)] p-4"
-                >
-                  <div className="flex items-center gap-3">
-                    <span className="grid size-10 shrink-0 place-items-center rounded-full border border-border bg-[var(--bg-input)] text-lavender">
-                      <IconUsers size={14} />
-                    </span>
-                    <span className="text-13 font-medium text-text-dim">
-                      Waiting for others
-                    </span>
-                  </div>
-                  <span className="text-12 text-text-faint">
-                    Share room code{" "}
-                    <span className="mono-num font-mono font-semibold text-accent">
-                      #{roomCode || "----"}
-                    </span>{" "}
-                    to invite squadmates.
-                  </span>
-                </Panel>
-              </li>
-            )}
-          </ul>
-        </div>
+                {humans.length === 0 && (
+                  <li className="min-w-0">
+                    <Panel
+                      padding="none"
+                      className="flex h-full flex-col items-start justify-center gap-2 rounded-2xl border-dashed border-border bg-[rgba(36,27,58,0.34)] p-4"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="grid size-10 shrink-0 place-items-center rounded-full border border-border bg-[var(--bg-input)] text-lavender">
+                          <IconUsers size={14} />
+                        </span>
+                        <span className="text-13 font-medium text-text-dim">
+                          Waiting for others
+                        </span>
+                      </div>
+                      <span className="text-12 text-text-faint">
+                        Share room code{" "}
+                        <span className="mono-num font-mono font-semibold text-accent">
+                          #{roomCode || "----"}
+                        </span>{" "}
+                        to invite squadmates.
+                      </span>
+                    </Panel>
+                  </li>
+                )}
+              </ul>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Right Full-Height Room Chat Island (only when open) */}

@@ -32,6 +32,7 @@ import {
   Copy,
   EarOff,
   ExternalLink,
+  Eye,
   FileAudio,
   FolderOpen,
   Gauge,
@@ -49,6 +50,8 @@ import {
   MicOff,
   Minimize2,
   Minus,
+  Monitor,
+  MonitorOff,
   Music,
   Pause,
   Pencil,
@@ -174,6 +177,11 @@ export const IconSkipForward = makeIcon(SkipForward, "skipForward");
 export const IconFolderOpen = makeIcon(FolderOpen, "folderOpen");
 export const IconFileAudio = makeIcon(FileAudio, "fileAudio");
 export const IconMonitor = makeIcon(Headphones, "monitor");
+
+// --- Screen sharing --------------------------------------------------------
+export const IconScreen = makeIcon(Monitor, "screen");
+export const IconScreenOff = makeIcon(MonitorOff, "screenOff");
+export const IconEye = makeIcon(Eye, "eye");
 
 // --- Generic controls ------------------------------------------------------
 export const IconCheck = makeIcon(Check, "check");

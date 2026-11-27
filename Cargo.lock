@@ -4471,7 +4471,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "soak-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing-subscriber",
  "uuid",
@@ -5888,7 +5888,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "verio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "indexmap 1.9.3",
  "rfd",
@@ -5910,7 +5910,7 @@ dependencies = [
 
 [[package]]
 name = "verio-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5925,7 +5925,7 @@ dependencies = [
 
 [[package]]
 name = "verio-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "ringbuf",
@@ -5934,7 +5934,7 @@ dependencies = [
 
 [[package]]
 name = "verio-discovery"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "mdns-sd",
@@ -5947,7 +5947,7 @@ dependencies = [
 
 [[package]]
 name = "verio-dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audiopus",
  "nnnoiseless",
@@ -5957,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "verio-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -5972,7 +5972,7 @@ dependencies = [
 
 [[package]]
 name = "verio-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "igd-next",
  "serde",

@@ -740,34 +740,80 @@ impl Signaling for VpsSignaling {
 }
 
 
+fn split_host_and_port(authority: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, after_bracket)) = rest.split_once(']') {
+            let port = after_bracket
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            return (format!("[{host}]"), port);
+        }
+    }
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return (h.to_string(), port);
+        }
+    }
+    (authority.to_string(), default_port)
+}
+
 pub fn extract_host_and_ports(server_url: &str) -> (String, u16, u16) {
-    let s = server_url.trim();
-    let s = s.trim_start_matches("ws://").trim_start_matches("wss://");
-    let host_port = s.split('/').next().unwrap_or("127.0.0.1:8443");
-    let (host, tcp_port) = if let Some((h, p)) = host_port.split_once(':') {
-        let port = p.parse::<u16>().unwrap_or(8443);
-        (h.to_string(), port)
+    let normalized = normalize_ws_url(server_url);
+    let (is_wss, rest) = if let Some(r) = normalized.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = normalized.strip_prefix("ws://") {
+        (false, r)
     } else {
-        (host_port.to_string(), 8443)
+        (false, normalized.as_str())
     };
+    let host_port = rest.split('/').next().unwrap_or("verio.drfake.ir:9091");
+    let (host, tcp_port) = split_host_and_port(host_port, if is_wss { 443 } else { 9091 });
     let udp_port = tcp_port.wrapping_add(1);
     (host, tcp_port, udp_port)
 }
 
-fn normalize_ws_url(raw: &str) -> String {
+pub fn normalize_ws_url(raw: &str) -> String {
     let raw = raw.trim();
-    let with_scheme = if raw.starts_with("ws://") || raw.starts_with("wss://") {
-        raw.to_string()
+    let (is_wss, rest) = if let Some(r) = raw.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = raw.strip_prefix("ws://") {
+        (false, r)
     } else {
-        format!("ws://{raw}")
+        (false, raw)
     };
-    if with_scheme.ends_with("/ws") {
-        with_scheme
-    } else if with_scheme.ends_with('/') {
-        format!("{with_scheme}ws")
+    let scheme = if is_wss { "wss://" } else { "ws://" };
+
+    let (authority, tail) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+
+    let has_explicit_port = if let Some(after_bracket) = authority.strip_prefix('[') {
+        after_bracket
+            .split_once(']')
+            .is_some_and(|(_, suffix)| suffix.starts_with(':') && suffix.len() > 1)
+    } else if let Some((_, p)) = authority.rsplit_once(':') {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
     } else {
-        format!("{with_scheme}/ws")
-    }
+        false
+    };
+
+    let normalized_authority = if !is_wss && !has_explicit_port && !authority.is_empty() {
+        format!("{authority}:9091")
+    } else {
+        authority.to_string()
+    };
+
+    let normalized_tail = if tail.ends_with("/ws") {
+        tail.to_string()
+    } else if tail.ends_with('/') {
+        format!("{tail}ws")
+    } else {
+        format!("{tail}/ws")
+    };
+
+    format!("{scheme}{normalized_authority}{normalized_tail}")
 }
 
 #[cfg(test)]
@@ -776,9 +822,13 @@ mod tests {
 
     #[test]
     fn test_normalize_ws_url() {
+        assert_eq!(normalize_ws_url("verio.drfake.ir"), "ws://verio.drfake.ir:9091/ws");
+        assert_eq!(normalize_ws_url("ws://verio.drfake.ir"), "ws://verio.drfake.ir:9091/ws");
+        assert_eq!(normalize_ws_url("ws://verio.drfake.ir:9091"), "ws://verio.drfake.ir:9091/ws");
         assert_eq!(normalize_ws_url("127.0.0.1:8443"), "ws://127.0.0.1:8443/ws");
         assert_eq!(normalize_ws_url("ws://127.0.0.1:8443"), "ws://127.0.0.1:8443/ws");
         assert_eq!(normalize_ws_url("ws://127.0.0.1:8443/ws"), "ws://127.0.0.1:8443/ws");
+        assert_eq!(normalize_ws_url("wss://verio.drfake.ir"), "wss://verio.drfake.ir/ws");
         assert_eq!(normalize_ws_url("wss://my-vps.com:8443/"), "wss://my-vps.com:8443/ws");
         assert_eq!(normalize_ws_url("wss://my-vps.com:8443/ws"), "wss://my-vps.com:8443/ws");
     }
@@ -794,6 +844,11 @@ mod tests {
         assert_eq!(host2, "myvps.com");
         assert_eq!(tcp2, 8443);
         assert_eq!(udp2, 8444);
+
+        let (host3, tcp3, udp3) = extract_host_and_ports("verio.drfake.ir");
+        assert_eq!(host3, "verio.drfake.ir");
+        assert_eq!(tcp3, 9091);
+        assert_eq!(udp3, 9092);
     }
 
     #[test]

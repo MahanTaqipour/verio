@@ -247,7 +247,14 @@ export function MockHarness({ transport }: MockHarnessProps) {
         </button>
         <button
           type="button"
-          style={{ ...btn, gridColumn: "1 / -1" }}
+          style={btn}
+          onClick={() => transport.togglePeerScreenShare()}
+        >
+          dan share
+        </button>
+        <button
+          type="button"
+          style={btn}
           onClick={() =>
             transport.emitAudioError(
               "spawn audio pump failed: no default output device",

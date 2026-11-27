@@ -20,6 +20,17 @@ use crate::db::Db;
 /// Debounce window before a change hits the database.
 const SAVE_DEBOUNCE_MS: u64 = 500;
 
+/// Default signaling server domain (Session 38: resolves transparently to `:9091`).
+pub const DEFAULT_VPS_ADDRESS: &str = "verio.drfake.ir";
+
+/// Legacy hardcoded VPS IPs auto-migrated onto [`DEFAULT_VPS_ADDRESS`].
+const LEGACY_VPS_IPS: &[&str] = &[
+    "141.11.1.110",
+    "87.107.165.14",
+    "89.116.72.30",
+    "193.24.105.202",
+];
+
 /// The pre-Session-28 store. Read once by [`import_legacy`], then renamed to
 /// `settings.json.imported` so it cannot be mistaken for the live settings.
 pub const LEGACY_SETTINGS_FILE_NAME: &str = "settings.json";
@@ -70,7 +81,7 @@ pub struct Settings {
     pub signaling_port: u16,
     /// Last 5 direct-connect addresses (most recent first).
     pub direct_recent: Vec<String>,
-    /// VPS signaling server address (ws:// or wss://). Default ws://127.0.0.1:8443.
+    /// VPS signaling server address (bare domain, ws://, or wss://). Default verio.drfake.ir.
     pub vps_address: String,
     /// Preferred voice transport mode.
     pub transport_mode: TransportModeSetting,
@@ -117,7 +128,7 @@ impl Default for Settings {
             hotkeys: HotkeySettings::default(),
             signaling_port: verio_discovery::DEFAULT_SIGNALING_PORT,
             direct_recent: Vec::new(),
-            vps_address: "ws://127.0.0.1:8443".to_string(),
+            vps_address: DEFAULT_VPS_ADDRESS.to_string(),
             transport_mode: TransportModeSetting::Auto,
             host_port: 8444,
             music_volume: 1.0,
@@ -132,7 +143,7 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Clamp free-form fields to valid ranges after a load or update.
+    /// Clamp free-form fields to valid ranges and migrate legacy server defaults.
     pub fn sanitize(&mut self) {
         self.input_gain_db = self.input_gain_db.clamp(-12.0, 12.0);
         if self.nickname.chars().count() > 64 {
@@ -143,6 +154,15 @@ impl Settings {
         }
         if self.host_port == 0 {
             self.host_port = 8444;
+        }
+        let trimmed_vps = self.vps_address.trim();
+        let is_legacy_vps = trimmed_vps.is_empty()
+            || trimmed_vps.eq_ignore_ascii_case("ws://127.0.0.1:8443")
+            || LEGACY_VPS_IPS.iter().any(|ip| trimmed_vps.contains(ip));
+        if is_legacy_vps {
+            self.vps_address = DEFAULT_VPS_ADDRESS.to_string();
+        } else if trimmed_vps != self.vps_address {
+            self.vps_address = trimmed_vps.to_string();
         }
         self.direct_recent.truncate(5);
         for addr in &mut self.direct_recent {
@@ -204,7 +224,16 @@ impl SettingsStore {
             settings.music_bitrate_kbps = 128;
             migrated = true;
         }
+        let prev_vps = settings.vps_address.clone();
         settings.sanitize();
+        if settings.vps_address != prev_vps {
+            tracing::info!(
+                old = %prev_vps,
+                new = %settings.vps_address,
+                "migrated legacy vps_address to default domain"
+            );
+            migrated = true;
+        }
         if migrated {
             if let Err(e) = save_settings(&db, &settings) {
                 tracing::warn!("failed to persist migrated settings: {e}");
@@ -667,5 +696,56 @@ mod tests {
         assert_eq!(s.nickname.chars().count(), 64);
         assert_eq!(s.direct_recent[0].chars().count(), 128);
         assert_eq!(s.hotkeys.ptt, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn legacy_vps_addresses_migrate_while_custom_servers_remain_untouched() {
+        assert_eq!(Settings::default().vps_address, "verio.drfake.ir");
+
+        for legacy in [
+            "",
+            "   ",
+            "ws://127.0.0.1:8443",
+            "141.11.1.110",
+            "ws://87.107.165.14:9091/ws",
+            "89.116.72.30:9091",
+            "ws://193.24.105.202:9091",
+        ] {
+            let mut s = Settings {
+                vps_address: legacy.to_string(),
+                ..Settings::default()
+            };
+            s.sanitize();
+            assert_eq!(
+                s.vps_address, "verio.drfake.ir",
+                "expected legacy address {legacy:?} to migrate"
+            );
+        }
+
+        let mut custom = Settings {
+            vps_address: "  ws://custom.example.com:8443  ".to_string(),
+            ..Settings::default()
+        };
+        custom.sanitize();
+        assert_eq!(custom.vps_address, "ws://custom.example.com:8443");
+
+        // Store load persists migrated legacy IP into SQLite immediately.
+        let dir = temp_dir("vps-migrate");
+        std::fs::write(
+            dir.join(LEGACY_SETTINGS_FILE_NAME),
+            serde_json::to_string(&Settings {
+                vps_address: "ws://193.24.105.202:9091".into(),
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let db = open(&dir);
+        let store = SettingsStore::load(db.clone(), &dir);
+        assert_eq!(store.get().vps_address, "verio.drfake.ir");
+        let saved: Settings =
+            serde_json::from_str(&db.load_settings_json().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.vps_address, "verio.drfake.ir");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

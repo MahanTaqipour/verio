@@ -170,11 +170,12 @@ pub fn start(cfg: BotConfig) -> Result<MusicBot, String> {
     //    — the relay fans out by room code — but it *is* needed for the roster:
     //    it is what gives every other client a `PeerJoined` now and a `PeerLeft`
     //    the moment we stop.
-    let mut session = VpsSignaling::join(&cfg.vps_addr, &cfg.room_code, &identity)
+    let normalized_vps = verio_discovery::vps::normalize_ws_url(&cfg.vps_addr);
+    let mut session = VpsSignaling::join(&normalized_vps, &cfg.room_code, &identity)
         .map_err(|e| format!("music bot could not join room {}: {e}", cfg.room_code))?;
 
     // 3. One relay socket for the whole room.
-    let relay_addrs = RoomManager::resolve_vps_relay_candidates(&cfg.vps_addr)?;
+    let relay_addrs = RoomManager::resolve_vps_relay_candidates(&normalized_vps)?;
     let primary = relay_addrs[0];
     let fallbacks = relay_addrs[1..].to_vec();
 

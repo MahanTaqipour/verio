@@ -162,6 +162,11 @@ export interface MuteInfo {
   by: string;
 }
 
+export interface MockStateRoomExtras {
+  /** Session 37B: active mock screen sharers keyed by peer uuid -> preset label. */
+  screenShares?: Record<string, string>;
+}
+
 export interface RoomSnapshot {
   state: RoomState;
   peer_name: string | null;
