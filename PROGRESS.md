@@ -5643,6 +5643,32 @@ Verified (real command output):
   - `C:\dev\verio\target\release\bundle\nsis\Verio_0.2.0_x64-setup.exe.sig` (`416` bytes)
   - `C:\dev\verio\target\release\bundle\nsis\latest.json` (`859` bytes, valid JSON, `"version": "0.2.0"`, URL `https://github.com/MahanTaqipour/verio/releases/download/v0.2.0/Verio_0.2.0_x64-setup.exe`)
 
+## Session 39: Setup `update.verio.drfake.ir` Static Update Mirror, Dual-Endpoint Rust Fallback, & Build Signed `v0.2.1`
+Goal:
+1. Configure dual-endpoint Tauri auto-updater prioritizing the VPS HTTPS mirror with genuine check/download fallback to GitHub Releases.
+2. Update `scripts/build-release.ps1` to emit both GitHub `latest.json` and VPS `latest-vps.json` (UTF-8 without BOM), bump version `0.2.0` -> `0.2.1`, verify full Rust + UI checks, and build signed `v0.2.1` on `C:`.
+3. Configure HTTPS update hosting on `193.24.105.202` without disturbing `verio-server-linux`, `coturn`, or live `x-ui`/`xray` (`*:443`), upload `v0.2.1` artifacts, and verify live HTTPS reachability from both VPS and local PC.
+
+Work done:
+1. **VPS Port Inspection & HTTPS Architecture (`193.24.105.202`)**:
+   - Discovered `xray-linux-amd64` (`pid=202033`, `x-ui` inbound `"DE Germany"`) already bound on `*:443` while port `80` and `9443` were free.
+   - Kept port `443` (`xray`) untouched per user confirmation and configured Nginx `1.24.0` + Certbot webroot (`/var/www/certbot`, Let's Encrypt cert for `update.verio.drfake.ir` valid through `2027-02-25`) on `*:80` (ACME + redirect) and `*:9443 ssl http2` serving `/var/www/verio-updates` (`Cache-Control: no-cache, no-store, must-revalidate` for `/latest.json`, `public, max-age=31536000, immutable` for `*.exe`).
+2. **Dual-Endpoint Updater & `v0.2.1` Release Pipeline (`ui/src-tauri/tauri.conf.json`, `ui/src-tauri/src/lib.rs`, `scripts/build-release.ps1`, `Cargo.toml`, `ui/package.json`, `ui/src-tauri/build.rs`, `ui/src/App.tsx`, `ui/src/components/verio/settings.tsx`, `ui/src/dev/mock/invoke.ts`, `CHANGELOG.md`)**:
+   - Configured `endpoints` to `["https://update.verio.drfake.ir:9443/latest.json", "https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json"]`.
+   - Replaced `check_for_update` / `install_update` with per-endpoint `updater_builder().endpoints(...).timeout(12s)` checks (`UPDATE_DOWNLOAD_TIMEOUT = 180s`), falling back to GitHub on both manifest check failures and `.download_and_install` failures, plus 2 unit tests in `updater_tests`.
+   - Updated `scripts/build-release.ps1` to locate the GitHub endpoint across `endpoints` and emit both `latest.json` and `latest-vps.json` (`https://update.verio.drfake.ir:9443/Verio_0.2.1_x64-setup.exe`) in UTF-8 without BOM.
+
+Verified (real command output):
+- `cargo clippy --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace --all-targets -- -D warnings`: Exit code 0 (0 warnings)
+- `cargo test --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace`: Exit code 0 (`verio_lib` 11, `verio_app` 103 unit + 4 + 2 integration, `verio_audio` 2, `verio_discovery` 12, `verio_dsp` 33, `verio_server` 16, `verio_transport` 19 — 0 failed; note an earlier run under parallel load had a single transient `test_direct_p2p_delivers_queued_control_before_channel_open` timing flake before passing cleanly 19/19 on clean re-run)
+- `cd ui; pnpm exec tsc --noEmit; pnpm test; pnpm build`: Exit code 0 (`17/17` passed; Vite built in 16.46s)
+- `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -UseRsproxy -Offline`: Exit code 0; produced:
+  - `C:\dev\verio\target\release\bundle\nsis\Verio_0.2.1_x64-setup.exe` (`6,593,947` bytes, SHA-256 `FE23211282F3178255F3211F3974FC6B3048832501ABBD734A00EB9DA5A0771A`)
+  - `C:\dev\verio\target\release\bundle\nsis\Verio_0.2.1_x64-setup.exe.sig` (`416` bytes)
+  - `C:\dev\verio\target\release\bundle\nsis\latest-vps.json` (`831` bytes, no BOM, URL `https://update.verio.drfake.ir:9443/Verio_0.2.1_x64-setup.exe`)
+  - `C:\dev\verio\target\release\bundle\nsis\latest.json` (`859` bytes, no BOM, URL `https://github.com/MahanTaqipour/verio/releases/download/v0.2.1/Verio_0.2.1_x64-setup.exe`)
+- Live HTTPS verification (`update.verio.drfake.ir:9443`) from both VPS (`HTTP/2 200`, matching SHA-256 `68cd781c16688a73319facb7e378678a452182803066cb831f031a040aa352ef` on `latest.json` and `fe23211282f3178255f3211f3974fc6b3048832501abbd734a00eb9da5a0771a` on `Verio_0.2.1_x64-setup.exe`) and local Windows PC (`HTTP/1.1 200 OK`, `Content-Length: 831` for `latest.json` with `Cache-Control: no-cache, no-store, must-revalidate` and `Content-Length: 6593947` for `.exe` with `Cache-Control: public, max-age=31536000, immutable`), with `verio-server-linux`, `turnserver`, and `xray-linux-amd6` verified running.
+
 
 
 

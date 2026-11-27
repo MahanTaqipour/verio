@@ -6,6 +6,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-27
+
+### Added
+- **VPS Auto-Update Mirror Generation (`scripts/build-release.ps1`)**: Generates `latest-vps.json` pointing to `https://update.verio.drfake.ir:9443/` alongside GitHub `latest.json` (both UTF-8 without BOM).
+
+### Changed
+- **Dual-Endpoint Auto-Updater with Download Fallback**: Primary check and download now query `https://update.verio.drfake.ir:9443/latest.json` with a 12-second request timeout and fall back automatically to GitHub Releases on connection, TLS, HTTP, or download failures.
+
 ## [0.2.0] - 2026-11-27
 
 ### Added

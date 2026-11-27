@@ -1539,66 +1539,157 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+const UPDATE_ENDPOINTS: [&str; 2] = [
+    "https://update.verio.drfake.ir:9443/latest.json",
+    "https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json",
+];
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const UPDATE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn format_update_errors(errors: &[String]) -> String {
+    if !errors.is_empty()
+        && errors
+            .iter()
+            .all(|e| e.contains("Could not fetch a valid release JSON"))
+    {
+        "No published release found on update mirror or GitHub yet (upload latest.json)."
+            .to_string()
+    } else {
+        errors.join(" | ")
+    }
+}
+
+async fn check_update_from_endpoint(
+    app: &tauri::AppHandle,
+    endpoint: &str,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let parsed = endpoint
+        .parse()
+        .map_err(|e| format!("Invalid updater endpoint {endpoint}: {e}"))?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![parsed])
+        .map_err(|e| e.to_string())?
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    updater.check().await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateAvailable>, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| {
-        let msg = e.to_string();
-        tracing::warn!(error = %msg, "update check initialization failed");
-        msg
-    })?;
-    let update = updater.check().await.map_err(|e| {
-        let raw = e.to_string();
-        tracing::warn!(error = %raw, "update check failed");
-        if raw.contains("Could not fetch a valid release JSON") {
-            "No published release found on GitHub yet (upload latest.json to a public Release)."
-                .to_string()
-        } else {
-            raw
+    let mut errors = Vec::new();
+    for endpoint in UPDATE_ENDPOINTS {
+        match check_update_from_endpoint(&app, endpoint).await {
+            Ok(update) => {
+                return Ok(update.map(|u| UpdateAvailable {
+                    version: u.version,
+                    current_version: env!("CARGO_PKG_VERSION").to_string(),
+                    date: u.date.map(|d| d.to_string()),
+                    body: u.body,
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    endpoint,
+                    error = %err,
+                    "update check failed; trying fallback endpoint"
+                );
+                errors.push(format!("{endpoint}: {err}"));
+            }
         }
-    })?;
-    Ok(update.map(|u| UpdateAvailable {
-        version: u.version,
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        date: u.date.map(|d| d.to_string()),
-        body: u.body,
-    }))
+    }
+    Err(format_update_errors(&errors))
 }
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let Some(update) = app
-        .updater()
-        .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Err("No update is currently available.".to_string());
-    };
-
-    let mut downloaded: u64 = 0;
-    let progress_app = app.clone();
-    update
-        .download_and_install(
-            move |chunk_len, content_len| {
-                downloaded = downloaded.saturating_add(chunk_len as u64);
-                let _ = progress_app.emit(
-                    "update_progress",
-                    UpdateProgress {
-                        downloaded,
-                        total: content_len,
-                    },
+    let mut errors = Vec::new();
+    for endpoint in UPDATE_ENDPOINTS {
+        match check_update_from_endpoint(&app, endpoint).await {
+            Ok(Some(mut update)) => {
+                update.timeout = Some(UPDATE_DOWNLOAD_TIMEOUT);
+                let mut downloaded: u64 = 0;
+                let progress_app = app.clone();
+                match update
+                    .download_and_install(
+                        move |chunk_len, content_len| {
+                            downloaded = downloaded.saturating_add(chunk_len as u64);
+                            let _ = progress_app.emit(
+                                "update_progress",
+                                UpdateProgress {
+                                    downloaded,
+                                    total: content_len,
+                                },
+                            );
+                        },
+                        || {},
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        tauri::Manager::state::<Bridge>(&app).settings.flush();
+                        app.restart();
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!(
+                            endpoint,
+                            error = %msg,
+                            "update download or install failed; trying fallback endpoint"
+                        );
+                        errors.push(format!("{endpoint}: {msg}"));
+                    }
+                }
+            }
+            Ok(None) => return Err("No update is currently available.".to_string()),
+            Err(err) => {
+                tracing::warn!(
+                    endpoint,
+                    error = %err,
+                    "update check failed during install; trying fallback endpoint"
                 );
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+                errors.push(format!("{endpoint}: {err}"));
+            }
+        }
+    }
+    Err(format_update_errors(&errors))
+}
 
-    tauri::Manager::state::<Bridge>(&app).settings.flush();
-    app.restart();
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+
+    #[test]
+    fn updater_endpoints_prioritize_vps_mirror_with_github_fallback() {
+        assert_eq!(
+            UPDATE_ENDPOINTS,
+            [
+                "https://update.verio.drfake.ir:9443/latest.json",
+                "https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json",
+            ]
+        );
+        assert!(UPDATE_CHECK_TIMEOUT >= std::time::Duration::from_secs(5));
+        assert!(UPDATE_DOWNLOAD_TIMEOUT >= UPDATE_CHECK_TIMEOUT);
+    }
+
+    #[test]
+    fn format_update_errors_preserves_transport_failures() {
+        let errs = vec![
+            "https://update.verio.drfake.ir:9443/latest.json: connection timed out".to_string(),
+            "https://github.com/...: tls handshake failed".to_string(),
+        ];
+        let msg = format_update_errors(&errs);
+        assert!(msg.contains("connection timed out"));
+        assert!(msg.contains("tls handshake failed"));
+
+        let missing = vec![
+            "https://update.verio.drfake.ir:9443/latest.json: Could not fetch a valid release JSON"
+                .to_string(),
+        ];
+        assert!(format_update_errors(&missing).contains("No published release found"));
+    }
 }
 
 /// Build and run the Tauri application.

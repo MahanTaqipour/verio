@@ -213,7 +213,7 @@ export default function App() {
   const [toastPaused, setToastPaused] = useState(false);
 
   // Auto-updater state (Session 36)
-  const [appVersion, setAppVersion] = useState("0.2.0");
+  const [appVersion, setAppVersion] = useState("0.2.1");
   const [availableUpdate, setAvailableUpdate] = useState<{
     version: string;
     current_version: string;

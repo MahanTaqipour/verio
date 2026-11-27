@@ -146,7 +146,7 @@ export function Settings({
   onSetDebugWavs,
   onSetVoiceQuality,
   onSetMusicQuality,
-  appVersion = "0.2.0",
+  appVersion = "0.2.1",
   updateCheckStatus,
   onCheckForUpdates,
   onOpenUpdateDialog,

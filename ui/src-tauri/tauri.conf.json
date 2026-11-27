@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Verio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "ir.verio.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -57,6 +57,7 @@
       },
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNTk3QTNEQTMzRTdGNzAKUldSd2Z6NmpQWHBaZzE2NDd5Ry8weUg1THU3MXRVT1JkclRIditiQlJaZkEwNm5RTGV4Yk9rcjIK",
       "endpoints": [
+        "https://update.verio.drfake.ir:9443/latest.json",
         "https://github.com/MahanTaqipour/verio/releases/latest/download/latest.json"
       ]
     }

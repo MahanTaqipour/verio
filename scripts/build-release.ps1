@@ -20,13 +20,11 @@ $env:CARGO_BUILD_JOBS = "1"
 $ConfPath = Join-Path $RepoRoot "ui\src-tauri\tauri.conf.json"
 $Conf = Get-Content -Raw $ConfPath | ConvertFrom-Json
 $Version = [string]$Conf.version
-$Endpoint = [string]$Conf.plugins.updater.endpoints[0]
-
-if ($Endpoint -match "github\.com/([^/]+/[^/]+)/releases/") {
-    $OwnerRepo = $Matches[1]
-} else {
-    throw "Could not parse GitHub OWNER/REPO from updater endpoint: $Endpoint"
+$GitHubEndpoint = $Conf.plugins.updater.endpoints | Where-Object { [string]$_ -match "github\.com/([^/]+/[^/]+)/releases/" } | Select-Object -First 1
+if (-not $GitHubEndpoint -or ([string]$GitHubEndpoint -notmatch "github\.com/([^/]+/[^/]+)/releases/")) {
+    throw "Could not parse GitHub OWNER/REPO from any updater endpoint in tauri.conf.json"
 }
+$OwnerRepo = $Matches[1]
 
 Write-Host "Building signed Windows NSIS release for Verio v$Version ($OwnerRepo) directly on C: with CARGO_BUILD_JOBS=1..."
 
@@ -79,12 +77,29 @@ $Manifest = [ordered]@{
     }
 }
 
+$VpsManifest = [ordered]@{
+    version   = $Version
+    notes     = "Verio v$Version"
+    pub_date  = $PubDate
+    platforms = [ordered]@{
+        "windows-x86_64" = [ordered]@{
+            signature = $Signature
+            url       = "https://update.verio.drfake.ir:9443/$SetupName"
+        }
+    }
+}
+
 $LatestJsonPath = Join-Path $NsisDir "latest.json"
-$Json = $Manifest | ConvertTo-Json -Depth 5
-[System.IO.File]::WriteAllText($LatestJsonPath, $Json, (New-Object System.Text.UTF8Encoding($false)))
+$LatestVpsJsonPath = Join-Path $NsisDir "latest-vps.json"
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($LatestJsonPath, ($Manifest | ConvertTo-Json -Depth 5), $Utf8NoBom)
+[System.IO.File]::WriteAllText($LatestVpsJsonPath, ($VpsManifest | ConvertTo-Json -Depth 5), $Utf8NoBom)
 
 Write-Host ""
 Write-Host "Release artifacts built successfully!"
-Write-Host "Upload these exact 2 files to GitHub Release v${Version}:"
+Write-Host "Upload to VPS (/var/www/verio-updates):"
+Write-Host "  1) $SetupPath"
+Write-Host "  2) $LatestVpsJsonPath -> /var/www/verio-updates/latest.json"
+Write-Host "Optional GitHub Release v${Version} fallback files:"
 Write-Host "  1) $SetupPath"
 Write-Host "  2) $LatestJsonPath"

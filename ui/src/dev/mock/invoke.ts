@@ -472,7 +472,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
       case "music_status":
         return structuredClone(state.music);
       case "get_app_version":
-        return "0.2.0";
+        return "0.2.1";
       case "check_for_update":
         return null;
       case "install_update":
@@ -481,7 +481,7 @@ export function installMockTransport(scenarioId: string): MockTransport {
         return {
           message: `Hello ${String(args.name ?? "")}! The Rust ↔ frontend bridge is working.`,
           rust_timestamp_ms: Date.now(),
-          app: { name: "Verio", version: "0.2.0" },
+          app: { name: "Verio", version: "0.2.1" },
         };
 
       // --- audio controls ---
