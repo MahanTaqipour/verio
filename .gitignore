@@ -57,6 +57,7 @@ tauri.key.pub
 *.bak
 *_done.flag
 /verio-music-player-panel.zip
+/verio.exe
 
 # Debug audio dumps; retain shipping sound assets
 *.wav

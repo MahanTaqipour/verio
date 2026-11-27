@@ -12,15 +12,31 @@ jobs:
   release-windows:
     runs-on: windows-latest
     steps:
+      - name: Check signing key secret
+        id: check
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping automated release build: TAURI_SIGNING_PRIVATE_KEY secret is not configured."
+          fi
+
       - name: Checkout repository
+        if: steps.check.outputs.has_key == 'true'
         uses: actions/checkout@v4
 
       - name: Setup pnpm
+        if: steps.check.outputs.has_key == 'true'
         uses: pnpm/action-setup@v4
         with:
           version: "11"
 
       - name: Setup Node.js
+        if: steps.check.outputs.has_key == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -28,16 +44,20 @@ jobs:
           cache-dependency-path: "ui/pnpm-lock.yaml"
 
       - name: Setup Rust toolchain
+        if: steps.check.outputs.has_key == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
+        if: steps.check.outputs.has_key == 'true'
         uses: swatinem/rust-cache@v2
 
       - name: Install UI dependencies
+        if: steps.check.outputs.has_key == 'true'
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
       - name: Build, sign, and publish GitHub Release
+        if: steps.check.outputs.has_key == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
