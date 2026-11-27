@@ -5960,6 +5960,7 @@ name = "verio-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "futures-util",
  "rand 0.8.8",
  "serde",

@@ -23,6 +23,7 @@ use verio_discovery::{
     create_answer_invite, create_invite, parse_invite, DirectSession, Identity, InviteKind,
     Role, Signaling,
 };
+pub use verio_discovery::vps::{IceServerConfig, SignalingCommand, SignalingEvent};
 use verio_transport::{
     spawn_session, ControlMessage, PeerHandle, SessionSetup, SdpPendingOffer,
     TransportEvent,
@@ -134,6 +135,21 @@ pub enum RoomEvent {
         sender_name: String,
         text: String,
         timestamp_ms: u64,
+    },
+    /// Session 37A: STUN/TURN ICE server configuration pushed by VPS signaling server.
+    IceConfig {
+        servers: Vec<IceServerConfig>,
+    },
+    /// Session 37A: remote peer started or stopped screen sharing.
+    PeerScreenState {
+        peer_id: String,
+        sharing: bool,
+        label: String,
+    },
+    /// Session 37A: targeted 1-to-1 WebRTC screen-share SDP/ICE signaling relay.
+    ScreenSignal {
+        from: String,
+        payload: serde_json::Value,
     },
 }
 
@@ -261,6 +277,10 @@ pub struct RoomManager {
     db: Db,
     /// Session 31: recent chat message IDs for deduplicating UDP double-sends (bounded at 128).
     recent_chat_ids: std::collections::VecDeque<String>,
+    /// Session 37A: outbound VPS signaling command sender for screen-sharing control & signals.
+    signaling_tx: Option<mpsc::Sender<SignalingCommand>>,
+    /// Session 37A: STUN/TURN ICE server list pushed by VPS signaling server for this room.
+    ice_servers: Vec<IceServerConfig>,
 }
 
 struct ActiveSession {
@@ -296,6 +316,8 @@ impl RoomManager {
             mute_sink: None,
             db,
             recent_chat_ids: std::collections::VecDeque::with_capacity(128),
+            signaling_tx: None,
+            ice_servers: Vec::new(),
         };
         room.restore_mutes();
         room.spawn_audio_pump();
@@ -632,6 +654,8 @@ impl RoomManager {
         self.room_code = None;
         self.transport_mode = None;
         self.recent_chat_ids.clear();
+        self.signaling_tx = None;
+        self.ice_servers.clear();
         let _ = reason;
     }
 
@@ -868,6 +892,63 @@ impl RoomManager {
         });
 
         Ok(())
+    }
+
+    /// Session 37A: publish local screen-share start/stop state via the VPS signaling socket.
+    pub fn send_screen_state(&self, sharing: bool, label: String) -> Result<(), String> {
+        if !matches!(self.state, RoomState::Connecting | RoomState::Connected) {
+            return Err("Join a room before updating screen share state.".into());
+        }
+        let Some(tx) = self.signaling_tx.as_ref() else {
+            return Err("Screen sharing requires an active VPS signaling session.".into());
+        };
+        let bounded_label = if sharing {
+            label.trim().chars().take(64).collect()
+        } else {
+            String::new()
+        };
+        tx.send(SignalingCommand::ScreenState {
+            sharing,
+            label: bounded_label,
+        })
+        .map_err(|_| "VPS signaling channel closed.".to_string())
+    }
+
+    /// Session 37A: relay targeted 1-to-1 WebRTC screen-share SDP/ICE signaling.
+    pub fn send_screen_signal(
+        &self,
+        target: String,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        if !matches!(self.state, RoomState::Connecting | RoomState::Connected) {
+            return Err("Join a room before sending screen share signals.".into());
+        }
+        let target_trimmed = target.trim();
+        if target_trimmed.is_empty() {
+            return Err("Screen signal target peer cannot be empty.".into());
+        }
+        let payload_len = serde_json::to_string(&payload)
+            .map_err(|e| format!("Invalid screen signal payload: {e}"))?
+            .len();
+        if payload_len > 65_536 {
+            return Err(format!(
+                "Screen signal payload too large ({payload_len} bytes, max 65536)."
+            ));
+        }
+        let Some(tx) = self.signaling_tx.as_ref() else {
+            return Err("Screen sharing requires an active VPS signaling session.".into());
+        };
+        tx.send(SignalingCommand::ScreenSignal {
+            target: target_trimmed.to_string(),
+            payload,
+        })
+        .map_err(|_| "VPS signaling channel closed.".to_string())
+    }
+
+    /// Session 37A: return the current room's STUN/TURN ICE server configuration.
+    #[must_use]
+    pub fn ice_servers(&self) -> Vec<IceServerConfig> {
+        self.ice_servers.clone()
     }
 
     /// The single path every mute takes, whoever it came from.
@@ -1435,6 +1516,9 @@ impl RoomManager {
             }
         };
 
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SignalingCommand>();
+        session.set_command_rx(cmd_rx);
+
         let sig_handle = {
             let room_weak = Arc::downgrade(room);
             match std::thread::Builder::new()
@@ -1445,14 +1529,35 @@ impl RoomManager {
                             return;
                         };
                         match event {
-                            verio_discovery::vps::SignalingEvent::PeerJoined(peer) => {
+                            SignalingEvent::PeerJoined(peer) => {
                                 let mut m = r.lock().expect("room lock");
                                 m.add_peer(peer);
                                 m.send_state_gossip();
                                 m.sync_mutes_to_room();
                             }
-                            verio_discovery::vps::SignalingEvent::PeerLeft(peer_id) => {
+                            SignalingEvent::PeerLeft(peer_id) => {
                                 r.lock().expect("room lock").remove_peer(&peer_id);
+                            }
+                            SignalingEvent::IceConfig(servers) => {
+                                let mut m = r.lock().expect("room lock");
+                                m.ice_servers = servers.clone();
+                                m.emit(RoomEvent::IceConfig { servers });
+                            }
+                            SignalingEvent::PeerScreenState {
+                                peer_id,
+                                sharing,
+                                label,
+                            } => {
+                                let m = r.lock().expect("room lock");
+                                m.emit(RoomEvent::PeerScreenState {
+                                    peer_id,
+                                    sharing,
+                                    label,
+                                });
+                            }
+                            SignalingEvent::ScreenSignal { from, payload } => {
+                                let m = r.lock().expect("room lock");
+                                m.emit(RoomEvent::ScreenSignal { from, payload });
                             }
                         }
                     });
@@ -1471,6 +1576,7 @@ impl RoomManager {
                 && !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
             {
                 m.roster_thread = roster_handle;
+                m.signaling_tx = sig_handle.as_ref().map(|_| cmd_tx);
                 m.signaling_thread = sig_handle;
                 None
             } else {
@@ -3142,6 +3248,66 @@ mod tests {
                 "failed send_chat must not emit local ChatReceived echo"
             );
         }
+    }
+
+    #[test]
+    fn send_screen_commands_enforce_room_state_bounds_and_teardown() {
+        let (mut m, _rx) = manager();
+        assert!(m.send_screen_state(true, "Monitor".into()).is_err());
+        assert!(m
+            .send_screen_signal("peer-b".into(), serde_json::json!({ "ok": true }))
+            .is_err());
+
+        m.set_state(RoomState::Connected);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        m.signaling_tx = Some(cmd_tx);
+        m.ice_servers = vec![IceServerConfig {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
+            username: None,
+            credential: None,
+        }];
+        assert_eq!(m.ice_servers().len(), 1);
+
+        // Long UTF-8 label is truncated to 64 chars cleanly; sharing=false clears label.
+        m.send_screen_state(true, format!("  {} ", "🖥️".repeat(70)))
+            .unwrap();
+        match cmd_rx.try_recv().unwrap() {
+            SignalingCommand::ScreenState { sharing, label } => {
+                assert!(sharing);
+                assert_eq!(label.chars().count(), 64);
+            }
+            other => panic!("expected ScreenState, got {other:?}"),
+        }
+
+        m.send_screen_state(false, "Ignored".into()).unwrap();
+        match cmd_rx.try_recv().unwrap() {
+            SignalingCommand::ScreenState { sharing, label } => {
+                assert!(!sharing);
+                assert!(label.is_empty());
+            }
+            other => panic!("expected ScreenState false, got {other:?}"),
+        }
+
+        // Empty target and >64 KB payload fail fast before queueing.
+        assert!(m
+            .send_screen_signal("   ".into(), serde_json::json!({}))
+            .is_err());
+        let huge = serde_json::json!({ "sdp": "a".repeat(70_000) });
+        assert!(m.send_screen_signal("peer-b".into(), huge).is_err());
+
+        m.send_screen_signal(" peer-b ".into(), serde_json::json!({ "kind": "offer" }))
+            .unwrap();
+        match cmd_rx.try_recv().unwrap() {
+            SignalingCommand::ScreenSignal { target, payload } => {
+                assert_eq!(target, "peer-b");
+                assert_eq!(payload["kind"], "offer");
+            }
+            other => panic!("expected ScreenSignal, got {other:?}"),
+        }
+
+        m.teardown_session("done");
+        assert!(m.signaling_tx.is_none());
+        assert!(m.ice_servers().is_empty());
     }
 }
 

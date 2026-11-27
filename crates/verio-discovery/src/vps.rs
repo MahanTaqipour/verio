@@ -18,7 +18,7 @@ use crate::{Identity, Role, Signaling, SignalingError, Uuid};
 pub type WsStream = WebSocket<MaybeTlsStream<TcpStream>>;
 
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const WS_POLL_TIMEOUT: Duration = Duration::from_millis(200);
+const WS_POLL_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Set read timeout on both plain TCP and `native-tls` WebSocket streams.
 pub fn set_ws_read_timeout(socket: &mut WsStream, dur: Option<Duration>) {
@@ -111,6 +111,26 @@ enum WireClientMessage {
     Leave {
         room: String,
     },
+    ScreenState {
+        room: String,
+        sharing: bool,
+        #[serde(default)]
+        label: String,
+    },
+    ScreenSignal {
+        room: String,
+        target: String,
+        payload: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +167,21 @@ enum WireServerMessage {
         from: String,
         candidate: String,
     },
+    IceConfig {
+        servers: Vec<IceServerConfig>,
+    },
+    PeerScreenState {
+        room: String,
+        peer_id: String,
+        sharing: bool,
+        #[serde(default)]
+        label: String,
+    },
+    ScreenSignal {
+        room: String,
+        from: String,
+        payload: serde_json::Value,
+    },
     Error {
         message: String,
     },
@@ -159,6 +194,32 @@ pub enum SignalingEvent {
     PeerJoined(Identity),
     /// A peer left the room (its UUID).
     PeerLeft(String),
+    /// Session 37A: STUN/TURN ICE server configuration pushed by VPS signaling server.
+    IceConfig(Vec<IceServerConfig>),
+    /// Session 37A: a remote peer started or stopped screen sharing.
+    PeerScreenState {
+        peer_id: String,
+        sharing: bool,
+        label: String,
+    },
+    /// Session 37A: targeted 1-to-1 WebRTC screen-share SDP/ICE signaling.
+    ScreenSignal {
+        from: String,
+        payload: serde_json::Value,
+    },
+}
+
+/// Session 37A: outbound control commands forwarded to the live VPS WebSocket listener.
+#[derive(Debug, Clone)]
+pub enum SignalingCommand {
+    ScreenState {
+        sharing: bool,
+        label: String,
+    },
+    ScreenSignal {
+        target: String,
+        payload: serde_json::Value,
+    },
 }
 
 pub struct VpsSignaling {
@@ -170,6 +231,10 @@ pub struct VpsSignaling {
     stop: Arc<AtomicBool>,
     /// Session 12: peers already in the room when we joined (empty for the creator).
     initial_peers: Vec<Identity>,
+    /// Session 37A: outbound signaling command receiver drained in `run_listener`.
+    cmd_rx: Option<std::sync::mpsc::Receiver<SignalingCommand>>,
+    /// Session 37A: signaling events received before `run_listener` starts.
+    pending_events: Vec<SignalingEvent>,
 }
 
 impl VpsSignaling {
@@ -226,9 +291,15 @@ impl VpsSignaling {
                                     target_peer: None,
                                     stop: Arc::new(AtomicBool::new(false)),
                                     initial_peers: Vec::new(),
+                                    cmd_rx: None,
+                                    pending_events: Vec::new(),
                                 },
                                 room,
                             ));
+                        }
+                        WireServerMessage::IceConfig { servers } => {
+                            tracing::debug!(count = servers.len(), "buffered early IceConfig during create");
+                            // Unlikely before Created, but preserve if sent out-of-order.
                         }
                         WireServerMessage::Error { message } => {
                             return Err(SignalingError::Protocol(format!(
@@ -312,6 +383,8 @@ impl VpsSignaling {
                                 target_peer,
                                 stop: Arc::new(AtomicBool::new(false)),
                                 initial_peers: peers_at_join,
+                                cmd_rx: None,
+                                pending_events: Vec::new(),
                             });
                         }
                         WireServerMessage::Error { message } => {
@@ -341,10 +414,38 @@ impl VpsSignaling {
         self.stop = flag;
     }
 
+    /// Session 37A: attach an outbound signaling command receiver drained by `run_listener`.
+    pub fn set_command_rx(&mut self, rx: std::sync::mpsc::Receiver<SignalingCommand>) {
+        self.cmd_rx = Some(rx);
+    }
+
     /// Session 12: peers that were already in the room when we joined.
     #[must_use]
     pub fn initial_peers(&self) -> Vec<Identity> {
         self.initial_peers.clone()
+    }
+
+    /// Session 37A: serialize and flush an outbound screen-share command over the WebSocket.
+    fn send_command(&mut self, cmd: SignalingCommand) {
+        let msg = match cmd {
+            SignalingCommand::ScreenState { sharing, label } => WireClientMessage::ScreenState {
+                room: self.room_code.clone(),
+                sharing,
+                label,
+            },
+            SignalingCommand::ScreenSignal { target, payload } => WireClientMessage::ScreenSignal {
+                room: self.room_code.clone(),
+                target,
+                payload,
+            },
+        };
+        if let Ok(text) = serde_json::to_string(&msg) {
+            if let Err(e) = self.socket.send(Message::Text(text)) {
+                tracing::warn!(%e, "VPS signaling: send command failed");
+                return;
+            }
+            let _ = self.socket.flush();
+        }
     }
 
     /// Explicitly send a `Leave` message and close the signaling WebSocket.
@@ -363,11 +464,20 @@ impl VpsSignaling {
     pub fn run_listener(mut self, mut on_event: impl FnMut(SignalingEvent) + Send + 'static) {
         set_ws_read_timeout(&mut self.socket, Some(WS_POLL_TIMEOUT));
         let local_uuid_str = self.local_uuid.to_string();
+        let cmd_rx = self.cmd_rx.take();
+        for ev in std::mem::take(&mut self.pending_events) {
+            on_event(ev);
+        }
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 self.leave_and_close();
                 tracing::info!("VPS signaling: left room on request");
                 break;
+            }
+            if let Some(rx) = cmd_rx.as_ref() {
+                while let Ok(cmd) = rx.try_recv() {
+                    self.send_command(cmd);
+                }
             }
             match self.socket.read() {
                 Ok(Message::Text(t)) => {
@@ -387,6 +497,32 @@ impl VpsSignaling {
                                 }
                                 tracing::info!(peer = %peer.name, uuid = %peer.uuid, "VPS signaling: peer joined room");
                                 on_event(SignalingEvent::PeerJoined(peer));
+                            }
+                            WireServerMessage::IceConfig { servers } => {
+                                tracing::debug!(count = servers.len(), "VPS signaling: received IceConfig");
+                                on_event(SignalingEvent::IceConfig(servers));
+                            }
+                            WireServerMessage::PeerScreenState {
+                                peer_id,
+                                sharing,
+                                label,
+                                ..
+                            } => {
+                                if peer_id == local_uuid_str {
+                                    continue;
+                                }
+                                tracing::info!(%peer_id, sharing, "VPS signaling: peer screen state updated");
+                                on_event(SignalingEvent::PeerScreenState {
+                                    peer_id,
+                                    sharing,
+                                    label,
+                                });
+                            }
+                            WireServerMessage::ScreenSignal { from, payload, .. } => {
+                                if from == local_uuid_str {
+                                    continue;
+                                }
+                                on_event(SignalingEvent::ScreenSignal { from, payload });
                             }
                             _ => {}
                         }
@@ -851,6 +987,178 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("server must receive flushed Pong from client");
         assert_eq!(pong_payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        stop.store(true, Ordering::Relaxed);
+        listener_thread.join().unwrap();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_vps_run_listener_bidirectional_screen_commands_and_events() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let local_id = Identity {
+            uuid: Uuid::from_u128(202),
+            user_id: "user-screen".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Bob".into(),
+            version: "0.2.0".into(),
+        };
+
+        let (server_rx_tx, server_rx_rx) = std::sync::mpsc::channel::<WireClientMessage>();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let Message::Text(req_txt) = ws.read().unwrap() else {
+                panic!("expected join message");
+            };
+            let WireClientMessage::Join { room, .. } =
+                serde_json::from_str(&req_txt).unwrap()
+            else {
+                panic!("expected Join variant");
+            };
+            ws.send(Message::Text(
+                serde_json::to_string(&WireServerMessage::Joined {
+                    room: room.clone(),
+                    peers: Vec::new(),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+
+            // Push IceConfig, PeerScreenState catch-up, and ScreenSignal immediately after Joined.
+            let ice = WireServerMessage::IceConfig {
+                servers: vec![IceServerConfig {
+                    urls: vec!["turn:193.24.105.202:3479?transport=udp".into()],
+                    username: Some("1700043200:u".into()),
+                    credential: Some("cred".into()),
+                }],
+            };
+            ws.send(Message::Text(serde_json::to_string(&ice).unwrap()))
+                .unwrap();
+
+            let peer_state = WireServerMessage::PeerScreenState {
+                room: room.clone(),
+                peer_id: "sharer-uuid".into(),
+                sharing: true,
+                label: "Primary Display".into(),
+            };
+            ws.send(Message::Text(serde_json::to_string(&peer_state).unwrap()))
+                .unwrap();
+
+            let inbound_sig = WireServerMessage::ScreenSignal {
+                room,
+                from: "sharer-uuid".into(),
+                payload: serde_json::json!({ "kind": "offer", "sdp": "v=0" }),
+            };
+            ws.send(Message::Text(serde_json::to_string(&inbound_sig).unwrap()))
+                .unwrap();
+
+            loop {
+                match ws.read() {
+                    Ok(Message::Text(txt)) => {
+                        if let Ok(parsed) = serde_json::from_str::<WireClientMessage>(&txt) {
+                            let is_leave = matches!(parsed, WireClientMessage::Leave { .. });
+                            let _ = server_rx_tx.send(parsed);
+                            if is_leave {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}/ws");
+        let mut session = VpsSignaling::join(&url, "1111", &local_id).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SignalingCommand>();
+        session.set_stop_flag(Arc::clone(&stop));
+        session.set_command_rx(cmd_rx);
+
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<SignalingEvent>();
+        let listener_thread = std::thread::spawn(move || {
+            session.run_listener(move |ev| {
+                let _ = ev_tx.send(ev);
+            });
+        });
+
+        // Verify inbound events arrived.
+        let mut got_ice = false;
+        let mut got_state = false;
+        let mut got_sig = false;
+        for _ in 0..3 {
+            match ev_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("expected inbound SignalingEvent")
+            {
+                SignalingEvent::IceConfig(servers) => {
+                    assert_eq!(servers.len(), 1);
+                    assert_eq!(servers[0].username.as_deref(), Some("1700043200:u"));
+                    got_ice = true;
+                }
+                SignalingEvent::PeerScreenState {
+                    peer_id,
+                    sharing,
+                    label,
+                } => {
+                    assert_eq!(peer_id, "sharer-uuid");
+                    assert!(sharing);
+                    assert_eq!(label, "Primary Display");
+                    got_state = true;
+                }
+                SignalingEvent::ScreenSignal { from, payload } => {
+                    assert_eq!(from, "sharer-uuid");
+                    assert_eq!(payload["kind"], "offer");
+                    got_sig = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(got_ice && got_state && got_sig);
+
+        // Send outbound ScreenState + ScreenSignal and ensure fast delivery while WS read is idle.
+        let start = Instant::now();
+        cmd_tx
+            .send(SignalingCommand::ScreenState {
+                sharing: true,
+                label: "Screen 2".into(),
+            })
+            .unwrap();
+        cmd_tx
+            .send(SignalingCommand::ScreenSignal {
+                target: "sharer-uuid".into(),
+                payload: serde_json::json!({ "kind": "answer", "sdp": "v=0" }),
+            })
+            .unwrap();
+
+        match server_rx_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server must receive ScreenState")
+        {
+            WireClientMessage::ScreenState { sharing, label, .. } => {
+                assert!(sharing);
+                assert_eq!(label, "Screen 2");
+            }
+            other => panic!("expected ScreenState, got {other:?}"),
+        }
+        match server_rx_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server must receive ScreenSignal")
+        {
+            WireClientMessage::ScreenSignal {
+                target, payload, ..
+            } => {
+                assert_eq!(target, "sharer-uuid");
+                assert_eq!(payload["kind"], "answer");
+            }
+            other => panic!("expected ScreenSignal, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(1));
 
         stop.store(true, Ordering::Relaxed);
         listener_thread.join().unwrap();

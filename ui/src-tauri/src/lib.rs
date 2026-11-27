@@ -555,6 +555,36 @@ fn send_chat_message(text: String, bridge: State<Bridge>) -> Result<(), String> 
     bridge.room.lock().expect("room lock").send_chat(text)
 }
 
+/// Session 37A: advertise local screen share start/stop state via VPS signaling.
+#[tauri::command]
+fn send_screen_state(sharing: bool, label: String, bridge: State<Bridge>) -> Result<(), String> {
+    bridge
+        .room
+        .lock()
+        .expect("room lock")
+        .send_screen_state(sharing, label)
+}
+
+/// Session 37A: relay targeted 1-to-1 screen-share WebRTC SDP/ICE signaling.
+#[tauri::command]
+fn send_screen_signal(
+    target: String,
+    payload: serde_json::Value,
+    bridge: State<Bridge>,
+) -> Result<(), String> {
+    bridge
+        .room
+        .lock()
+        .expect("room lock")
+        .send_screen_signal(target, payload)
+}
+
+/// Session 37A: return the current room's STUN/TURN ICE server configuration.
+#[tauri::command]
+fn get_ice_servers(bridge: State<Bridge>) -> Vec<verio_app::room::IceServerConfig> {
+    bridge.room.lock().expect("room lock").ice_servers()
+}
+
 // ---------------------------------------------------------------------------
 // Session 13: music player commands
 // ---------------------------------------------------------------------------
@@ -1645,6 +1675,9 @@ pub fn run() {
             get_app_version,
             check_for_update,
             install_update,
+            send_screen_state,
+            send_screen_signal,
+            get_ice_servers,
         ])
         .setup(move |app| {
             let launch: LaunchArgs = launch;
@@ -2076,6 +2109,35 @@ pub fn run() {
                                     let _ = fwd_app.emit(
                                         "rtt_updated",
                                         serde_json::json!({ "ms": ms }),
+                                    );
+                                }
+                                RoomEvent::IceConfig { servers } => {
+                                    let _ = fwd_app.emit(
+                                        "ice_config",
+                                        serde_json::json!({ "servers": servers }),
+                                    );
+                                }
+                                RoomEvent::PeerScreenState {
+                                    peer_id,
+                                    sharing,
+                                    label,
+                                } => {
+                                    let _ = fwd_app.emit(
+                                        "screen_state",
+                                        serde_json::json!({
+                                            "peer_id": peer_id,
+                                            "sharing": sharing,
+                                            "label": label,
+                                        }),
+                                    );
+                                }
+                                RoomEvent::ScreenSignal { from, payload } => {
+                                    let _ = fwd_app.emit(
+                                        "screen_signal",
+                                        serde_json::json!({
+                                            "from": from,
+                                            "payload": payload,
+                                        }),
                                     );
                                 }
                                 RoomEvent::Error { message } => {

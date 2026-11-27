@@ -5562,4 +5562,37 @@ Verified (real command output):
   - `target\release\bundle\nsis\Verio_0.1.0_x64-setup.exe.sig` (416 bytes)
   - `target\release\bundle\nsis\latest.json` (valid JSON, `version: "0.1.0"`, non-empty `signature` matching `.sig`, `url: https://github.com/MahanTaqipour/verio/releases/download/v0.1.0/Verio_0.1.0_x64-setup.exe`)
 
+### Session 37A (2026-11-27) — Screen Sharing Signaling Relay, Ephemeral TURN Credentials & VPS `coturn` Deployment
+
+Goal:
+1. Extend `verio-server` WebSocket protocol & relay to support Watch-on-Demand screen sharing state broadcast (`PeerScreenState`), targeted 1-to-1 SDP/ICE relay (`ScreenSignal`), and time-limited `coturn` TURN credentials (`IceConfig`) via pure-Rust RFC 2104 HMAC-SHA1.
+2. Make `VpsSignaling` bidirectional (`WS_POLL_TIMEOUT = 25ms`, outbound `SignalingCommand` channel with `.flush()`, inbound `SignalingEvent`), and expose `send_screen_state`, `send_screen_signal`, `get_ice_servers` + Tauri events (`ice_config`, `screen_state`, `screen_signal`) through `RoomManager` & `ui/src-tauri`.
+3. Install/configure `coturn` (port `3479`, `external-ip=193.24.105.202`) and redeploy `verio-server-linux` on VPS `193.24.105.202`.
+
+Work done:
+1. **`crates/verio-server` (`Cargo.toml` + `src/main.rs`)**:
+   - Added `--turn-url` and `--turn-secret` CLI options to `ServerConfig` / `parse_args_from` and stored them on `AppState`.
+   - Implemented pure-Rust RFC 3174 SHA-1 (`sha1`) + RFC 2104 `hmac_sha1` + `build_ice_servers` emitting Google/VPS STUN plus UDP & TCP `turn:...?transport=udp|tcp` entries with 12-hour `{expiry}:{peer_id}` HMAC-SHA1 base64 credentials (using existing locked `base64 = "0.23.1"`).
+   - Extended `ClientMessage` (`ScreenState`, `ScreenSignal`), `ServerMessage` (`IceConfig`, `PeerScreenState`, `ScreenSignal`), and `PeerSession` (`screen_sharing`, `screen_label`).
+   - Added `send_post_join_sync` (pushes `IceConfig` on Create/Join and active sharers' `PeerScreenState` to late joiners), `handle_screen_state` (UTF-8 char-safe 64-char label cap, broadcasts to room peers excluding self), `handle_screen_signal` (65,536-byte serialized payload cap, sender session & room membership check, strictly 1-to-1 target delivery), and disconnect cleanup in `remove_peer_from_room` (broadcasts `sharing: false` alongside `PeerLeft`).
+2. **`crates/verio-discovery/src/vps.rs`**:
+   - Reduced `WS_POLL_TIMEOUT` from `200ms` to `25ms`.
+   - Added `IceServerConfig`, `SignalingCommand::{ScreenState, ScreenSignal}`, extended `WireClientMessage` / `WireServerMessage` / `SignalingEvent`, added `VpsSignaling::set_command_rx`, and updated `run_listener` to flush outbound commands and emit `IceConfig` / `PeerScreenState` / `ScreenSignal`.
+3. **`crates/verio-app/src/room.rs`, `crates/soak-harness/src/room_soak.rs`, `ui/src-tauri/src/lib.rs`**:
+   - Re-exported `IceServerConfig`, added `RoomEvent::{IceConfig, PeerScreenState, ScreenSignal}`, wired `signaling_tx` + `ice_servers` on `RoomManager` (cleared in `teardown_session`), added `send_screen_state`, `send_screen_signal`, `ice_servers` methods, updated `soak-harness` match, forwarded `ice_config` / `screen_state` / `screen_signal` Tauri events, and registered `send_screen_state`, `send_screen_signal`, and `get_ice_servers` commands.
+4. **Mutation Tests (reverted byte-exact; baseline SHA-1 `eff56737a44525555d14bc2d3723a63c6f860b19`)**:
+   - `hmac_sha1` opad `0x5c` -> `0x5d`: `test_hmac_sha1_rfc2202_vectors` FAILED.
+   - `handle_screen_signal` targeted lookup replaced with room broadcast: `test_screen_signal_targeted_routing_membership_and_size_limit` FAILED.
+   - `send_post_join_sync` catch-up screen-state filter inverted (`!p.screen_sharing`): `test_screen_state_broadcast_late_joiner_and_disconnect_cleanup` FAILED.
+5. **VPS `193.24.105.202` `coturn` + `verio-server-linux` Deployment**:
+   - Cross-compiled `verio-server` for `x86_64-unknown-linux-musl` (`cargo rustc ... --release -p verio-server -- -C linker=rust-lld`).
+   - Installed `coturn` on Ubuntu 24.04 (`193.24.105.202`), generated a 32-byte hex shared secret stored strictly on the VPS in `/root/verio-turn.env` (0600) and `/etc/turnserver.conf` (0640, `listening-port=3479`, `external-ip=193.24.105.202`, `use-auth-secret`, `realm=verio.ir`, UDP+TCP enabled), enabled/started `coturn.service`.
+   - Uploaded `/root/verio-server-linux` and restarted inside `tmux` session `verio` (`./verio-server-linux -p 9091 -mr active --turn-url "$TURN_URL" --turn-secret "$TURN_SECRET"`).
+
+Verified (real command output):
+- `cargo clippy --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace --all-targets -- -D warnings`: Exit code 0 (zero warnings)
+- `cargo test --offline --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" --workspace`: Exit code 0 (`verio_lib` 9, `verio_app` 101 unit + 4 + 2 integration, `verio_audio` 2, `verio_discovery` 12, `verio_dsp` 33, `verio_server` 16, `verio_transport` 19 — 0 failed)
+- `ss -lunpt` on `193.24.105.202`: `verio-server-linux` bound on `0.0.0.0:9091` (TCP), `0.0.0.0:9092` (UDP), `0.0.0.0:3478` (UDP); `turnserver` active and bound on `193.24.105.202:3479` (UDP & TCP).
+
+
 

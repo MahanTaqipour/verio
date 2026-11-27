@@ -17,6 +17,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,9 @@ use tokio::sync::{mpsc, Notify, RwLock};
 const DEFAULT_TCP_PORT: u16 = 8443;
 const DEFAULT_UDP_PORT: u16 = 8444;
 pub const MAIN_ROOT_ROOM: &str = "1111";
+const MAX_SCREEN_LABEL_CHARS: usize = 64;
+const MAX_SCREEN_SIGNAL_BYTES: usize = 65_536;
+const TURN_CREDENTIAL_TTL_SECS: u64 = 43_200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerIdentity {
@@ -37,6 +41,15 @@ pub struct PeerIdentity {
     pub force_stop: bool,
     pub name: String,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +79,17 @@ pub enum ClientMessage {
     },
     Leave {
         room: String,
+    },
+    ScreenState {
+        room: String,
+        sharing: bool,
+        #[serde(default)]
+        label: String,
+    },
+    ScreenSignal {
+        room: String,
+        target: String,
+        payload: serde_json::Value,
     },
 }
 
@@ -103,6 +127,21 @@ pub enum ServerMessage {
         from: String,
         candidate: String,
     },
+    IceConfig {
+        servers: Vec<IceServerConfig>,
+    },
+    PeerScreenState {
+        room: String,
+        peer_id: String,
+        sharing: bool,
+        #[serde(default)]
+        label: String,
+    },
+    ScreenSignal {
+        room: String,
+        from: String,
+        payload: serde_json::Value,
+    },
     Error {
         message: String,
     },
@@ -113,6 +152,8 @@ struct PeerSession {
     identity: PeerIdentity,
     tx: mpsc::UnboundedSender<Message>,
     close_notify: Arc<Notify>,
+    screen_sharing: bool,
+    screen_label: String,
 }
 
 struct Room {
@@ -123,13 +164,22 @@ struct Room {
 struct AppState {
     rooms: Arc<RwLock<HashMap<String, Room>>>,
     next_conn_id: Arc<AtomicU64>,
+    turn_url: Option<String>,
+    turn_secret: Option<String>,
 }
 
 impl AppState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_turn(None, None)
+    }
+
+    fn with_turn(turn_url: Option<String>, turn_secret: Option<String>) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            turn_url,
+            turn_secret,
         }
     }
 
@@ -138,11 +188,135 @@ impl AppState {
     }
 }
 
+/// Pure-Rust RFC 3174 SHA-1 digest.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
+                _ => (b ^ c ^ d, 0xCA62_C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Pure-Rust RFC 2104 HMAC-SHA1 authentication code for coturn REST credentials.
+pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha1(key);
+        key_block[..20].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = Vec::with_capacity(64 + data.len());
+    let mut opad = Vec::with_capacity(64 + 20);
+    for &b in &key_block {
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+    }
+    ipad.extend_from_slice(data);
+    let inner = sha1(&ipad);
+    opad.extend_from_slice(&inner);
+    sha1(&opad)
+}
+
+/// Build ICE server list (public STUN + optional time-limited coturn TURN credentials).
+pub fn build_ice_servers(
+    peer_id: &str,
+    turn_url: Option<&str>,
+    turn_secret: Option<&str>,
+    now_unix_secs: u64,
+) -> Vec<IceServerConfig> {
+    let mut stun_urls = vec![
+        "stun:stun.l.google.com:19302".to_string(),
+        "stun:stun1.l.google.com:19302".to_string(),
+    ];
+    let mut turn_entry = None;
+
+    if let (Some(url), Some(secret)) = (turn_url, turn_secret) {
+        let base = url.trim().split('?').next().unwrap_or("").trim();
+        if !base.is_empty() && !secret.is_empty() {
+            if let Some(host_port) = base.strip_prefix("turn:") {
+                stun_urls.insert(0, format!("stun:{host_port}"));
+            }
+            let expiry = now_unix_secs.saturating_add(TURN_CREDENTIAL_TTL_SECS);
+            let username = format!("{expiry}:{peer_id}");
+            let digest = hmac_sha1(secret.as_bytes(), username.as_bytes());
+            let credential = base64::engine::general_purpose::STANDARD.encode(digest);
+            turn_entry = Some(IceServerConfig {
+                urls: vec![
+                    format!("{base}?transport=udp"),
+                    format!("{base}?transport=tcp"),
+                ],
+                username: Some(username),
+                credential: Some(credential),
+            });
+        }
+    }
+
+    let mut servers = vec![IceServerConfig {
+        urls: stun_urls,
+        username: None,
+        credential: None,
+    }];
+    if let Some(turn) = turn_entry {
+        servers.push(turn);
+    }
+    servers
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub main_root: bool,
+    pub turn_url: Option<String>,
+    pub turn_secret: Option<String>,
 }
 
 pub fn parse_args_from<I, T>(args: I) -> Result<Option<ServerConfig>, String>
@@ -154,6 +328,8 @@ where
     let mut tcp_port = None;
     let mut udp_port = None;
     let mut main_root = false;
+    let mut turn_url = None;
+    let mut turn_secret = None;
 
     while let Some(arg) = iter.next() {
         let s = arg.as_ref();
@@ -166,6 +342,8 @@ where
                        -p, --port <PORT>        TCP port for WebSocket signaling [default: 8443]\n  \
                        -u, --udp-port <PORT>    UDP port for fallback voice relay [default: 8444 (or TCP port + 1)]\n  \
                        -mr, --main-root <VALUE> Main root room 1111 (active | inactive) [default: inactive]\n  \
+                       --turn-url <URL>         coturn URI (e.g. turn:193.24.105.202:3479)\n  \
+                       --turn-secret <SECRET>   coturn static-auth-secret for ephemeral HMAC-SHA1 credentials\n  \
                        -h, --help               Print help information"
                 );
                 return Ok(None);
@@ -204,6 +382,25 @@ where
                     }
                 }
             }
+            "--turn-url" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| format!("missing TURN URL argument for {s}"))?;
+                let trimmed = val.as_ref().trim();
+                if trimmed.is_empty() {
+                    return Err("invalid --turn-url value: cannot be empty".to_string());
+                }
+                turn_url = Some(trimmed.to_string());
+            }
+            "--turn-secret" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| format!("missing TURN secret argument for {s}"))?;
+                if val.as_ref().is_empty() {
+                    return Err("invalid --turn-secret value: cannot be empty".to_string());
+                }
+                turn_secret = Some(val.as_ref().to_string());
+            }
             opt if opt.starts_with("-p=") || opt.starts_with("--port=") => {
                 let val = opt.split_once('=').unwrap().1;
                 let port = val
@@ -230,6 +427,20 @@ where
                     }
                 }
             }
+            opt if opt.starts_with("--turn-url=") => {
+                let val = opt.split_once('=').unwrap().1.trim();
+                if val.is_empty() {
+                    return Err("invalid --turn-url value: cannot be empty".to_string());
+                }
+                turn_url = Some(val.to_string());
+            }
+            opt if opt.starts_with("--turn-secret=") => {
+                let val = opt.split_once('=').unwrap().1;
+                if val.is_empty() {
+                    return Err("invalid --turn-secret value: cannot be empty".to_string());
+                }
+                turn_secret = Some(val.to_string());
+            }
             other => {
                 return Err(format!("unknown option '{other}'. Run with --help for usage."));
             }
@@ -249,6 +460,8 @@ where
         tcp_port: final_tcp,
         udp_port: final_udp,
         main_root,
+        turn_url,
+        turn_secret,
     }))
 }
 
@@ -265,7 +478,18 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let state = AppState::new();
+    let state = AppState::with_turn(config.turn_url.clone(), config.turn_secret.clone());
+    match (&config.turn_url, &config.turn_secret) {
+        (Some(url), Some(_)) => {
+            tracing::info!(turn_url = %url, "ephemeral coturn ICE credentials enabled");
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::warn!(
+                "both --turn-url and --turn-secret are required for TURN credentials; falling back to STUN only"
+            );
+        }
+        (None, None) => {}
+    }
 
     if config.main_root {
         let mut rooms = state.rooms.write().await;
@@ -427,8 +651,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Arc::clone(&close_notify),
                 )
                 .await;
-                current_room = Some(code);
-                current_peer_id = Some(peer_id);
+                current_room = Some(code.clone());
+                current_peer_id = Some(peer_id.clone());
+                send_post_join_sync(&state, &code, &peer_id, &tx).await;
             }
 
             ClientMessage::Join { room, identity } => {
@@ -448,8 +673,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 )
                 .await
                 {
-                    current_room = Some(room);
-                    current_peer_id = Some(peer_id);
+                    current_room = Some(room.clone());
+                    current_peer_id = Some(peer_id.clone());
+                    send_post_join_sync(&state, &room, &peer_id, &tx).await;
                 }
             }
 
@@ -500,6 +726,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
 
+            ClientMessage::ScreenState {
+                room,
+                sharing,
+                label,
+            } => {
+                if current_room.as_deref() == Some(room.as_str()) {
+                    if let Some(peer_id) = current_peer_id.as_deref() {
+                        handle_screen_state(&state, &room, peer_id, conn_id, sharing, label).await;
+                    }
+                }
+            }
+
+            ClientMessage::ScreenSignal {
+                room,
+                target,
+                payload,
+            } => {
+                if current_room.as_deref() == Some(room.as_str()) {
+                    if let Some(from_id) = current_peer_id.as_deref() {
+                        handle_screen_signal(&state, &room, from_id, conn_id, &target, payload)
+                            .await;
+                    }
+                }
+            }
+
             ClientMessage::Leave { room } => {
                 if let Some(peer_id) = current_peer_id.take() {
                     remove_peer_from_room(&state, &room, &peer_id, conn_id).await;
@@ -515,6 +766,154 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     send_task.abort();
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Send ephemeral ICE configuration and catch-up screen sharing states to a newly entered peer.
+async fn send_post_join_sync(
+    state: &AppState,
+    room_code: &str,
+    peer_id: &str,
+    tx: &mpsc::UnboundedSender<Message>,
+) {
+    let servers = build_ice_servers(
+        peer_id,
+        state.turn_url.as_deref(),
+        state.turn_secret.as_deref(),
+        unix_secs_now(),
+    );
+    let ice_msg = ServerMessage::IceConfig { servers };
+    if let Ok(json) = serde_json::to_string(&ice_msg) {
+        let _ = tx.send(Message::Text(json.into()));
+    }
+
+    let active_shares: Vec<(String, String)> = {
+        let rooms = state.rooms.read().await;
+        rooms
+            .get(room_code)
+            .map(|r| {
+                r.peers
+                    .iter()
+                    .filter(|(id, p)| id.as_str() != peer_id && p.screen_sharing)
+                    .map(|(id, p)| (id.clone(), p.screen_label.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    for (sharer_id, label) in active_shares {
+        let state_msg = ServerMessage::PeerScreenState {
+            room: room_code.to_string(),
+            peer_id: sharer_id,
+            sharing: true,
+            label,
+        };
+        if let Ok(json) = serde_json::to_string(&state_msg) {
+            let _ = tx.send(Message::Text(json.into()));
+        }
+    }
+}
+
+/// Update a peer's screen sharing state and broadcast it to the rest of the room.
+async fn handle_screen_state(
+    state: &AppState,
+    room_code: &str,
+    peer_id: &str,
+    conn_id: u64,
+    sharing: bool,
+    label: String,
+) {
+    let bounded_label: String = if sharing {
+        label.trim().chars().take(MAX_SCREEN_LABEL_CHARS).collect()
+    } else {
+        String::new()
+    };
+
+    let mut rooms = state.rooms.write().await;
+    let Some(r) = rooms.get_mut(room_code) else {
+        return;
+    };
+    let Some(sender) = r.peers.get_mut(peer_id) else {
+        return;
+    };
+    if sender.conn_id != conn_id {
+        return;
+    }
+    sender.screen_sharing = sharing;
+    sender.screen_label = bounded_label.clone();
+
+    let notify = ServerMessage::PeerScreenState {
+        room: room_code.to_string(),
+        peer_id: peer_id.to_string(),
+        sharing,
+        label: bounded_label,
+    };
+    if let Ok(json) = serde_json::to_string(&notify) {
+        for (other_id, p) in &r.peers {
+            if other_id != peer_id {
+                let _ = p.tx.send(Message::Text(json.clone().into()));
+            }
+        }
+    }
+}
+
+/// Forward a targeted 1-to-1 screen share SDP/ICE payload after verifying membership and size cap.
+async fn handle_screen_signal(
+    state: &AppState,
+    room_code: &str,
+    from_id: &str,
+    conn_id: u64,
+    target_id: &str,
+    payload: serde_json::Value,
+) {
+    let payload_bytes = match serde_json::to_string(&payload) {
+        Ok(s) => s.len(),
+        Err(e) => {
+            tracing::warn!(room = %room_code, from = %from_id, %e, "dropping unserializable screen_signal payload");
+            return;
+        }
+    };
+    if payload_bytes > MAX_SCREEN_SIGNAL_BYTES {
+        tracing::warn!(
+            room = %room_code,
+            from = %from_id,
+            bytes = payload_bytes,
+            limit = MAX_SCREEN_SIGNAL_BYTES,
+            "dropping oversized screen_signal payload"
+        );
+        return;
+    }
+
+    let rooms = state.rooms.read().await;
+    let Some(r) = rooms.get(room_code) else {
+        return;
+    };
+    let sender_ok = r
+        .peers
+        .get(from_id)
+        .is_some_and(|p| p.conn_id == conn_id);
+    if !sender_ok {
+        return;
+    }
+    if target_id == from_id {
+        return;
+    }
+    if let Some(target_peer) = r.peers.get(target_id) {
+        let relay = ServerMessage::ScreenSignal {
+            room: room_code.to_string(),
+            from: from_id.to_string(),
+            payload,
+        };
+        if let Ok(json) = serde_json::to_string(&relay) {
+            let _ = target_peer.tx.send(Message::Text(json.into()));
+        }
+    }
 }
 
 async fn create_room_session(
@@ -545,6 +944,8 @@ async fn create_room_session(
             identity: identity.clone(),
             tx: tx.clone(),
             close_notify,
+            screen_sharing: false,
+            screen_label: String::new(),
         },
     );
     rooms.insert(code.clone(), Room { peers });
@@ -621,6 +1022,8 @@ async fn join_room_session(
                 identity: identity.clone(),
                 tx: tx.clone(),
                 close_notify,
+                screen_sharing: false,
+                screen_label: String::new(),
             },
         );
 
@@ -662,8 +1065,22 @@ async fn remove_peer_from_room(state: &AppState, room_code: &str, peer_id: &str,
             );
             return;
         }
-        r.peers.remove(peer_id);
+        let removed = r.peers.remove(peer_id);
         tracing::info!(room = %room_code, peer_id = %peer_id, conn_id, "peer left room");
+
+        if removed.as_ref().is_some_and(|p| p.screen_sharing) {
+            let stop_share = ServerMessage::PeerScreenState {
+                room: room_code.to_string(),
+                peer_id: peer_id.to_string(),
+                sharing: false,
+                label: String::new(),
+            };
+            if let Ok(stop_json) = serde_json::to_string(&stop_share) {
+                for p in r.peers.values() {
+                    let _ = p.tx.send(Message::Text(stop_json.clone().into()));
+                }
+            }
+        }
 
         // Notify remaining peers and prune closed channels immediately
         let notify = ServerMessage::PeerLeft {
@@ -1219,6 +1636,341 @@ mod tests {
         let main_clients = rooms.get(MAIN_ROOT_ROOM).unwrap();
         assert!(!main_clients.contains_key(&[1u8; 16]), "stale client in 1111 must be pruned");
         assert!(main_clients.contains_key(&[2u8; 16]), "fresh client in 1111 must remain");
+    }
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    #[test]
+    fn test_parse_args_turn_flags() {
+        let cfg = parse_args_from([
+            "-p",
+            "9091",
+            "-mr",
+            "active",
+            "--turn-url",
+            "turn:193.24.105.202:3479",
+            "--turn-secret",
+            "top-secret",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.tcp_port, 9091);
+        assert!(cfg.main_root);
+        assert_eq!(cfg.turn_url.as_deref(), Some("turn:193.24.105.202:3479"));
+        assert_eq!(cfg.turn_secret.as_deref(), Some("top-secret"));
+
+        let cfg_eq = parse_args_from([
+            "--turn-url=turn:193.24.105.202:3479",
+            "--turn-secret=abc123",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cfg_eq.turn_url.as_deref(),
+            Some("turn:193.24.105.202:3479")
+        );
+        assert_eq!(cfg_eq.turn_secret.as_deref(), Some("abc123"));
+
+        assert!(parse_args_from(["--turn-url"]).is_err());
+        assert!(parse_args_from(["--turn-secret"]).is_err());
+        assert!(parse_args_from(["--turn-url="]).is_err());
+        assert!(parse_args_from(["--turn-secret="]).is_err());
+    }
+
+    #[test]
+    fn test_hmac_sha1_rfc2202_vectors() {
+        // RFC 2202 Test Case 1
+        assert_eq!(
+            hex_lower(&hmac_sha1(&[0x0b; 20], b"Hi There")),
+            "b617318655057264e28bc0b6fb378c8ef146be00"
+        );
+        // RFC 2202 Test Case 2
+        assert_eq!(
+            hex_lower(&hmac_sha1(b"Jefe", b"what do ya want for nothing?")),
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+        );
+        // RFC 2202 Test Case 3
+        assert_eq!(
+            hex_lower(&hmac_sha1(&[0xaa; 20], &[0xdd; 50])),
+            "125d7342b9ac11cd91a39af48aa17b4f63f175d3"
+        );
+        // RFC 2202 Test Case 6 (> 64-byte key hashed first)
+        assert_eq!(
+            hex_lower(&hmac_sha1(
+                &[0xaa; 80],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+        );
+    }
+
+    #[test]
+    fn test_build_ice_servers_stun_and_ephemeral_turn() {
+        let stun_only = build_ice_servers("peer-1", None, None, 1_700_000_000);
+        assert_eq!(stun_only.len(), 1);
+        assert!(stun_only[0]
+            .urls
+            .contains(&"stun:stun.l.google.com:19302".to_string()));
+        assert!(stun_only[0].username.is_none());
+
+        let with_turn = build_ice_servers(
+            "peer-abc",
+            Some("turn:193.24.105.202:3479"),
+            Some("coturn-shared-secret"),
+            1_700_000_000,
+        );
+        assert_eq!(with_turn.len(), 2);
+        assert!(with_turn[0]
+            .urls
+            .contains(&"stun:193.24.105.202:3479".to_string()));
+        assert_eq!(
+            with_turn[1].urls,
+            vec![
+                "turn:193.24.105.202:3479?transport=udp".to_string(),
+                "turn:193.24.105.202:3479?transport=tcp".to_string(),
+            ]
+        );
+        let expected_user = "1700043200:peer-abc";
+        assert_eq!(with_turn[1].username.as_deref(), Some(expected_user));
+        let expected_cred = base64::engine::general_purpose::STANDARD.encode(hmac_sha1(
+            b"coturn-shared-secret",
+            expected_user.as_bytes(),
+        ));
+        assert_eq!(
+            with_turn[1].credential.as_deref(),
+            Some(expected_cred.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_screen_state_broadcast_late_joiner_and_disconnect_cleanup() {
+        let state = AppState::with_turn(
+            Some("turn:193.24.105.202:3479".into()),
+            Some("test-secret".into()),
+        );
+        let alice = PeerIdentity {
+            uuid: "alice-uuid".into(),
+            user_id: "u-alice".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Alice".into(),
+            version: "0.2.0".into(),
+        };
+        let bob = PeerIdentity {
+            uuid: "bob-uuid".into(),
+            user_id: "u-bob".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Bob".into(),
+            version: "0.2.0".into(),
+        };
+        let charlie = PeerIdentity {
+            uuid: "charlie-uuid".into(),
+            user_id: "u-charlie".into(),
+            is_bot: false,
+            force_stop: false,
+            name: "Charlie".into(),
+            version: "0.2.0".into(),
+        };
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_c, mut rx_c) = mpsc::unbounded_channel();
+
+        let room_code =
+            create_room_session(&state, alice, 1, tx_a.clone(), Arc::new(Notify::new())).await;
+        let _ = rx_a.recv().await.unwrap(); // Created
+
+        assert!(
+            join_room_session(
+                &state,
+                &room_code,
+                bob,
+                2,
+                tx_b.clone(),
+                Arc::new(Notify::new())
+            )
+            .await
+        );
+        let _ = rx_b.recv().await.unwrap(); // Joined
+        let _ = rx_a.recv().await.unwrap(); // PeerJoined(Bob)
+
+        // Alice starts sharing with >64 char multi-byte UTF-8 label.
+        let long_label = format!("  {}  ", "🖥️".repeat(70));
+        handle_screen_state(&state, &room_code, "alice-uuid", 1, true, long_label).await;
+
+        assert!(
+            rx_a.try_recv().is_err(),
+            "sharer must not receive own PeerScreenState echo"
+        );
+        let Message::Text(bob_msg) = rx_b.recv().await.unwrap() else {
+            panic!("expected PeerScreenState text for Bob");
+        };
+        let ServerMessage::PeerScreenState {
+            peer_id,
+            sharing,
+            label,
+            ..
+        } = serde_json::from_str(&bob_msg).unwrap()
+        else {
+            panic!("expected PeerScreenState");
+        };
+        assert_eq!(peer_id, "alice-uuid");
+        assert!(sharing);
+        assert_eq!(label.chars().count(), MAX_SCREEN_LABEL_CHARS);
+
+        // Late joiner Charlie joins while Alice is still sharing.
+        assert!(
+            join_room_session(
+                &state,
+                &room_code,
+                charlie,
+                3,
+                tx_c.clone(),
+                Arc::new(Notify::new())
+            )
+            .await
+        );
+        let _ = rx_c.recv().await.unwrap(); // Joined
+        let _ = rx_a.recv().await.unwrap(); // PeerJoined(Charlie)
+        let _ = rx_b.recv().await.unwrap(); // PeerJoined(Charlie)
+        send_post_join_sync(&state, &room_code, "charlie-uuid", &tx_c).await;
+
+        let Message::Text(c_ice) = rx_c.recv().await.unwrap() else {
+            panic!("expected IceConfig text for Charlie");
+        };
+        let ServerMessage::IceConfig { servers } = serde_json::from_str(&c_ice).unwrap() else {
+            panic!("expected IceConfig");
+        };
+        assert_eq!(servers.len(), 2);
+
+        let Message::Text(c_state) = rx_c.recv().await.unwrap() else {
+            panic!("expected PeerScreenState catch-up text for Charlie");
+        };
+        let ServerMessage::PeerScreenState {
+            peer_id: catchup_peer,
+            sharing: catchup_sharing,
+            label: catchup_label,
+            ..
+        } = serde_json::from_str(&c_state).unwrap()
+        else {
+            panic!("expected PeerScreenState catch-up");
+        };
+        assert_eq!(catchup_peer, "alice-uuid");
+        assert!(catchup_sharing);
+        assert_eq!(catchup_label.chars().count(), MAX_SCREEN_LABEL_CHARS);
+
+        // Alice disconnects unexpectedly without toggling sharing off -> remaining peers receive sharing: false.
+        remove_peer_from_room(&state, &room_code, "alice-uuid", 1).await;
+        let Message::Text(b_stop) = rx_b.recv().await.unwrap() else {
+            panic!("expected PeerScreenState stop text for Bob");
+        };
+        let ServerMessage::PeerScreenState {
+            peer_id: stop_peer,
+            sharing: stop_sharing,
+            ..
+        } = serde_json::from_str(&b_stop).unwrap()
+        else {
+            panic!("expected PeerScreenState stop");
+        };
+        assert_eq!(stop_peer, "alice-uuid");
+        assert!(!stop_sharing);
+
+        let Message::Text(b_left) = rx_b.recv().await.unwrap() else {
+            panic!("expected PeerLeft for Bob");
+        };
+        assert!(matches!(
+            serde_json::from_str(&b_left).unwrap(),
+            ServerMessage::PeerLeft { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_screen_signal_targeted_routing_membership_and_size_limit() {
+        let state = AppState::new();
+        let make_id = |id: &str, name: &str| PeerIdentity {
+            uuid: id.into(),
+            user_id: format!("u-{id}"),
+            is_bot: false,
+            force_stop: false,
+            name: name.into(),
+            version: "0.2.0".into(),
+        };
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_c, mut rx_c) = mpsc::unbounded_channel();
+
+        let room_code = create_room_session(
+            &state,
+            make_id("peer-a", "A"),
+            1,
+            tx_a.clone(),
+            Arc::new(Notify::new()),
+        )
+        .await;
+        let _ = rx_a.recv().await.unwrap();
+
+        assert!(
+            join_room_session(
+                &state,
+                &room_code,
+                make_id("peer-b", "B"),
+                2,
+                tx_b.clone(),
+                Arc::new(Notify::new()),
+            )
+            .await
+        );
+        let _ = rx_b.recv().await.unwrap();
+        let _ = rx_a.recv().await.unwrap();
+
+        assert!(
+            join_room_session(
+                &state,
+                &room_code,
+                make_id("peer-c", "C"),
+                3,
+                tx_c.clone(),
+                Arc::new(Notify::new()),
+            )
+            .await
+        );
+        let _ = rx_c.recv().await.unwrap();
+        let _ = rx_a.recv().await.unwrap();
+        let _ = rx_b.recv().await.unwrap();
+
+        // Peer A sends ScreenSignal targeted strictly to Peer B.
+        let payload = serde_json::json!({ "kind": "offer", "sdp": "v=0..." });
+        handle_screen_signal(&state, &room_code, "peer-a", 1, "peer-b", payload.clone()).await;
+
+        let Message::Text(b_sig) = rx_b.recv().await.unwrap() else {
+            panic!("expected ScreenSignal text for B");
+        };
+        let ServerMessage::ScreenSignal { from, payload: rx_payload, .. } =
+            serde_json::from_str(&b_sig).unwrap()
+        else {
+            panic!("expected ScreenSignal");
+        };
+        assert_eq!(from, "peer-a");
+        assert_eq!(rx_payload, payload);
+        assert!(rx_a.try_recv().is_err(), "sender A must not receive own ScreenSignal");
+        assert!(rx_c.try_recv().is_err(), "non-target C must never receive A->B ScreenSignal");
+
+        // Stale conn_id or non-member cannot inject ScreenSignal.
+        handle_screen_signal(&state, &room_code, "peer-a", 999, "peer-b", payload.clone()).await;
+        assert!(rx_b.try_recv().is_err());
+
+        // Oversized payload (> 64 KB) must be dropped cleanly.
+        let oversized = serde_json::json!({ "blob": "x".repeat(MAX_SCREEN_SIGNAL_BYTES + 64) });
+        handle_screen_signal(&state, &room_code, "peer-a", 1, "peer-b", oversized).await;
+        assert!(rx_b.try_recv().is_err(), "oversized payload must be dropped");
     }
 }
 

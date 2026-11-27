@@ -348,7 +348,11 @@ fn spawn_event_collector(
                 // the mute above.
                 | RoomEvent::MusicStopRequested { .. }
                 // Session 31: ephemeral in-call chat is not exercised in the audio soak.
-                | RoomEvent::ChatReceived { .. } => {}
+                | RoomEvent::ChatReceived { .. }
+                // Session 37A: screen sharing signaling is not exercised in the audio soak.
+                | RoomEvent::IceConfig { .. }
+                | RoomEvent::PeerScreenState { .. }
+                | RoomEvent::ScreenSignal { .. } => {}
             }
         }
     });
